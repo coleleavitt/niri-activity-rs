@@ -1,16 +1,18 @@
 [package]
-name = "actitivty-rs"
+name = "niri-activity-rs"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 niri-ipc = { path = "../niri/niri-ipc" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
-directories = "5"
+directories = "6.0.0"
 thiserror = "2"
-toml = "0.8"
+toml = "0.9.11+spec-1.1.0"
 evdev = "0.13"
+signal-hook = "0.4.3"
+backoff = "0.4"
+inotify = { version = "0.11", default-features = false }
