@@ -4,6 +4,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use chrono::{DateTime, Datelike, Local, NaiveTime};
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
@@ -46,11 +48,25 @@ pub struct TitleRule {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct Schedule {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_schedule_start")]
+    pub start: String,
+    #[serde(default = "default_schedule_end")]
+    pub end: String,
+    #[serde(default = "default_schedule_days")]
+    pub days: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default = "default_idle_threshold")]
     pub idle_threshold_secs: u64,
     #[serde(default = "default_mouse_dpi")]
     pub mouse_dpi: f64,
+    #[serde(default)]
+    pub schedule: Schedule,
     #[serde(default)]
     pub categories: HashMap<String, Category>,
     #[serde(default)]
@@ -65,13 +81,43 @@ fn default_mouse_dpi() -> f64 {
     800.0
 }
 
+fn default_schedule_start() -> String {
+    "09:00".to_string()
+}
+
+fn default_schedule_end() -> String {
+    "17:00".to_string()
+}
+
+fn default_schedule_days() -> Vec<String> {
+    vec![
+        "Mon".to_string(),
+        "Tue".to_string(),
+        "Wed".to_string(),
+        "Thu".to_string(),
+        "Fri".to_string(),
+    ]
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             idle_threshold_secs: default_idle_threshold(),
             mouse_dpi: default_mouse_dpi(),
+            schedule: Schedule::default(),
             categories: HashMap::new(),
             title_rules: Vec::new(),
+        }
+    }
+}
+
+impl Default for Schedule {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start: default_schedule_start(),
+            end: default_schedule_end(),
+            days: default_schedule_days(),
         }
     }
 }
@@ -91,24 +137,57 @@ impl Config {
     }
 }
 
-pub fn get_data_dir() -> PathBuf {
-    let dirs = directories::ProjectDirs::from("", "", "niri-activity-rs")
-        .expect("Could not determine data directory");
-    let data_dir = dirs.data_dir().to_path_buf();
-    fs::create_dir_all(&data_dir).expect("Could not create data directory");
-    data_dir
+impl Schedule {
+    pub fn is_in_schedule(&self, dt: &DateTime<Local>) -> bool {
+        if !self.enabled {
+            return true;
+        }
+
+        let weekday = dt.weekday().to_string();
+        let matches_day = self
+            .days
+            .iter()
+            .any(|day| day.eq_ignore_ascii_case(&weekday));
+        if !matches_day {
+            return false;
+        }
+
+        let start = match NaiveTime::parse_from_str(&self.start, "%H:%M") {
+            Ok(time) => time,
+            Err(_) => return true,
+        };
+        let end = match NaiveTime::parse_from_str(&self.end, "%H:%M") {
+            Ok(time) => time,
+            Err(_) => return true,
+        };
+        let current = dt.time();
+
+        if start <= end {
+            current >= start && current <= end
+        } else {
+            current >= start || current <= end
+        }
+    }
 }
 
-pub fn get_config_path() -> PathBuf {
+pub fn get_data_dir() -> Result<PathBuf, Error> {
     let dirs = directories::ProjectDirs::from("", "", "niri-activity-rs")
-        .expect("Could not determine config directory");
+        .ok_or_else(|| Error::NiriError("Could not determine data directory".into()))?;
+    let data_dir = dirs.data_dir().to_path_buf();
+    fs::create_dir_all(&data_dir)?;
+    Ok(data_dir)
+}
+
+pub fn get_config_path() -> Result<PathBuf, Error> {
+    let dirs = directories::ProjectDirs::from("", "", "niri-activity-rs")
+        .ok_or_else(|| Error::NiriError("Could not determine config directory".into()))?;
     let config_dir = dirs.config_dir();
-    fs::create_dir_all(config_dir).expect("Could not create config directory");
-    config_dir.join("config.toml")
+    fs::create_dir_all(config_dir)?;
+    Ok(config_dir.join("config.toml"))
 }
 
 pub fn load_config() -> Result<Config, Error> {
-    let config_path = get_config_path();
+    let config_path = get_config_path()?;
     if config_path.exists() {
         let content = fs::read_to_string(&config_path)?;
         Ok(toml::from_str(&content)?)
@@ -118,7 +197,7 @@ pub fn load_config() -> Result<Config, Error> {
 }
 
 pub fn init_config() -> Result<(), Error> {
-    let config_path = get_config_path();
+    let config_path = get_config_path()?;
 
     if config_path.exists() {
         println!("Config already exists: {}", config_path.display());
@@ -210,6 +289,13 @@ category = \"productive\"
 [[title_rules]]
 pattern = \"docs.rs\"
 category = \"productive\"
+
+# Work schedule — only affects report breakdown (tracking is always on)
+[schedule]
+enabled = false
+start = \"09:00\"
+end = \"17:00\"
+days = [\"Mon\", \"Tue\", \"Wed\", \"Thu\", \"Fri\"]
 "#;
 
     fs::write(&config_path, example)?;

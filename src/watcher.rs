@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -33,6 +34,38 @@ impl From<&Window> for WindowInfo {
     }
 }
 
+fn is_session_locked() -> bool {
+    let session_id = match Command::new("loginctl")
+        .args(["list-sessions", "--no-legend"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .and_then(|line| line.split_whitespace().next())
+                .map(|id| id.to_string())
+        }
+        _ => None,
+    };
+
+    let Some(session_id) = session_id else {
+        return false;
+    };
+
+    match Command::new("loginctl")
+        .args(["show-session", &session_id, "-p", "LockedHint", "--value"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.trim().eq_ignore_ascii_case("yes")
+        }
+        _ => false,
+    }
+}
+
 pub fn connect_to_niri() -> Result<Socket, Error> {
     let backoff = ExponentialBackoff {
         initial_interval: Duration::from_millis(100),
@@ -62,12 +95,13 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     use std::io::Write;
 
     let config = load_config()?;
-    let db_path = get_data_dir().join("activity.db");
-    let untracked_log_path = get_data_dir().join("untracked_apps.log");
+    let data_dir = get_data_dir()?;
+    let db_path = data_dir.join("activity.db");
+    let untracked_log_path = data_dir.join("untracked_apps.log");
     let mut logged_untracked: HashSet<String> = HashSet::new();
 
     println!("Database: {}", db_path.display());
-    println!("Config: {}", get_config_path().display());
+    println!("Config: {}", get_config_path()?.display());
     println!("Idle threshold: {}s", config.idle_threshold_secs);
     println!("Categories configured: {}", config.categories.len());
 
@@ -120,6 +154,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let mut accumulated_idle_ms: i64 = 0;
     let mut last_idle_check = Instant::now();
     let mut last_flush = Instant::now();
+    let mut is_locked = false;
     const FLUSH_INTERVAL: Duration = Duration::from_secs(300);
 
     println!("\nWatching window focus (event-driven)...");
@@ -153,21 +188,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         }
 
         let now_instant = Instant::now();
-        let now_ms = monitor_start.elapsed().as_millis() as u64;
-        let last_input_ms = input_stats.last_activity_ms();
-        let idle_duration_ms = now_ms.saturating_sub(last_input_ms);
-        let is_idle = idle_duration_ms > idle_threshold_ms;
+        let locked_now = is_session_locked();
 
-        let elapsed_since_last_check =
-            now_instant.duration_since(last_idle_check).as_millis() as i64;
-        if is_idle {
-            accumulated_idle_ms += elapsed_since_last_check;
-        } else {
-            accumulated_active_ms += elapsed_since_last_check;
-        }
-        last_idle_check = now_instant;
-
-        if now_instant.duration_since(last_flush) >= FLUSH_INTERVAL {
+        if locked_now && !is_locked {
             if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
                 let input = input_stats.snapshot();
                 insert_event(
@@ -181,18 +204,67 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         input,
                     },
                 )?;
-                if !quiet {
-                    eprintln!(
-                        "[periodic flush] {} ({}ms)",
-                        info.app_id,
-                        accumulated_active_ms + accumulated_idle_ms
-                    );
-                }
-                focus_start = Utc::now();
-                accumulated_active_ms = 0;
-                accumulated_idle_ms = 0;
             }
+            is_locked = true;
+            if !quiet {
+                eprintln!("[LOCKED] Screen locked, pausing tracking");
+            }
+        }
+
+        if !locked_now && is_locked {
+            is_locked = false;
+            focus_start = Utc::now();
+            accumulated_active_ms = 0;
+            accumulated_idle_ms = 0;
+            last_idle_check = now_instant;
             last_flush = now_instant;
+            if !quiet {
+                eprintln!("[UNLOCKED] Screen unlocked, resuming tracking");
+            }
+        }
+
+        if !is_locked {
+            let now_ms = monitor_start.elapsed().as_millis() as u64;
+            let last_input_ms = input_stats.last_activity_ms();
+            let idle_duration_ms = now_ms.saturating_sub(last_input_ms);
+            let is_idle = idle_duration_ms > idle_threshold_ms;
+
+            let elapsed_since_last_check =
+                now_instant.duration_since(last_idle_check).as_millis() as i64;
+            if is_idle {
+                accumulated_idle_ms += elapsed_since_last_check;
+            } else {
+                accumulated_active_ms += elapsed_since_last_check;
+            }
+            last_idle_check = now_instant;
+
+            if now_instant.duration_since(last_flush) >= FLUSH_INTERVAL {
+                if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
+                    let input = input_stats.snapshot();
+                    insert_event(
+                        &conn,
+                        SessionSnapshot {
+                            window: info.clone(),
+                            config: &config,
+                            focus_start,
+                            active_ms: accumulated_active_ms,
+                            idle_ms: accumulated_idle_ms,
+                            input,
+                        },
+                    )?;
+                    if !quiet {
+                        eprintln!(
+                            "[periodic flush] {} ({}ms)",
+                            info.app_id,
+                            accumulated_active_ms + accumulated_idle_ms
+                        );
+                    }
+                    focus_start = Utc::now();
+                    accumulated_active_ms = 0;
+                    accumulated_idle_ms = 0;
+                }
+                last_flush = now_instant;
+            }
         }
 
         let event = match rx.recv_timeout(Duration::from_secs(1)) {
@@ -242,6 +314,15 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             }
 
             Event::WindowFocusChanged { id: new_focus_id } => {
+                if is_locked {
+                    focused_id = new_focus_id;
+                    focus_start = now;
+                    accumulated_active_ms = 0;
+                    accumulated_idle_ms = 0;
+                    last_idle_check = now_instant;
+                    last_flush = now_instant;
+                    continue;
+                }
                 let input = input_stats.snapshot();
 
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {

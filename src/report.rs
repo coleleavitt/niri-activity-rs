@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use chrono::{Local, Timelike, Utc};
+use chrono::{Local, LocalResult, Timelike, Utc};
 use rusqlite::{params, Connection};
 
 use crate::config::{get_data_dir, load_config, Category, Config};
@@ -17,23 +17,44 @@ pub struct App {
 impl App {
     pub fn open() -> Result<App, Error> {
         let config = load_config()?;
-        let db_path = get_data_dir().join("activity.db");
+        let db_path = get_data_dir()?.join("activity.db");
         let conn = Connection::open(&db_path)?;
         run_migrations(&conn, &config)?;
         Ok(App { config, conn })
     }
 }
 
+fn local_day_start_utc(date: chrono::NaiveDate) -> Result<String, Error> {
+    let day_start = date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| Error::NiriError("invalid local day start".into()))?;
+    let local_dt = match day_start.and_local_timezone(Local) {
+        LocalResult::Single(dt) => dt,
+        LocalResult::Ambiguous(dt, _) => dt,
+        LocalResult::None => {
+            return Err(Error::NiriError(
+                "local day start is not representable".into(),
+            ))
+        }
+    };
+    Ok(local_dt.with_timezone(&Utc).to_rfc3339())
+}
+
+fn local_day_end_utc(date: chrono::NaiveDate) -> Result<String, Error> {
+    let next_day = date + chrono::Duration::days(1);
+    local_day_start_utc(next_day)
+}
+
+fn parse_timestamp_local(value: &str) -> Option<chrono::DateTime<Local>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&Local))
+        .ok()
+}
+
 pub fn show_today(app: &App) -> Result<(), Error> {
     let _ = &app.config;
     let local_today = Local::now().date_naive();
-    let day_start_utc = local_today
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_local_timezone(Local)
-        .unwrap()
-        .with_timezone(&Utc)
-        .to_rfc3339();
+    let day_start_utc = local_day_start_utc(local_today)?;
 
     let mut stmt = app.conn.prepare(
         "SELECT app_id, category, SUM(active_ms + idle_ms) as total_ms 
@@ -86,13 +107,7 @@ struct Metrics {
 
 pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
     let since_local = Local::now().date_naive() - chrono::Duration::days(days as i64);
-    let since_utc = since_local
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_local_timezone(Local)
-        .unwrap()
-        .with_timezone(&Utc)
-        .to_rfc3339();
+    let since_utc = local_day_start_utc(since_local)?;
 
     let mut stmt = app.conn.prepare(
         "SELECT category, SUM(active_ms) as active, SUM(idle_ms) as idle
@@ -164,20 +179,8 @@ pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
 pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), Error> {
     assert!(bucket_min > 0, "bucket size must be positive");
     let target_local = Local::now().date_naive() - chrono::Duration::days(days_back as i64);
-    let day_start_utc = target_local
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_local_timezone(Local)
-        .unwrap()
-        .with_timezone(&Utc)
-        .to_rfc3339();
-    let day_end_utc = (target_local + chrono::Duration::days(1))
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_local_timezone(Local)
-        .unwrap()
-        .with_timezone(&Utc)
-        .to_rfc3339();
+    let day_start_utc = local_day_start_utc(target_local)?;
+    let day_end_utc = local_day_end_utc(target_local)?;
 
     let mut stmt = app.conn.prepare(
         "SELECT timestamp, app_id, category, active_ms, idle_ms, keystrokes
@@ -227,9 +230,9 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
     let mut buckets: std::collections::BTreeMap<u32, Bucket> = std::collections::BTreeMap::new();
 
     for ev in &events {
-        let ts = chrono::DateTime::parse_from_rfc3339(&ev.timestamp)
-            .map(|dt| dt.with_timezone(&chrono::Local))
-            .unwrap_or_else(|_| chrono::Local::now());
+        let Some(ts) = parse_timestamp_local(&ev.timestamp) else {
+            continue;
+        };
 
         let minutes_since_midnight = ts.hour() * 60 + ts.minute();
         let bucket_key = minutes_since_midnight / bucket_min * bucket_min;
@@ -325,13 +328,7 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
 pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
     assert!(days > 0, "report must cover at least 1 day");
     let since_local = Local::now().date_naive() - chrono::Duration::days(days as i64);
-    let since_utc = since_local
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_local_timezone(Local)
-        .unwrap()
-        .with_timezone(&Utc)
-        .to_rfc3339();
+    let since_utc = local_day_start_utc(since_local)?;
     let now_str = Local::now().format("%Y-%m-%d %H:%M").to_string();
 
     println!("╔══════════════════════════════════════════════════════╗");
@@ -501,9 +498,9 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
     let mut hourly: HashMap<u32, (i64, i64)> = HashMap::new();
 
     for row in &raw_rows {
-        let local_dt = chrono::DateTime::parse_from_rfc3339(&row.timestamp)
-            .map(|dt| dt.with_timezone(&Local))
-            .unwrap_or_else(|_| Local::now());
+        let Some(local_dt) = parse_timestamp_local(&row.timestamp) else {
+            continue;
+        };
 
         let day_key = local_dt.format("%Y-%m-%d").to_string();
         let hour_key = local_dt.hour();
@@ -528,6 +525,53 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
             pct(*day_active, *day_total),
             day_keys,
             switches,
+        );
+    }
+
+    if app.config.schedule.enabled {
+        println!("\n── Schedule ──────────────────────────────────────────");
+
+        let mut work_total_ms: i64 = 0;
+        let mut work_active_ms: i64 = 0;
+        let mut work_keys: i64 = 0;
+        let mut after_total_ms: i64 = 0;
+        let mut after_active_ms: i64 = 0;
+        let mut after_keys: i64 = 0;
+
+        for row in &raw_rows {
+            let Some(local_dt) = parse_timestamp_local(&row.timestamp) else {
+                continue;
+            };
+            let total = row.active_ms + row.idle_ms;
+            if app.config.schedule.is_in_schedule(&local_dt) {
+                work_total_ms += total;
+                work_active_ms += row.active_ms;
+                work_keys += row.keystrokes;
+            } else {
+                after_total_ms += total;
+                after_active_ms += row.active_ms;
+                after_keys += row.keystrokes;
+            }
+        }
+
+        let work_label = format!(
+            "Work Hours ({}-{}):",
+            app.config.schedule.start, app.config.schedule.end
+        );
+
+        println!(
+            "  {:<27} {:>8}  active: {:>6}  {:>5} keys",
+            work_label,
+            fmt_duration(work_total_ms),
+            pct(work_active_ms, work_total_ms),
+            work_keys,
+        );
+        println!(
+            "  {:<27} {:>8}  active: {:>6}  {:>5} keys",
+            "After Hours:",
+            fmt_duration(after_total_ms),
+            pct(after_active_ms, after_total_ms),
+            after_keys,
         );
     }
 
