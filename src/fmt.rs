@@ -17,6 +17,15 @@ pub fn fmt_duration(ms: i64) -> String {
     format!("{}h {}m", hours, mins)
 }
 
+/// Format milliseconds as `h:mm:ss` for ActivTrak-compatible CSV export.
+pub fn fmt_hms(ms: i64) -> String {
+    let total_secs = ms / 1000;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    format!("{}:{:02}:{:02}", h, m, s)
+}
+
 pub fn pct(part: i64, total: i64) -> String {
     if total == 0 {
         "0%".to_string()

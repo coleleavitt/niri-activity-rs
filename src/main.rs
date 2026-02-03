@@ -49,6 +49,12 @@ enum Commands {
         #[arg(short, long, default_value = "1")]
         days: u32,
     },
+    /// Export CSV matching ActivTrak column format
+    Export {
+        /// Number of days to export
+        #[arg(short, long, default_value = "30")]
+        days: u32,
+    },
     /// Initialize config file with examples
     Init,
 }
@@ -67,6 +73,9 @@ fn main() {
         }
         Commands::Report { days } => {
             report::App::open().and_then(|app| report::generate_report(&app, days))
+        }
+        Commands::Export { days } => {
+            report::App::open().and_then(|app| report::export_csv(&app, days))
         }
         Commands::Init => config::init_config(),
     };

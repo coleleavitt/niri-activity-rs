@@ -7,7 +7,7 @@ use rusqlite::{params, Connection};
 use crate::config::{get_data_dir, load_config, Category, Config};
 use crate::db::run_migrations;
 use crate::error::Error;
-use crate::fmt::{fmt_distance, fmt_duration, fmt_duration_compact, pct, truncate};
+use crate::fmt::{fmt_distance, fmt_duration, fmt_duration_compact, fmt_hms, pct, truncate};
 
 pub struct App {
     pub config: Config,
@@ -101,6 +101,7 @@ struct Metrics {
     total_ms: i64,
     productive_ms: i64,
     unproductive_ms: i64,
+    neutral_ms: i64,
     productive_active_ms: i64,
     productive_idle_ms: i64,
 }
@@ -140,7 +141,9 @@ pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
             Category::Unproductive => {
                 m.unproductive_ms += total;
             }
-            Category::Neutral => {}
+            Category::Neutral => {
+                m.neutral_ms += total;
+            }
         }
     }
 
@@ -160,6 +163,11 @@ pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
         "Unproductive Time:       {} ({})",
         fmt_duration(m.unproductive_ms),
         pct(m.unproductive_ms, m.total_ms)
+    );
+    println!(
+        "Undefined Time:          {} ({})",
+        fmt_duration(m.neutral_ms),
+        pct(m.neutral_ms, m.total_ms)
     );
     println!();
     println!(
@@ -614,6 +622,93 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
     }
 
     println!();
+
+    Ok(())
+}
+
+pub fn export_csv(app: &App, days: u32) -> Result<(), Error> {
+    assert!(days > 0, "export must cover at least 1 day");
+
+    let since_local = Local::now().date_naive() - chrono::Duration::days(days as i64);
+    let today_local = Local::now().date_naive();
+
+    println!(
+        "Date,Screen Time (h:mm:ss),Productive (h:mm:ss),Unproductive (h:mm:ss),\
+         Undefined (h:mm:ss),ProdActive (h:mm:ss),ProdPassive (h:mm:ss),\
+         Productive Ratio,Productive Active %"
+    );
+
+    let mut date = since_local;
+    while date <= today_local {
+        let day_start = local_day_start_utc(date)?;
+        let day_end = local_day_end_utc(date)?;
+
+        let mut stmt = app.conn.prepare(
+            "SELECT category, SUM(active_ms), SUM(idle_ms)
+             FROM events
+             WHERE timestamp >= ?1 AND timestamp < ?2
+             GROUP BY category",
+        )?;
+
+        let mut m = Metrics::default();
+
+        let rows = stmt.query_map(params![&day_start, &day_end], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (category_raw, active_ms, idle_ms) = row?;
+            let total = active_ms.saturating_add(idle_ms);
+            m.total_ms = m.total_ms.saturating_add(total);
+
+            match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
+                Category::Productive => {
+                    m.productive_ms = m.productive_ms.saturating_add(total);
+                    m.productive_active_ms = m.productive_active_ms.saturating_add(active_ms);
+                    m.productive_idle_ms = m.productive_idle_ms.saturating_add(idle_ms);
+                }
+                Category::Unproductive => {
+                    m.unproductive_ms = m.unproductive_ms.saturating_add(total);
+                }
+                Category::Neutral => {
+                    m.neutral_ms = m.neutral_ms.saturating_add(total);
+                }
+            }
+        }
+
+        let prod_ratio = if m.total_ms > 0 {
+            format!("{:.1}%", m.productive_ms as f64 / m.total_ms as f64 * 100.0)
+        } else {
+            "0.0%".to_string()
+        };
+        let prod_active_pct = if m.productive_ms > 0 {
+            format!(
+                "{:.1}%",
+                m.productive_active_ms as f64 / m.productive_ms as f64 * 100.0
+            )
+        } else {
+            "0.0%".to_string()
+        };
+
+        println!(
+            "{},{},{},{},{},{},{},{},{}",
+            date,
+            fmt_hms(m.total_ms),
+            fmt_hms(m.productive_ms),
+            fmt_hms(m.unproductive_ms),
+            fmt_hms(m.neutral_ms),
+            fmt_hms(m.productive_active_ms),
+            fmt_hms(m.productive_idle_ms),
+            prod_ratio,
+            prod_active_pct,
+        );
+
+        date += chrono::Duration::days(1);
+    }
 
     Ok(())
 }
