@@ -1,5 +1,5 @@
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
 use crate::config::Config;
 use crate::error::Error;
@@ -117,6 +117,44 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
         if updated > 0 {
             eprintln!(
                 "Migration 002: reclassified {} events with title rules",
+                updated
+            );
+        }
+    }
+
+    if !applied.contains(&"003_app_scoped_title_rules".to_string()) {
+        let mut stmt = conn.prepare("SELECT id, app_id, title, category FROM events")?;
+        let rows: Vec<(i64, String, String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut updated = 0i64;
+        for (id, app_id, title, old_category) in &rows {
+            let correct = config.classify(app_id, title);
+            if correct.to_string() != *old_category {
+                conn.execute(
+                    "UPDATE events SET category = ?1 WHERE id = ?2",
+                    params![correct.to_string(), id],
+                )?;
+                updated += 1;
+            }
+        }
+
+        conn.execute(
+            "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
+            params!["003_app_scoped_title_rules", Utc::now().to_rfc3339()],
+        )?;
+        if updated > 0 {
+            eprintln!(
+                "Migration 003: reclassified {} events with app-scoped title rules",
                 updated
             );
         }

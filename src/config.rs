@@ -45,6 +45,8 @@ impl FromStr for Category {
 pub struct TitleRule {
     pub pattern: String,
     pub category: Category,
+    #[serde(default)]
+    pub app: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +128,9 @@ impl Config {
     pub fn classify(&self, app_id: &str, title: &str) -> Category {
         let title_lower = title.to_lowercase();
         for rule in &self.title_rules {
+            if !rule.app.is_empty() && !rule.app.iter().any(|a| a.eq_ignore_ascii_case(app_id)) {
+                continue;
+            }
             if title_lower.contains(&rule.pattern.to_lowercase()) {
                 return rule.category;
             }
@@ -252,28 +257,37 @@ idle_threshold_secs = 120
 
 # Title rules — override category based on window title (case-insensitive substring match)
 # Checked BEFORE app-level categories, so these take priority.
-# Useful for browsers where the same app_id can be productive or not.
+#
+# Optional: add app = [\"zen\", \"firefox\"] to limit a rule to specific apps.
+# Without app, the rule applies to ALL windows (including terminals, IDEs, etc).
 
+# Browser-only rules — won't misclassify terminal windows working on \"spotify-rs\"
 [[title_rules]]
 pattern = \"YouTube\"
 category = \"unproductive\"
+app = [\"zen\", \"firefox\", \"chromium\"]
 
 [[title_rules]]
 pattern = \"Instagram\"
 category = \"unproductive\"
+app = [\"zen\", \"firefox\", \"chromium\"]
 
 [[title_rules]]
 pattern = \"Spotify\"
 category = \"unproductive\"
+app = [\"zen\", \"firefox\", \"chromium\", \"spotify\"]
 
 [[title_rules]]
 pattern = \"Discord\"
 category = \"unproductive\"
+app = [\"zen\", \"firefox\", \"chromium\"]
 
 [[title_rules]]
 pattern = \"Reddit\"
 category = \"unproductive\"
+app = [\"zen\", \"firefox\", \"chromium\"]
 
+# These are safe as global rules — unlikely false positives
 [[title_rules]]
 pattern = \"GitHub\"
 category = \"productive\"
