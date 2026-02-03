@@ -49,6 +49,8 @@ pub struct TitleRule {
 pub struct Config {
     #[serde(default = "default_idle_threshold")]
     pub idle_threshold_secs: u64,
+    #[serde(default = "default_mouse_dpi")]
+    pub mouse_dpi: f64,
     #[serde(default)]
     pub categories: HashMap<String, Category>,
     #[serde(default)]
@@ -59,10 +61,15 @@ fn default_idle_threshold() -> u64 {
     60
 }
 
+fn default_mouse_dpi() -> f64 {
+    800.0
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             idle_threshold_secs: default_idle_threshold(),
+            mouse_dpi: default_mouse_dpi(),
             categories: HashMap::new(),
             title_rules: Vec::new(),
         }

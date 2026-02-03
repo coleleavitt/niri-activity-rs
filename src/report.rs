@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use chrono::{Local, Timelike, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
-use crate::config::{Category, Config, get_data_dir, load_config};
+use crate::config::{get_data_dir, load_config, Category, Config};
 use crate::db::run_migrations;
 use crate::error::Error;
-use crate::fmt::{fmt_duration, fmt_duration_compact, pct, truncate};
+use crate::fmt::{fmt_distance, fmt_duration, fmt_duration_compact, pct, truncate};
 
 pub struct App {
     pub config: Config,
@@ -339,19 +339,20 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
     println!("║  Period: {} → {}              ║", since_local, now_str);
     println!("╚══════════════════════════════════════════════════════╝\n");
 
-    let (total_ms, active_ms, idle_ms, total_keys, total_clicks, total_scroll, total_events): (
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-    ) = app.conn.query_row(
+    let (
+        total_ms,
+        active_ms,
+        idle_ms,
+        total_keys,
+        total_clicks,
+        total_scroll,
+        total_distance,
+        total_events,
+    ): (i64, i64, i64, i64, i64, i64, i64, i64) = app.conn.query_row(
         "SELECT COALESCE(SUM(active_ms + idle_ms),0), COALESCE(SUM(active_ms),0),
                 COALESCE(SUM(idle_ms),0), COALESCE(SUM(keystrokes),0),
                 COALESCE(SUM(mouse_clicks),0), COALESCE(SUM(scroll_events),0),
-                COUNT(*)
+                COALESCE(SUM(mouse_distance),0), COUNT(*)
          FROM events WHERE timestamp >= ?1",
         params![&since_utc],
         |row| {
@@ -363,6 +364,7 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
+                row.get(7)?,
             ))
         },
     )?;
@@ -388,6 +390,10 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
     println!("  Keystrokes:         {}", total_keys);
     println!("  Mouse Clicks:       {}", total_clicks);
     println!("  Scroll Events:      {}", total_scroll);
+    println!(
+        "  Mouse Travel:       {}",
+        fmt_distance(total_distance, app.config.mouse_dpi)
+    );
 
     println!("\n── Productivity ──────────────────────────────────────");
 

@@ -34,6 +34,17 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Convert raw mouse sensor counts to physical distance.
+/// `counts / mouse_dpi` = inches (evdev REL_X/REL_Y are mickeys).
+pub fn fmt_distance(counts: i64, mouse_dpi: f64) -> String {
+    let feet = counts as f64 / mouse_dpi / 12.0;
+    if feet >= 5280.0 {
+        format!("{:.1}mi", feet / 5280.0)
+    } else {
+        format!("{:.0}ft", feet)
+    }
+}
+
 pub fn bar(fraction: f64, width: usize) -> String {
     let clamped = fraction.clamp(0.0, 1.0);
     let filled = (clamped * width as f64).round() as usize;
