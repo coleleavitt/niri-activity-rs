@@ -434,36 +434,53 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
     println!("\n── Top Applications ──────────────────────────────────");
 
     let mut app_stmt = app.conn.prepare(
-        "SELECT app_id, category, SUM(active_ms + idle_ms), SUM(keystrokes), SUM(mouse_clicks)
+        "SELECT app_id, category, SUM(active_ms + idle_ms), SUM(active_ms), SUM(keystrokes), SUM(mouse_clicks)
          FROM events WHERE timestamp >= ?1
-         GROUP BY app_id ORDER BY SUM(active_ms + idle_ms) DESC
-         LIMIT 10",
+         GROUP BY app_id, category ORDER BY SUM(active_ms + idle_ms) DESC
+         LIMIT 15",
     )?;
 
-    let apps: Vec<(String, String, i64, i64, i64)> = app_stmt
+    struct AppRow {
+        app_id: String,
+        category: Category,
+        total_ms: i64,
+        active_ms: i64,
+        keys: i64,
+        clicks: i64,
+    }
+
+    let app_rows: Vec<AppRow> = app_stmt
         .query_map(params![&since_utc], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
+            Ok(AppRow {
+                app_id: row.get::<_, String>(0)?,
+                category: Category::from_str(&row.get::<_, String>(1)?)
+                    .unwrap_or(Category::Neutral),
+                total_ms: row.get::<_, i64>(2)?,
+                active_ms: row.get::<_, i64>(3)?,
+                keys: row.get::<_, i64>(4)?,
+                clicks: row.get::<_, i64>(5)?,
+            })
         })?
         .filter_map(|r| r.ok())
         .collect();
 
-    for (app, cat_raw, app_total, keys, clicks) in &apps {
-        let bar_len = (*app_total as f64 / total_ms as f64 * 25.0).round() as usize;
-        let category = Category::from_str(cat_raw).unwrap_or(Category::Neutral);
+    for row in &app_rows {
+        let bar_len = (row.total_ms as f64 / total_ms as f64 * 25.0).round() as usize;
+        let active_min = row.active_ms as f64 / 60_000.0;
+        let keys_per_min = if active_min > 0.5 {
+            format!("{:.0}/m", row.keys as f64 / active_min)
+        } else {
+            "-".to_string()
+        };
         println!(
-            "  {:<22} {} {:>8}  {:>5} keys {:>3} clicks  ({})",
-            truncate(app, 22),
+            "  {:<22} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks  ({})",
+            truncate(&row.app_id, 22),
             "█".repeat(bar_len),
-            fmt_duration(*app_total),
-            keys,
-            clicks,
-            category,
+            fmt_duration(row.total_ms),
+            row.keys,
+            keys_per_min,
+            row.clicks,
+            row.category,
         );
     }
 
