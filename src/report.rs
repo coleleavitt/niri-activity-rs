@@ -2,12 +2,16 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use chrono::{Local, LocalResult, Timelike, Utc};
+use owo_colors::OwoColorize;
 use rusqlite::{Connection, params};
 
 use crate::config::{Category, Config, get_data_dir, load_config};
 use crate::db::run_migrations;
 use crate::error::Error;
-use crate::fmt::{fmt_distance, fmt_duration, fmt_duration_compact, fmt_hms, pct, truncate};
+use crate::fmt::{
+    cat_bar, cat_colored, cat_label, colored_bar, fmt_distance, fmt_duration, fmt_duration_compact,
+    fmt_hms, pct, section_header, truncate,
+};
 
 pub struct App {
     pub config: Config,
@@ -22,6 +26,106 @@ impl App {
         run_migrations(&conn, &config)?;
         Ok(App { config, conn })
     }
+}
+
+pub struct TodayRow {
+    pub app_id: String,
+    pub category: Category,
+    pub total_ms: i64,
+}
+
+pub struct TodayData {
+    pub date: chrono::NaiveDate,
+    pub rows: Vec<TodayRow>,
+}
+
+pub struct MetricsData {
+    pub days: u32,
+    pub total_ms: i64,
+    pub productive_ms: i64,
+    pub unproductive_ms: i64,
+    pub neutral_ms: i64,
+    pub productive_active_ms: i64,
+    pub productive_passive_ms: i64,
+    pub productive_idle_ms: i64,
+}
+
+pub struct TimelineBucket {
+    pub hour: u32,
+    pub minute: u32,
+    pub productive_ms: i64,
+    pub neutral_ms: i64,
+    pub unproductive_ms: i64,
+    pub idle_ms: i64,
+    pub keystrokes: i64,
+    pub dominant_app: String,
+}
+
+pub struct TimelineData {
+    pub date: chrono::NaiveDate,
+    pub bucket_min: u32,
+    pub buckets: Vec<TimelineBucket>,
+}
+
+#[allow(dead_code)]
+pub struct CategoryBreakdown {
+    pub category: Category,
+    pub total_ms: i64,
+    pub active_ms: i64,
+    pub idle_ms: i64,
+}
+
+pub struct AppBreakdown {
+    pub app_id: String,
+    pub category: Category,
+    pub total_ms: i64,
+    pub active_ms: i64,
+    pub keys: i64,
+    pub clicks: i64,
+}
+
+pub struct DailyBreakdown {
+    pub date: String,
+    pub total_ms: i64,
+    pub active_ms: i64,
+    pub keystrokes: i64,
+    pub switches: i64,
+}
+
+pub struct HourBreakdown {
+    pub hour: u32,
+    pub total_ms: i64,
+    pub keystrokes: i64,
+}
+
+pub struct ScheduleBreakdown {
+    pub work_label: String,
+    pub work_total_ms: i64,
+    pub work_active_ms: i64,
+    pub work_keys: i64,
+    pub after_total_ms: i64,
+    pub after_active_ms: i64,
+    pub after_keys: i64,
+}
+
+pub struct ReportData {
+    pub since_date: chrono::NaiveDate,
+    pub now_str: String,
+    pub total_ms: i64,
+    pub active_ms: i64,
+    pub passive_ms: i64,
+    pub idle_ms: i64,
+    pub total_keys: i64,
+    pub total_clicks: i64,
+    pub total_scroll: i64,
+    pub total_distance: i64,
+    pub total_events: i64,
+    pub jiggler_count: i64,
+    pub categories: Vec<CategoryBreakdown>,
+    pub top_apps: Vec<AppBreakdown>,
+    pub daily: Vec<DailyBreakdown>,
+    pub peak_hours: Vec<HourBreakdown>,
+    pub schedule: Option<ScheduleBreakdown>,
 }
 
 fn local_day_start_utc(date: chrono::NaiveDate) -> Result<String, Error> {
@@ -51,10 +155,9 @@ fn parse_timestamp_local(value: &str) -> Option<chrono::DateTime<Local>> {
         .ok()
 }
 
-pub fn show_today(app: &App) -> Result<(), Error> {
-    let _ = &app.config;
-    let local_today = Local::now().date_naive();
-    let day_start_utc = local_day_start_utc(local_today)?;
+pub fn query_today(app: &App) -> Result<TodayData, Error> {
+    let date = Local::now().date_naive();
+    let day_start_utc = local_day_start_utc(date)?;
 
     let mut stmt = app.conn.prepare(
         "SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) as total_ms 
@@ -64,32 +167,51 @@ pub fn show_today(app: &App) -> Result<(), Error> {
          ORDER BY total_ms DESC",
     )?;
 
-    let rows = stmt.query_map([&day_start_utc], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    })?;
+    let rows = stmt
+        .query_map([&day_start_utc], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .map(|(app_id, category_raw, total_ms)| TodayRow {
+            app_id,
+            category: Category::from_str(&category_raw).unwrap_or(Category::Neutral),
+            total_ms,
+        })
+        .collect();
 
-    println!("Activity for today ({}):\n", local_today);
-    println!("{:<30} {:>12} {:>10}", "Application", "Category", "Time");
-    println!("{}", "-".repeat(54));
+    Ok(TodayData { date, rows })
+}
 
-    for row in rows {
-        let (app_id, category_raw, total_ms) = row?;
-        let hours = total_ms / 3_600_000;
-        let mins = (total_ms % 3_600_000) / 60_000;
-        let secs = (total_ms % 60_000) / 1000;
-        let category = Category::from_str(&category_raw).unwrap_or(Category::Neutral);
+pub fn show_today(app: &App) -> Result<(), Error> {
+    let data = query_today(app)?;
 
+    println!(
+        "{}\n",
+        format!("Activity for today ({}):", data.date).cyan().bold()
+    );
+    println!(
+        "{:<30} {:>12} {:>10}",
+        "Application".bold(),
+        "Category".bold(),
+        "Time".bold()
+    );
+    println!("{}", "─".repeat(54).dimmed());
+
+    for row in &data.rows {
+        let hours = row.total_ms / 3_600_000;
+        let mins = (row.total_ms % 3_600_000) / 60_000;
+        let secs = (row.total_ms % 60_000) / 1000;
+
+        let time_str = format!("{:>2}h {:>2}m {:>2}s", hours, mins, secs);
         println!(
-            "{:<30} {:>12} {:>2}h {:>2}m {:>2}s",
-            truncate(&app_id, 28),
-            category,
-            hours,
-            mins,
-            secs
+            "{:<30} {:>12} {}",
+            cat_colored(row.category, &truncate(&row.app_id, 28)),
+            cat_label(row.category),
+            time_str.bold(),
         );
     }
 
@@ -107,7 +229,7 @@ struct Metrics {
     productive_idle_ms: i64,
 }
 
-pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
+pub fn query_metrics(app: &App, days: u32) -> Result<MetricsData, Error> {
     let since_local = Local::now().date_naive() - chrono::Duration::days(days as i64);
     let since_utc = local_day_start_utc(since_local)?;
 
@@ -118,7 +240,16 @@ pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
          GROUP BY category",
     )?;
 
-    let mut m = Metrics::default();
+    let mut m = MetricsData {
+        days,
+        total_ms: 0,
+        productive_ms: 0,
+        unproductive_ms: 0,
+        neutral_ms: 0,
+        productive_active_ms: 0,
+        productive_passive_ms: 0,
+        productive_idle_ms: 0,
+    };
 
     let rows = stmt.query_map([&since_utc], |row| {
         Ok((
@@ -150,53 +281,67 @@ pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
         }
     }
 
+    Ok(m)
+}
+
+pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
+    let m = query_metrics(app, days)?;
+
     println!(
-        "=== Productivity Metrics ({} day{}) ===\n",
-        days,
-        if days == 1 { "" } else { "s" }
+        "{}\n",
+        format!(
+            "═══ Productivity Metrics ({} day{}) ═══",
+            m.days,
+            if m.days == 1 { "" } else { "s" }
+        )
+        .cyan()
+        .bold()
     );
 
-    println!("Total Time:              {}", fmt_duration(m.total_ms));
     println!(
-        "Productive Time:         {} ({})",
-        fmt_duration(m.productive_ms),
-        pct(m.productive_ms, m.total_ms)
+        "Total Time:              {}",
+        fmt_duration(m.total_ms).bold()
     );
     println!(
-        "Unproductive Time:       {} ({})",
-        fmt_duration(m.unproductive_ms),
-        pct(m.unproductive_ms, m.total_ms)
+        "Productive Time:         {} {}",
+        fmt_duration(m.productive_ms).green().bold(),
+        pct(m.productive_ms, m.total_ms).dimmed()
     );
     println!(
-        "Undefined Time:          {} ({})",
-        fmt_duration(m.neutral_ms),
-        pct(m.neutral_ms, m.total_ms)
+        "Unproductive Time:       {} {}",
+        fmt_duration(m.unproductive_ms).red().bold(),
+        pct(m.unproductive_ms, m.total_ms).dimmed()
+    );
+    println!(
+        "Undefined Time:          {} {}",
+        fmt_duration(m.neutral_ms).yellow().bold(),
+        pct(m.neutral_ms, m.total_ms).dimmed()
     );
     println!();
     println!(
-        "Productive Active:       {} ({})",
-        fmt_duration(m.productive_active_ms),
-        pct(m.productive_active_ms, m.productive_ms)
+        "Productive Active:       {} {}",
+        fmt_duration(m.productive_active_ms).green(),
+        pct(m.productive_active_ms, m.productive_ms).dimmed()
     );
     println!(
-        "Productive Passive:      {} ({})",
-        fmt_duration(m.productive_passive_ms),
-        pct(m.productive_passive_ms, m.productive_ms)
+        "Productive Passive:      {} {}",
+        fmt_duration(m.productive_passive_ms).yellow(),
+        pct(m.productive_passive_ms, m.productive_ms).dimmed()
     );
     println!(
-        "Productive Idle:         {} ({})",
-        fmt_duration(m.productive_idle_ms),
-        pct(m.productive_idle_ms, m.productive_ms)
+        "Productive Idle:         {} {}",
+        fmt_duration(m.productive_idle_ms).dimmed(),
+        pct(m.productive_idle_ms, m.productive_ms).dimmed()
     );
 
     Ok(())
 }
 
-pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), Error> {
+pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<TimelineData, Error> {
     assert!(bucket_min > 0, "bucket size must be positive");
-    let target_local = Local::now().date_naive() - chrono::Duration::days(days_back as i64);
-    let day_start_utc = local_day_start_utc(target_local)?;
-    let day_end_utc = local_day_end_utc(target_local)?;
+    let date = Local::now().date_naive() - chrono::Duration::days(days_back as i64);
+    let day_start_utc = local_day_start_utc(date)?;
+    let day_end_utc = local_day_end_utc(date)?;
 
     let mut stmt = app.conn.prepare(
         "SELECT timestamp, app_id, category, active_ms, COALESCE(passive_ms,0), idle_ms, keystrokes
@@ -230,12 +375,7 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
         .filter_map(|r| r.ok())
         .collect();
 
-    if events.is_empty() {
-        println!("No activity recorded for {}", target_local);
-        return Ok(());
-    }
-
-    struct Bucket {
+    struct BucketAcc {
         productive_ms: i64,
         neutral_ms: i64,
         unproductive_ms: i64,
@@ -245,7 +385,8 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
         dominant_app_ms: i64,
     }
 
-    let mut buckets: std::collections::BTreeMap<u32, Bucket> = std::collections::BTreeMap::new();
+    let mut bucket_map: std::collections::BTreeMap<u32, BucketAcc> =
+        std::collections::BTreeMap::new();
 
     for ev in &events {
         let Some(ts) = parse_timestamp_local(&ev.timestamp) else {
@@ -256,7 +397,7 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
         let bucket_key = minutes_since_midnight / bucket_min * bucket_min;
         let total_ms = ev.active_ms + ev.passive_ms + ev.idle_ms;
 
-        let b = buckets.entry(bucket_key).or_insert_with(|| Bucket {
+        let b = bucket_map.entry(bucket_key).or_insert_with(|| BucketAcc {
             productive_ms: 0,
             neutral_ms: 0,
             unproductive_ms: 0,
@@ -280,16 +421,48 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
         }
     }
 
+    let buckets = bucket_map
+        .into_iter()
+        .map(|(key, b)| TimelineBucket {
+            hour: key / 60,
+            minute: key % 60,
+            productive_ms: b.productive_ms,
+            neutral_ms: b.neutral_ms,
+            unproductive_ms: b.unproductive_ms,
+            idle_ms: b.idle_ms,
+            keystrokes: b.keystrokes,
+            dominant_app: b.dominant_app,
+        })
+        .collect();
+
+    Ok(TimelineData {
+        date,
+        bucket_min,
+        buckets,
+    })
+}
+
+pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), Error> {
+    let data = query_timeline(app, days_back, bucket_min)?;
+
+    if data.buckets.is_empty() {
+        println!("No activity recorded for {}", data.date);
+        return Ok(());
+    }
+
     println!(
-        "=== Timeline for {} ({}min buckets) ===\n",
-        target_local, bucket_min
+        "{}\n",
+        format!(
+            "═══ Timeline for {} ({}min buckets) ═══",
+            data.date, data.bucket_min
+        )
+        .cyan()
+        .bold()
     );
 
     let bar_width: usize = 20;
 
-    for (&bucket_key, b) in &buckets {
-        let hour = bucket_key / 60;
-        let min = bucket_key % 60;
+    for b in &data.buckets {
         let total = b.productive_ms + b.neutral_ms + b.unproductive_ms;
         if total == 0 {
             continue;
@@ -305,31 +478,19 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
         let neutral_frac = b.neutral_ms as f64 / total as f64;
         let unprod_frac = b.unproductive_ms as f64 / total as f64;
 
-        let prod_chars = (prod_frac * bar_width as f64).round() as usize;
-        let neutral_chars = (neutral_frac * bar_width as f64).round() as usize;
-        let unprod_chars = (unprod_frac * bar_width as f64).round() as usize;
-        let remaining = bar_width.saturating_sub(prod_chars + neutral_chars + unprod_chars);
-
-        let bar = format!(
-            "{}{}{}{}",
-            "█".repeat(prod_chars),
-            "▒".repeat(neutral_chars),
-            "░".repeat(unprod_chars),
-            " ".repeat(remaining),
-        );
+        let bar = colored_bar(prod_frac, neutral_frac, unprod_frac, bar_width);
 
         let idle_marker = if idle_pct > 0.8 {
-            " [AFK]"
+            format!(" {}", "[AFK]".red().bold())
         } else if idle_pct > 0.5 {
-            " [mostly idle]"
+            format!(" {}", "[mostly idle]".yellow())
         } else {
-            ""
+            String::new()
         };
 
         println!(
-            "{:02}:{:02} {} {:>6} {:>4} keys  {:<20}{}",
-            hour,
-            min,
+            "{} {} {:>6} {:>4} keys  {:<20}{}",
+            format!("{:02}:{:02}", b.hour, b.minute).dimmed(),
             bar,
             fmt_duration_compact(total),
             b.keystrokes,
@@ -338,21 +499,21 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
         );
     }
 
-    println!("\n  █ productive  ▒ neutral  ░ unproductive");
+    println!(
+        "\n  {} productive  {} neutral  {} unproductive",
+        "█".green(),
+        "█".yellow(),
+        "█".red()
+    );
 
     Ok(())
 }
 
-pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
+pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
     assert!(days > 0, "report must cover at least 1 day");
-    let since_local = Local::now().date_naive() - chrono::Duration::days(days as i64);
-    let since_utc = local_day_start_utc(since_local)?;
+    let since_date = Local::now().date_naive() - chrono::Duration::days(days as i64);
+    let since_utc = local_day_start_utc(since_date)?;
     let now_str = Local::now().format("%Y-%m-%d %H:%M").to_string();
-
-    println!("╔══════════════════════════════════════════════════════╗");
-    println!("║           ACTIVITY REPORT                           ║");
-    println!("║  Period: {} → {}              ║", since_local, now_str);
-    println!("╚══════════════════════════════════════════════════════╝\n");
 
     let (
         total_ms,
@@ -391,52 +552,13 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
         },
     )?;
 
-    if total_events == 0 {
-        println!("No activity recorded for this period.");
-        return Ok(());
-    }
-
-    println!("── Overview ──────────────────────────────────────────");
-    println!("  Total Time:         {}", fmt_duration(total_ms));
-    println!(
-        "  Active:             {} ({})",
-        fmt_duration(active_ms),
-        pct(active_ms, total_ms)
-    );
-    println!(
-        "  Passive:            {} ({})",
-        fmt_duration(passive_ms),
-        pct(passive_ms, total_ms)
-    );
-    println!(
-        "  Idle/AFK:           {} ({})",
-        fmt_duration(idle_ms),
-        pct(idle_ms, total_ms)
-    );
-    println!("  Focus Switches:     {}", total_events);
-    println!("  Keystrokes:         {}", total_keys);
-    println!("  Mouse Clicks:       {}", total_clicks);
-    println!("  Scroll Events:      {}", total_scroll);
-    println!(
-        "  Mouse Travel:       {}",
-        fmt_distance(total_distance, app.config.mouse_dpi)
-    );
-    if jiggler_count > 0 {
-        println!(
-            "  Jiggler Events:     {} (artificial input detected)",
-            jiggler_count
-        );
-    }
-
-    println!("\n── Productivity ──────────────────────────────────────");
-
     let mut cat_stmt = app.conn.prepare(
         "SELECT category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(idle_ms)
          FROM events WHERE timestamp >= ?1
          GROUP BY category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC",
     )?;
 
-    let cats: Vec<(String, i64, i64, i64)> = cat_stmt
+    let categories: Vec<CategoryBreakdown> = cat_stmt
         .query_map(params![&since_utc], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -446,28 +568,15 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
             ))
         })?
         .filter_map(|r| r.ok())
+        .map(
+            |(cat_raw, cat_total, cat_active, cat_idle)| CategoryBreakdown {
+                category: Category::from_str(&cat_raw).unwrap_or(Category::Neutral),
+                total_ms: cat_total,
+                active_ms: cat_active,
+                idle_ms: cat_idle,
+            },
+        )
         .collect();
-
-    for (cat_raw, cat_total, cat_active, _cat_idle) in &cats {
-        let category = Category::from_str(cat_raw).unwrap_or(Category::Neutral);
-        let icon = match category {
-            Category::Productive => "●",
-            Category::Unproductive => "○",
-            Category::Neutral => "◌",
-        };
-        let bar = crate::fmt::bar(*cat_total as f64 / total_ms as f64, 30);
-        let bar = bar.trim_end();
-        println!(
-            "  {} {:<14} {} {} (active: {})",
-            icon,
-            category,
-            bar,
-            fmt_duration(*cat_total),
-            pct(*cat_active, *cat_total),
-        );
-    }
-
-    println!("\n── Top Applications ──────────────────────────────────");
 
     let mut app_stmt = app.conn.prepare(
         "SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(keystrokes), SUM(mouse_clicks)
@@ -476,49 +585,29 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
          LIMIT 15",
     )?;
 
-    struct AppRow {
-        app_id: String,
-        category: Category,
-        total_ms: i64,
-        active_ms: i64,
-        keys: i64,
-        clicks: i64,
-    }
-
-    let app_rows: Vec<AppRow> = app_stmt
+    let top_apps: Vec<AppBreakdown> = app_stmt
         .query_map(params![&since_utc], |row| {
-            Ok(AppRow {
-                app_id: row.get::<_, String>(0)?,
-                category: Category::from_str(&row.get::<_, String>(1)?)
-                    .unwrap_or(Category::Neutral),
-                total_ms: row.get::<_, i64>(2)?,
-                active_ms: row.get::<_, i64>(3)?,
-                keys: row.get::<_, i64>(4)?,
-                clicks: row.get::<_, i64>(5)?,
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
         })?
         .filter_map(|r| r.ok())
+        .map(
+            |(app_id, cat_raw, app_total, app_active, keys, clicks)| AppBreakdown {
+                app_id,
+                category: Category::from_str(&cat_raw).unwrap_or(Category::Neutral),
+                total_ms: app_total,
+                active_ms: app_active,
+                keys,
+                clicks,
+            },
+        )
         .collect();
-
-    for row in &app_rows {
-        let bar_len = (row.total_ms as f64 / total_ms as f64 * 25.0).round() as usize;
-        let active_min = row.active_ms as f64 / 60_000.0;
-        let keys_per_min = if active_min > 0.5 {
-            format!("{:.0}/m", row.keys as f64 / active_min)
-        } else {
-            "-".to_string()
-        };
-        println!(
-            "  {:<22} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks  ({})",
-            truncate(&row.app_id, 22),
-            "█".repeat(bar_len),
-            fmt_duration(row.total_ms),
-            row.keys,
-            keys_per_min,
-            row.clicks,
-            row.category,
-        );
-    }
 
     let mut raw_stmt = app.conn.prepare(
         "SELECT timestamp, active_ms, COALESCE(passive_ms,0), idle_ms, keystrokes
@@ -546,9 +635,7 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
         .filter_map(|r| r.ok())
         .collect();
 
-    println!("\n── Daily Breakdown ───────────────────────────────────");
-
-    let mut daily: std::collections::BTreeMap<String, (i64, i64, i64, i64)> =
+    let mut daily_map: std::collections::BTreeMap<String, (i64, i64, i64, i64)> =
         std::collections::BTreeMap::new();
     let mut hourly: HashMap<u32, (i64, i64)> = HashMap::new();
 
@@ -561,7 +648,7 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
         let hour_key = local_dt.hour();
         let total = row.active_ms + row.passive_ms + row.idle_ms;
 
-        let d = daily.entry(day_key).or_insert((0, 0, 0, 0));
+        let d = daily_map.entry(day_key).or_insert((0, 0, 0, 0));
         d.0 += total;
         d.1 += row.active_ms;
         d.2 += row.keystrokes;
@@ -572,20 +659,36 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
         h.1 += row.keystrokes;
     }
 
-    for (day, (day_total, day_active, day_keys, switches)) in &daily {
-        println!(
-            "  {}  {:>8}  active: {}  {:>5} keys  {} switches",
-            day,
-            fmt_duration(*day_total),
-            pct(*day_active, *day_total),
-            day_keys,
-            switches,
-        );
-    }
+    let daily: Vec<DailyBreakdown> = daily_map
+        .into_iter()
+        .map(
+            |(date, (day_total, day_active, keys, switches))| DailyBreakdown {
+                date,
+                total_ms: day_total,
+                active_ms: day_active,
+                keystrokes: keys,
+                switches,
+            },
+        )
+        .collect();
 
-    if app.config.schedule.enabled {
-        println!("\n── Schedule ──────────────────────────────────────────");
+    let mut hour_vec: Vec<(u32, i64, i64)> = hourly
+        .into_iter()
+        .map(|(h, (total, keys))| (h, total, keys))
+        .collect();
+    hour_vec.sort_by_key(|item| std::cmp::Reverse(item.1));
+    hour_vec.truncate(5);
 
+    let peak_hours: Vec<HourBreakdown> = hour_vec
+        .into_iter()
+        .map(|(hour, hour_total, keys)| HourBreakdown {
+            hour,
+            total_ms: hour_total,
+            keystrokes: keys,
+        })
+        .collect();
+
+    let schedule = if app.config.schedule.enabled {
         let mut work_total_ms: i64 = 0;
         let mut work_active_ms: i64 = 0;
         let mut work_keys: i64 = 0;
@@ -609,45 +712,230 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
             }
         }
 
-        let work_label = format!(
-            "Work Hours ({}-{}):",
-            app.config.schedule.start, app.config.schedule.end
-        );
-
-        println!(
-            "  {:<27} {:>8}  active: {:>6}  {:>5} keys",
-            work_label,
-            fmt_duration(work_total_ms),
-            pct(work_active_ms, work_total_ms),
+        Some(ScheduleBreakdown {
+            work_label: format!(
+                "Work Hours ({}-{}):",
+                app.config.schedule.start, app.config.schedule.end
+            ),
+            work_total_ms,
+            work_active_ms,
             work_keys,
-        );
-        println!(
-            "  {:<27} {:>8}  active: {:>6}  {:>5} keys",
-            "After Hours:",
-            fmt_duration(after_total_ms),
-            pct(after_active_ms, after_total_ms),
+            after_total_ms,
+            after_active_ms,
             after_keys,
+        })
+    } else {
+        None
+    };
+
+    Ok(ReportData {
+        since_date,
+        now_str,
+        total_ms,
+        active_ms,
+        passive_ms,
+        idle_ms,
+        total_keys,
+        total_clicks,
+        total_scroll,
+        total_distance,
+        total_events,
+        jiggler_count,
+        categories,
+        top_apps,
+        daily,
+        peak_hours,
+        schedule,
+    })
+}
+
+pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
+    let data = query_report(app, days)?;
+
+    println!(
+        "{}",
+        "╔══════════════════════════════════════════════════════╗"
+            .cyan()
+            .bold()
+    );
+    println!(
+        "{}{}{}",
+        "║".cyan().bold(),
+        "           ACTIVITY REPORT                           "
+            .white()
+            .bold(),
+        "║".cyan().bold()
+    );
+    let period_line = format!(
+        "  Period: {} → {}              ",
+        data.since_date, data.now_str
+    );
+    println!("{}{}{}", "║".cyan().bold(), period_line, "║".cyan().bold());
+    println!(
+        "{}\n",
+        "╚══════════════════════════════════════════════════════╝"
+            .cyan()
+            .bold()
+    );
+
+    if data.total_events == 0 {
+        println!("No activity recorded for this period.");
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        section_header("── Overview ──────────────────────────────────────────")
+    );
+    println!(
+        "  Total Time:         {}",
+        fmt_duration(data.total_ms).bold()
+    );
+    println!(
+        "  Active:             {} {}",
+        fmt_duration(data.active_ms).green().bold(),
+        pct(data.active_ms, data.total_ms).dimmed()
+    );
+    println!(
+        "  Passive:            {} {}",
+        fmt_duration(data.passive_ms).yellow(),
+        pct(data.passive_ms, data.total_ms).dimmed()
+    );
+    println!(
+        "  Idle/AFK:           {} {}",
+        fmt_duration(data.idle_ms).dimmed(),
+        pct(data.idle_ms, data.total_ms).dimmed()
+    );
+    println!("  Focus Switches:     {}", data.total_events);
+    println!("  Keystrokes:         {}", data.total_keys);
+    println!("  Mouse Clicks:       {}", data.total_clicks);
+    println!("  Scroll Events:      {}", data.total_scroll);
+    println!(
+        "  Mouse Travel:       {}",
+        fmt_distance(data.total_distance, app.config.mouse_dpi)
+    );
+    if data.jiggler_count > 0 {
+        println!(
+            "  Jiggler Events:     {}",
+            format!("{} (artificial input detected)", data.jiggler_count)
+                .red()
+                .bold()
         );
     }
 
-    println!("\n── Peak Hours ────────────────────────────────────────");
+    println!(
+        "\n{}",
+        section_header("── Productivity ──────────────────────────────────────")
+    );
 
-    let mut hour_vec: Vec<(u32, i64, i64)> = hourly
-        .into_iter()
-        .map(|(h, (total, keys))| (h, total, keys))
-        .collect();
-    hour_vec.sort_by_key(|item| std::cmp::Reverse(item.1));
-    hour_vec.truncate(5);
-
-    let max_hour_ms = hour_vec.first().map(|h| h.1).unwrap_or(1);
-    for (hour, hour_total, hour_keys) in &hour_vec {
-        let bar_len = (*hour_total as f64 / max_hour_ms as f64 * 20.0).round() as usize;
+    for cat in &data.categories {
+        let icon = match cat.category {
+            Category::Productive => "●".green().to_string(),
+            Category::Unproductive => "○".red().to_string(),
+            Category::Neutral => "◌".yellow().to_string(),
+        };
+        let filled = (cat.total_ms as f64 / data.total_ms as f64 * 30.0).round() as usize;
+        let bar = cat_bar(cat.category, filled);
         println!(
-            "  {:02}:00  {} {:>8}  {:>5} keys",
-            hour,
-            "█".repeat(bar_len),
-            fmt_duration(*hour_total),
-            hour_keys,
+            "  {} {:<14} {} {} {}",
+            icon,
+            cat_label(cat.category),
+            bar,
+            fmt_duration(cat.total_ms).bold(),
+            format!("(active: {})", pct(cat.active_ms, cat.total_ms)).dimmed(),
+        );
+    }
+
+    println!(
+        "\n{}",
+        section_header("── Top Applications ──────────────────────────────────")
+    );
+
+    for row in &data.top_apps {
+        let bar_len = (row.total_ms as f64 / data.total_ms as f64 * 25.0).round() as usize;
+        let active_min = row.active_ms as f64 / 60_000.0;
+        let keys_per_min = if active_min > 0.5 {
+            format!("{:.0}/m", row.keys as f64 / active_min)
+        } else {
+            "-".to_string()
+        };
+        println!(
+            "  {:<22} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks  ({})",
+            cat_colored(row.category, &truncate(&row.app_id, 22)),
+            cat_bar(row.category, bar_len),
+            fmt_duration(row.total_ms).bold(),
+            row.keys,
+            keys_per_min.dimmed(),
+            row.clicks,
+            cat_label(row.category),
+        );
+    }
+
+    println!(
+        "\n{}",
+        section_header("── Daily Breakdown ───────────────────────────────────")
+    );
+
+    for d in &data.daily {
+        let active_pct_val = if d.total_ms > 0 {
+            d.active_ms as f64 / d.total_ms as f64 * 100.0
+        } else {
+            0.0
+        };
+        let active_str = pct(d.active_ms, d.total_ms);
+        let active_colored = if active_pct_val >= 60.0 {
+            active_str.green().to_string()
+        } else if active_pct_val >= 30.0 {
+            active_str.yellow().to_string()
+        } else {
+            active_str.red().to_string()
+        };
+        println!(
+            "  {}  {:>8}  active: {}  {:>5} keys  {} switches",
+            d.date.dimmed(),
+            fmt_duration(d.total_ms).bold(),
+            active_colored,
+            d.keystrokes,
+            d.switches,
+        );
+    }
+
+    if let Some(sched) = &data.schedule {
+        println!(
+            "\n{}",
+            section_header("── Schedule ──────────────────────────────────────────")
+        );
+
+        println!(
+            "  {:<27} {:>8}  active: {:>6}  {:>5} keys",
+            sched.work_label.green(),
+            fmt_duration(sched.work_total_ms).bold(),
+            pct(sched.work_active_ms, sched.work_total_ms).green(),
+            sched.work_keys,
+        );
+        println!(
+            "  {:<27} {:>8}  active: {:>6}  {:>5} keys",
+            "After Hours:".yellow(),
+            fmt_duration(sched.after_total_ms).bold(),
+            pct(sched.after_active_ms, sched.after_total_ms).yellow(),
+            sched.after_keys,
+        );
+    }
+
+    println!(
+        "\n{}",
+        section_header("── Peak Hours ────────────────────────────────────────")
+    );
+
+    let max_hour_ms = data.peak_hours.first().map(|h| h.total_ms).unwrap_or(1);
+    for h in &data.peak_hours {
+        let bar_len = (h.total_ms as f64 / max_hour_ms as f64 * 20.0).round() as usize;
+        println!(
+            "  {}  {} {:>8}  {:>5} keys",
+            format!("{:02}:00", h.hour).dimmed(),
+            "█".repeat(bar_len).cyan(),
+            fmt_duration(h.total_ms).bold(),
+            h.keystrokes,
         );
     }
 

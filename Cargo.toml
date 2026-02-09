@@ -16,3 +16,6 @@ evdev = "0.13"
 signal-hook = "0.4.3"
 backoff = "0.4"
 inotify = { version = "0.11", default-features = false }
+owo-colors = "4.2.3"
+ratatui = "0.30.0"
+crossterm = { path = "../../forks/crossterm" }

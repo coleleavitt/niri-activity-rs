@@ -1,3 +1,7 @@
+use owo_colors::OwoColorize;
+
+use crate::config::Category;
+
 pub fn fmt_duration_compact(ms: i64) -> String {
     let total_secs = ms / 1000;
     if total_secs < 60 {
@@ -54,9 +58,45 @@ pub fn fmt_distance(counts: i64, mouse_dpi: f64) -> String {
     }
 }
 
-pub fn bar(fraction: f64, width: usize) -> String {
-    let clamped = fraction.clamp(0.0, 1.0);
-    let filled = (clamped * width as f64).round() as usize;
-    let remaining = width.saturating_sub(filled);
-    format!("{}{}", "█".repeat(filled), " ".repeat(remaining))
+pub fn colored_bar(prod_frac: f64, neutral_frac: f64, unprod_frac: f64, width: usize) -> String {
+    let prod_chars = (prod_frac * width as f64).round() as usize;
+    let neutral_chars = (neutral_frac * width as f64).round() as usize;
+    let unprod_chars = (unprod_frac * width as f64).round() as usize;
+    let remaining = width.saturating_sub(prod_chars + neutral_chars + unprod_chars);
+    format!(
+        "{}{}{}{}",
+        "█".repeat(prod_chars).green(),
+        "█".repeat(neutral_chars).yellow(),
+        "█".repeat(unprod_chars).red(),
+        " ".repeat(remaining),
+    )
+}
+
+pub fn cat_colored(category: Category, text: &str) -> String {
+    match category {
+        Category::Productive => text.green().to_string(),
+        Category::Unproductive => text.red().to_string(),
+        Category::Neutral => text.yellow().to_string(),
+    }
+}
+
+pub fn cat_label(category: Category) -> String {
+    match category {
+        Category::Productive => "productive".green().bold().to_string(),
+        Category::Unproductive => "unproductive".red().bold().to_string(),
+        Category::Neutral => "neutral".yellow().bold().to_string(),
+    }
+}
+
+pub fn cat_bar(category: Category, filled: usize) -> String {
+    let segment = "█".repeat(filled);
+    match category {
+        Category::Productive => segment.green().to_string(),
+        Category::Unproductive => segment.red().to_string(),
+        Category::Neutral => segment.yellow().to_string(),
+    }
+}
+
+pub fn section_header(text: &str) -> String {
+    text.cyan().bold().to_string()
 }

@@ -13,10 +13,12 @@ use rusqlite::Connection;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+use owo_colors::OwoColorize;
+
 use crate::config::{Category, get_config_path, get_data_dir, load_config};
 use crate::db::{SessionSnapshot, init_db, insert_event, run_migrations};
 use crate::error::Error;
-use crate::fmt::{fmt_duration_compact, truncate};
+use crate::fmt::{cat_colored, cat_label, fmt_duration_compact, truncate};
 use crate::input::start_idle_monitor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,15 @@ impl std::fmt::Display for ActivityState {
             ActivityState::Idle => write!(f, "idle"),
             ActivityState::Locked => write!(f, "locked"),
         }
+    }
+}
+
+fn color_state(state: ActivityState) -> String {
+    match state {
+        ActivityState::Active => "active".green().bold().to_string(),
+        ActivityState::Passive => "passive".yellow().bold().to_string(),
+        ActivityState::Idle => "idle".red().to_string(),
+        ActivityState::Locked => "locked".magenta().bold().to_string(),
     }
 }
 
@@ -237,7 +248,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             is_locked = true;
             current_state = ActivityState::Locked;
             if !quiet {
-                eprintln!("[LOCKED] Screen locked, pausing tracking");
+                eprintln!(
+                    "{} Screen locked, pausing tracking",
+                    "[LOCKED]".magenta().bold()
+                );
             }
         }
 
@@ -252,7 +266,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             last_idle_check = now_instant;
             last_flush = now_instant;
             if !quiet {
-                eprintln!("[UNLOCKED] Screen unlocked, resuming tracking");
+                eprintln!(
+                    "{} Screen unlocked, resuming tracking",
+                    "[UNLOCKED]".green().bold()
+                );
             }
         }
 
@@ -270,7 +287,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             };
 
             if new_state != current_state && !quiet {
-                eprintln!("[STATE] {} -> {}", current_state, new_state);
+                let from = color_state(current_state);
+                let to = color_state(new_state);
+                eprintln!("{} {} → {}", "[STATE]".dimmed(), from, to);
             }
             current_state = new_state;
 
@@ -309,9 +328,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         let total =
                             accumulated_active_ms + accumulated_passive_ms + accumulated_idle_ms;
                         eprintln!(
-                            "[periodic flush] {} ({})",
-                            info.app_id,
-                            fmt_duration_compact(total)
+                            "{} {} ({})",
+                            "[flush]".dimmed(),
+                            info.app_id.cyan(),
+                            fmt_duration_compact(total).dimmed()
                         );
                     }
                     focus_start = Utc::now();
@@ -423,15 +443,27 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         } else {
                             0
                         };
-                        let jiggler_tag = if session_jiggler { " [JIGGLER]" } else { "" };
+                        let jiggler_tag = if session_jiggler {
+                            format!(" {}", "[JIGGLER]".red().bold())
+                        } else {
+                            String::new()
+                        };
+                        let idle_str = if idle_pct > 80 {
+                            format!("{}% idle", idle_pct).red().to_string()
+                        } else if idle_pct > 50 {
+                            format!("{}% idle", idle_pct).yellow().to_string()
+                        } else {
+                            format!("{}% idle", idle_pct).dimmed().to_string()
+                        };
                         println!(
-                            "[{}] {} ({}) - \"{}\" ({}, {}% idle, {} keys, {} clicks, {} scroll, {}px){}",
-                            focus_start.with_timezone(&Local).format("%H:%M:%S"),
-                            info.app_id,
-                            category,
-                            truncate(&info.title, 40),
-                            fmt_duration_compact(total),
-                            idle_pct,
+                            "{} {} ({}) - {} ({}, {}, {} keys, {} clicks, {} scroll, {}px){}",
+                            format!("[{}]", focus_start.with_timezone(&Local).format("%H:%M:%S"))
+                                .dimmed(),
+                            cat_colored(category, &info.app_id),
+                            cat_label(category),
+                            format!("\"{}\"", truncate(&info.title, 40)).dimmed(),
+                            fmt_duration_compact(total).bold(),
+                            idle_str,
                             input.keystrokes,
                             input.mouse_clicks,
                             input.scroll_events,

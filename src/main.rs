@@ -4,6 +4,8 @@ mod error;
 mod fmt;
 mod input;
 mod report;
+mod theme;
+mod tui;
 mod watcher;
 
 use clap::{Parser, Subcommand};
@@ -15,7 +17,7 @@ use crate::error::Error;
 #[command(about = "Track window focus on Niri compositor")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -55,6 +57,12 @@ enum Commands {
         #[arg(short, long, default_value = "30")]
         days: u32,
     },
+    /// Launch interactive TUI dashboard
+    Tui {
+        /// Number of days to cover
+        #[arg(short, long, default_value = "7")]
+        days: u32,
+    },
     /// Initialize config file with examples
     Init,
 }
@@ -63,21 +71,23 @@ fn main() {
     let cli = Cli::parse();
 
     let result: Result<(), Error> = match cli.command {
-        Commands::Watch { quiet } => watcher::watch(quiet),
-        Commands::Today => report::App::open().and_then(|app| report::show_today(&app)),
-        Commands::Metrics { days } => {
+        None => tui::run_tui(7),
+        Some(Commands::Tui { days }) => tui::run_tui(days),
+        Some(Commands::Watch { quiet }) => watcher::watch(quiet),
+        Some(Commands::Today) => report::App::open().and_then(|app| report::show_today(&app)),
+        Some(Commands::Metrics { days }) => {
             report::App::open().and_then(|app| report::show_metrics(&app, days))
         }
-        Commands::Timeline { days, bucket } => {
+        Some(Commands::Timeline { days, bucket }) => {
             report::App::open().and_then(|app| report::show_timeline(&app, days, bucket))
         }
-        Commands::Report { days } => {
+        Some(Commands::Report { days }) => {
             report::App::open().and_then(|app| report::generate_report(&app, days))
         }
-        Commands::Export { days } => {
+        Some(Commands::Export { days }) => {
             report::App::open().and_then(|app| report::export_csv(&app, days))
         }
-        Commands::Init => config::init_config(),
+        Some(Commands::Init) => config::init_config(),
     };
 
     if let Err(e) = result {
