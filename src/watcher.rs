@@ -19,6 +19,25 @@ use crate::error::Error;
 use crate::fmt::{fmt_duration_compact, truncate};
 use crate::input::start_idle_monitor;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityState {
+    Active,
+    Passive,
+    Idle,
+    Locked,
+}
+
+impl std::fmt::Display for ActivityState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActivityState::Active => write!(f, "active"),
+            ActivityState::Passive => write!(f, "passive"),
+            ActivityState::Idle => write!(f, "idle"),
+            ActivityState::Locked => write!(f, "locked"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WindowInfo {
     pub app_id: String,
@@ -120,8 +139,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     });
 
     let monitor_start = Instant::now();
-    let input_stats = start_idle_monitor(monitor_start);
-    let idle_threshold_ms = config.idle_threshold_secs * 1000;
+    let input_stats = start_idle_monitor(monitor_start, config.jiggler.clone());
+    let idle_threshold_ms = config.idle_threshold_secs.saturating_mul(1000);
+    let deep_idle_threshold_ms = config.deep_idle_secs.saturating_mul(1000);
 
     let mut socket = connect_to_niri()?;
     let reply = socket.send(Request::EventStream)?;
@@ -151,10 +171,13 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let mut focused_id: Option<u64> = None;
     let mut focus_start = Utc::now();
     let mut accumulated_active_ms: i64 = 0;
+    let mut accumulated_passive_ms: i64 = 0;
     let mut accumulated_idle_ms: i64 = 0;
     let mut last_idle_check = Instant::now();
     let mut last_flush = Instant::now();
     let mut is_locked = false;
+    let mut jiggler_was_detected = false;
+    let mut current_state = ActivityState::Active;
     const FLUSH_INTERVAL: Duration = Duration::from_secs(300);
 
     println!("\nWatching window focus (event-driven)...");
@@ -165,6 +188,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             eprintln!("\nShutdown signal received, flushing current session...");
             if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
                 let input = input_stats.snapshot();
+                let jiggler = input_stats.jiggler_detected();
                 insert_event(
                     &conn,
                     SessionSnapshot {
@@ -172,14 +196,16 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         config: &config,
                         focus_start,
                         active_ms: accumulated_active_ms,
+                        passive_ms: accumulated_passive_ms,
                         idle_ms: accumulated_idle_ms,
                         input,
+                        jiggler_detected: jiggler || jiggler_was_detected,
                     },
                 )?;
-                let total = accumulated_active_ms + accumulated_idle_ms;
+                let total = accumulated_active_ms + accumulated_passive_ms + accumulated_idle_ms;
                 eprintln!(
-                    "Flushed: {} ({}ms active, {}ms idle)",
-                    info.app_id, accumulated_active_ms, accumulated_idle_ms
+                    "Flushed: {} ({}ms active, {}ms passive, {}ms idle)",
+                    info.app_id, accumulated_active_ms, accumulated_passive_ms, accumulated_idle_ms
                 );
                 eprintln!("Total session time saved: {}ms", total);
             }
@@ -193,6 +219,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         if locked_now && !is_locked {
             if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
                 let input = input_stats.snapshot();
+                let jiggler = input_stats.jiggler_detected();
                 insert_event(
                     &conn,
                     SessionSnapshot {
@@ -200,12 +227,15 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         config: &config,
                         focus_start,
                         active_ms: accumulated_active_ms,
+                        passive_ms: accumulated_passive_ms,
                         idle_ms: accumulated_idle_ms,
                         input,
+                        jiggler_detected: jiggler || jiggler_was_detected,
                     },
                 )?;
             }
             is_locked = true;
+            current_state = ActivityState::Locked;
             if !quiet {
                 eprintln!("[LOCKED] Screen locked, pausing tracking");
             }
@@ -213,9 +243,12 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
 
         if !locked_now && is_locked {
             is_locked = false;
+            current_state = ActivityState::Active;
             focus_start = Utc::now();
             accumulated_active_ms = 0;
+            accumulated_passive_ms = 0;
             accumulated_idle_ms = 0;
+            jiggler_was_detected = false;
             last_idle_check = now_instant;
             last_flush = now_instant;
             if !quiet {
@@ -227,20 +260,38 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             let now_ms = monitor_start.elapsed().as_millis() as u64;
             let last_input_ms = input_stats.last_activity_ms();
             let idle_duration_ms = now_ms.saturating_sub(last_input_ms);
-            let is_idle = idle_duration_ms > idle_threshold_ms;
+
+            let new_state = if idle_duration_ms > deep_idle_threshold_ms {
+                ActivityState::Idle
+            } else if idle_duration_ms > idle_threshold_ms {
+                ActivityState::Passive
+            } else {
+                ActivityState::Active
+            };
+
+            if new_state != current_state && !quiet {
+                eprintln!("[STATE] {} -> {}", current_state, new_state);
+            }
+            current_state = new_state;
+
+            if input_stats.jiggler_detected() {
+                jiggler_was_detected = true;
+            }
 
             let elapsed_since_last_check =
                 now_instant.duration_since(last_idle_check).as_millis() as i64;
-            if is_idle {
-                accumulated_idle_ms += elapsed_since_last_check;
-            } else {
-                accumulated_active_ms += elapsed_since_last_check;
+            match current_state {
+                ActivityState::Active => accumulated_active_ms += elapsed_since_last_check,
+                ActivityState::Passive => accumulated_passive_ms += elapsed_since_last_check,
+                ActivityState::Idle => accumulated_idle_ms += elapsed_since_last_check,
+                ActivityState::Locked => {}
             }
             last_idle_check = now_instant;
 
             if now_instant.duration_since(last_flush) >= FLUSH_INTERVAL {
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
                     let input = input_stats.snapshot();
+                    let jiggler = input_stats.jiggler_detected();
                     insert_event(
                         &conn,
                         SessionSnapshot {
@@ -248,20 +299,26 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             config: &config,
                             focus_start,
                             active_ms: accumulated_active_ms,
+                            passive_ms: accumulated_passive_ms,
                             idle_ms: accumulated_idle_ms,
                             input,
+                            jiggler_detected: jiggler || jiggler_was_detected,
                         },
                     )?;
                     if !quiet {
+                        let total =
+                            accumulated_active_ms + accumulated_passive_ms + accumulated_idle_ms;
                         eprintln!(
-                            "[periodic flush] {} ({}ms)",
+                            "[periodic flush] {} ({})",
                             info.app_id,
-                            accumulated_active_ms + accumulated_idle_ms
+                            fmt_duration_compact(total)
                         );
                     }
                     focus_start = Utc::now();
                     accumulated_active_ms = 0;
+                    accumulated_passive_ms = 0;
                     accumulated_idle_ms = 0;
+                    jiggler_was_detected = false;
                 }
                 last_flush = now_instant;
             }
@@ -318,14 +375,18 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     focused_id = new_focus_id;
                     focus_start = now;
                     accumulated_active_ms = 0;
+                    accumulated_passive_ms = 0;
                     accumulated_idle_ms = 0;
+                    jiggler_was_detected = false;
                     last_idle_check = now_instant;
                     last_flush = now_instant;
                     continue;
                 }
                 let input = input_stats.snapshot();
+                let jiggler = input_stats.jiggler_detected();
 
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
+                    let session_jiggler = jiggler || jiggler_was_detected;
                     insert_event(
                         &conn,
                         SessionSnapshot {
@@ -333,12 +394,15 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             config: &config,
                             focus_start,
                             active_ms: accumulated_active_ms,
+                            passive_ms: accumulated_passive_ms,
                             idle_ms: accumulated_idle_ms,
                             input,
+                            jiggler_detected: session_jiggler,
                         },
                     )?;
 
-                    let total = accumulated_active_ms + accumulated_idle_ms;
+                    let total =
+                        accumulated_active_ms + accumulated_passive_ms + accumulated_idle_ms;
 
                     let category = config.classify(&info.app_id, &info.title);
                     if category == Category::Neutral
@@ -354,12 +418,14 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
 
                     if !quiet && total >= 500 {
                         let idle_pct = if total > 0 {
-                            (accumulated_idle_ms as f64 / total as f64 * 100.0) as u32
+                            ((accumulated_passive_ms + accumulated_idle_ms) as f64 / total as f64
+                                * 100.0) as u32
                         } else {
                             0
                         };
+                        let jiggler_tag = if session_jiggler { " [JIGGLER]" } else { "" };
                         println!(
-                            "[{}] {} ({}) - \"{}\" ({}, {}% idle, {} keys, {} clicks, {} scroll, {}px)",
+                            "[{}] {} ({}) - \"{}\" ({}, {}% idle, {} keys, {} clicks, {} scroll, {}px){}",
                             focus_start.with_timezone(&Local).format("%H:%M:%S"),
                             info.app_id,
                             category,
@@ -369,7 +435,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             input.keystrokes,
                             input.mouse_clicks,
                             input.scroll_events,
-                            input.mouse_distance
+                            input.mouse_distance,
+                            jiggler_tag,
                         );
                     }
                 }
@@ -377,7 +444,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 focused_id = new_focus_id;
                 focus_start = now;
                 accumulated_active_ms = 0;
+                accumulated_passive_ms = 0;
                 accumulated_idle_ms = 0;
+                jiggler_was_detected = false;
+                current_state = ActivityState::Active;
                 last_idle_check = now_instant;
                 last_flush = now_instant;
             }

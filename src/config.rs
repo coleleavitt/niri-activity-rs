@@ -49,6 +49,24 @@ pub struct TitleRule {
     pub app: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct JigglerConfig {
+    #[serde(default = "default_jiggler_enabled")]
+    pub enabled: bool,
+    /// Observation window in seconds (default: 600 = 10 min).
+    #[serde(default = "default_jiggler_window")]
+    pub window_secs: u64,
+    /// Minimum events in the window before detection triggers (default: 5).
+    #[serde(default = "default_jiggler_min_events")]
+    pub min_events: usize,
+    /// If max_interval - min_interval < this (ms), flag as artificial (default: 100).
+    #[serde(default = "default_jiggler_variance")]
+    pub variance_threshold_ms: u64,
+    /// Process names to flag as jiggler software.
+    #[serde(default = "default_jiggler_blacklist")]
+    pub process_blacklist: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Schedule {
     #[serde(default)]
@@ -65,10 +83,14 @@ pub struct Schedule {
 pub struct Config {
     #[serde(default = "default_idle_threshold")]
     pub idle_threshold_secs: u64,
+    #[serde(default = "default_deep_idle")]
+    pub deep_idle_secs: u64,
     #[serde(default = "default_mouse_dpi")]
     pub mouse_dpi: f64,
     #[serde(default)]
     pub schedule: Schedule,
+    #[serde(default)]
+    pub jiggler: JigglerConfig,
     #[serde(default)]
     pub categories: HashMap<String, Category>,
     #[serde(default)]
@@ -79,8 +101,45 @@ fn default_idle_threshold() -> u64 {
     60
 }
 
+fn default_deep_idle() -> u64 {
+    300
+}
+
 fn default_mouse_dpi() -> f64 {
     800.0
+}
+
+fn default_jiggler_enabled() -> bool {
+    true
+}
+
+fn default_jiggler_window() -> u64 {
+    600
+}
+
+fn default_jiggler_min_events() -> usize {
+    5
+}
+
+fn default_jiggler_variance() -> u64 {
+    100
+}
+
+fn default_jiggler_blacklist() -> Vec<String> {
+    [
+        "xdotool",
+        "ydotool",
+        "xdg-screensaver",
+        "caffeine",
+        "keep-presence",
+        "mouse-jiggler",
+        "movemouse",
+        "jiggler",
+        "wiggle",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
 }
 
 fn default_schedule_start() -> String {
@@ -105,10 +164,24 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             idle_threshold_secs: default_idle_threshold(),
+            deep_idle_secs: default_deep_idle(),
             mouse_dpi: default_mouse_dpi(),
             schedule: Schedule::default(),
+            jiggler: JigglerConfig::default(),
             categories: HashMap::new(),
             title_rules: Vec::new(),
+        }
+    }
+}
+
+impl Default for JigglerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_jiggler_enabled(),
+            window_secs: default_jiggler_window(),
+            min_events: default_jiggler_min_events(),
+            variance_threshold_ms: default_jiggler_variance(),
+            process_blacklist: default_jiggler_blacklist(),
         }
     }
 }
@@ -209,8 +282,22 @@ pub fn init_config() -> Result<(), Error> {
         return Ok(());
     }
 
-    let example = r#"# Idle threshold in seconds (default: 120)
-idle_threshold_secs = 120
+    let example = r#"# Seconds without input before state transitions to Passive (default: 60)
+idle_threshold_secs = 60
+
+# Seconds without input before Passive transitions to Idle (default: 300)
+deep_idle_secs = 300
+
+# Jiggler / artificial input detection
+[jiggler]
+enabled = true
+window_secs = 600          # 10-min observation window
+min_events = 5             # need this many events to evaluate
+variance_threshold_ms = 100 # max-min interval < this = artificial
+process_blacklist = [
+    "xdotool", "ydotool", "caffeine", "keep-presence",
+    "mouse-jiggler", "movemouse", "jiggler", "wiggle"
+]
 
 # Map app_id to category: productive, unproductive, neutral
 [categories]

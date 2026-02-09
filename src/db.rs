@@ -1,5 +1,5 @@
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::config::Config;
 use crate::error::Error;
@@ -11,8 +11,10 @@ pub struct SessionSnapshot<'a> {
     pub config: &'a Config,
     pub focus_start: chrono::DateTime<Utc>,
     pub active_ms: i64,
+    pub passive_ms: i64,
     pub idle_ms: i64,
     pub input: InputSnapshot,
+    pub jiggler_detected: bool,
 }
 
 pub fn init_db(conn: &Connection) -> Result<(), Error> {
@@ -160,6 +162,18 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
         }
     }
 
+    if !applied.contains(&"004_add_passive_and_jiggler".to_string()) {
+        conn.execute_batch(
+            "ALTER TABLE events ADD COLUMN passive_ms INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE events ADD COLUMN jiggler_detected INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        conn.execute(
+            "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
+            params!["004_add_passive_and_jiggler", Utc::now().to_rfc3339()],
+        )?;
+        eprintln!("Migration 004: added passive_ms and jiggler_detected columns");
+    }
+
     Ok(())
 }
 
@@ -168,19 +182,21 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
         .config
         .classify(&snapshot.window.app_id, &snapshot.window.title);
     conn.execute(
-        "INSERT INTO events (timestamp, app_id, title, category, active_ms, idle_ms, keystrokes, mouse_clicks, scroll_events, mouse_distance) 
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO events (timestamp, app_id, title, category, active_ms, passive_ms, idle_ms, keystrokes, mouse_clicks, scroll_events, mouse_distance, jiggler_detected) 
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             snapshot.focus_start.to_rfc3339(),
             &snapshot.window.app_id,
             &snapshot.window.title,
             category.to_string(),
             snapshot.active_ms,
+            snapshot.passive_ms,
             snapshot.idle_ms,
             snapshot.input.keystrokes as i64,
             snapshot.input.mouse_clicks as i64,
             snapshot.input.scroll_events as i64,
-            snapshot.input.mouse_distance as i64
+            snapshot.input.mouse_distance as i64,
+            snapshot.jiggler_detected as i32,
         ],
     )?;
     Ok(())

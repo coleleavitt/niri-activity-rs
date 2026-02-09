@@ -1,16 +1,26 @@
+use std::collections::VecDeque;
 use std::ops::RangeInclusive;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use inotify::{Inotify, WatchMask};
 
+use crate::config::JigglerConfig;
+
 pub const BTN_MOUSE_RANGE: RangeInclusive<u16> = 272..=279;
 pub const REL_X: u16 = 0;
 pub const REL_Y: u16 = 1;
-pub const REL_HWHEEL: u16 = 8;
+pub const REL_WHEEL: u16 = 8;
+pub const REL_HWHEEL: u16 = 6;
 pub const REL_WHEEL_HI_RES: u16 = 11;
+pub const REL_HWHEEL_HI_RES: u16 = 12;
+
+pub const ABS_X: u16 = 0;
+pub const ABS_Y: u16 = 1;
+pub const ABS_MT_POSITION_X: u16 = 53;
+pub const ABS_MT_POSITION_Y: u16 = 54;
 
 #[derive(Debug, Clone, Copy)]
 pub struct InputSnapshot {
@@ -26,6 +36,8 @@ pub struct InputStats {
     mouse_clicks: Arc<AtomicU64>,
     scroll_events: Arc<AtomicU64>,
     mouse_distance: Arc<AtomicU64>,
+    jiggler_pattern: Arc<AtomicBool>,
+    jiggler_process: Arc<AtomicBool>,
 }
 
 impl InputStats {
@@ -45,6 +57,115 @@ impl InputStats {
     pub fn last_activity_ms(&self) -> u64 {
         self.last_activity_ms.load(Ordering::Relaxed)
     }
+
+    pub fn jiggler_detected(&self) -> bool {
+        self.jiggler_pattern.load(Ordering::Relaxed) || self.jiggler_process.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn jiggler_pattern_detected(&self) -> bool {
+        self.jiggler_pattern.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn jiggler_process_detected(&self) -> bool {
+        self.jiggler_process.load(Ordering::Relaxed)
+    }
+}
+
+struct IntervalTracker {
+    timestamps_ms: VecDeque<u64>,
+    window_ms: u64,
+    min_events: usize,
+    variance_threshold_ms: u64,
+}
+
+impl IntervalTracker {
+    fn new(config: &JigglerConfig) -> Self {
+        Self {
+            timestamps_ms: VecDeque::with_capacity(256),
+            window_ms: config.window_secs.saturating_mul(1000),
+            min_events: config.min_events,
+            variance_threshold_ms: config.variance_threshold_ms,
+        }
+    }
+
+    fn record(&mut self, now_ms: u64) {
+        self.timestamps_ms.push_back(now_ms);
+        let cutoff = now_ms.saturating_sub(self.window_ms);
+        while let Some(&front) = self.timestamps_ms.front() {
+            if front < cutoff {
+                self.timestamps_ms.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn is_artificial(&self) -> bool {
+        if self.timestamps_ms.len() < self.min_events {
+            return false;
+        }
+
+        let first = self.timestamps_ms.front().copied().unwrap_or(0);
+        let last = self.timestamps_ms.back().copied().unwrap_or(0);
+        let span_ms = last.saturating_sub(first);
+        // Require events spread across at least 60 seconds — bursts after idle recovery
+        // or rapid clicking shouldn't trigger jiggler detection.
+        const MIN_SPAN_MS: u64 = 60_000;
+        if span_ms < MIN_SPAN_MS {
+            return false;
+        }
+
+        let mut min_interval = u64::MAX;
+        let mut max_interval = 0u64;
+        let mut has_intervals = false;
+
+        let ts: Vec<u64> = self.timestamps_ms.iter().copied().collect();
+        for pair in ts.windows(2) {
+            let interval = pair[1].saturating_sub(pair[0]);
+            if interval == 0 {
+                continue;
+            }
+            has_intervals = true;
+            if interval < min_interval {
+                min_interval = interval;
+            }
+            if interval > max_interval {
+                max_interval = interval;
+            }
+        }
+
+        if !has_intervals {
+            return false;
+        }
+
+        max_interval.saturating_sub(min_interval) < self.variance_threshold_ms
+    }
+}
+
+pub fn scan_jiggler_processes(blacklist: &[String]) -> bool {
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let comm_path = entry.path().join("comm");
+        if let Ok(comm) = std::fs::read_to_string(&comm_path) {
+            let comm = comm.trim();
+            if blacklist.iter().any(|b| comm.eq_ignore_ascii_case(b)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn enumerate_input_devices() -> Vec<evdev::Device> {
@@ -70,13 +191,15 @@ pub fn enumerate_input_devices() -> Vec<evdev::Device> {
         .collect()
 }
 
-pub fn start_idle_monitor(start: Instant) -> InputStats {
+pub fn start_idle_monitor(start: Instant, jiggler_config: JigglerConfig) -> InputStats {
     let stats = InputStats {
         last_activity_ms: Arc::new(AtomicU64::new(0)),
         keystrokes: Arc::new(AtomicU64::new(0)),
         mouse_clicks: Arc::new(AtomicU64::new(0)),
         scroll_events: Arc::new(AtomicU64::new(0)),
         mouse_distance: Arc::new(AtomicU64::new(0)),
+        jiggler_pattern: Arc::new(AtomicBool::new(false)),
+        jiggler_process: Arc::new(AtomicBool::new(false)),
     };
 
     let last_activity = Arc::clone(&stats.last_activity_ms);
@@ -84,6 +207,7 @@ pub fn start_idle_monitor(start: Instant) -> InputStats {
     let mouse_clicks = Arc::clone(&stats.mouse_clicks);
     let scroll_events = Arc::clone(&stats.scroll_events);
     let mouse_distance = Arc::clone(&stats.mouse_distance);
+    let jiggler_pattern_flag = Arc::clone(&stats.jiggler_pattern);
 
     let devices_changed = Arc::new(AtomicBool::new(false));
     let devices_changed_clone = Arc::clone(&devices_changed);
@@ -133,6 +257,18 @@ pub fn start_idle_monitor(start: Instant) -> InputStats {
         }
     });
 
+    if jiggler_config.enabled {
+        let jiggler_process_flag = Arc::clone(&stats.jiggler_process);
+        let blacklist = jiggler_config.process_blacklist.clone();
+        thread::spawn(move || loop {
+            let found = scan_jiggler_processes(&blacklist);
+            jiggler_process_flag.store(found, Ordering::Relaxed);
+            thread::sleep(Duration::from_secs(30));
+        });
+    }
+
+    let jiggler_enabled = jiggler_config.enabled;
+
     thread::spawn(move || {
         let mut devices = enumerate_input_devices();
 
@@ -148,9 +284,14 @@ pub fn start_idle_monitor(start: Instant) -> InputStats {
         let mut last_mouse_event = Instant::now();
         let mut last_keyboard_event = Instant::now();
 
+        let mut kb_tracker = IntervalTracker::new(&jiggler_config);
+        let mut mouse_tracker = IntervalTracker::new(&jiggler_config);
+        let mut last_jiggler_check = Instant::now();
+
         const REENUMERATE_INTERVAL: Duration = Duration::from_secs(60);
         const STALE_MOUSE_THRESHOLD: Duration = Duration::from_secs(30);
         const REENUMERATE_COOLDOWN: Duration = Duration::from_secs(10);
+        const JIGGLER_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
         loop {
             let loop_now = Instant::now();
@@ -207,10 +348,16 @@ pub fn start_idle_monitor(start: Instant) -> InputStats {
                                         mouse_clicks.fetch_add(1, Ordering::Relaxed);
                                         last_activity.store(now, Ordering::Relaxed);
                                         last_mouse_event = Instant::now();
+                                        if jiggler_enabled {
+                                            mouse_tracker.record(now);
+                                        }
                                     } else {
                                         keystrokes.fetch_add(1, Ordering::Relaxed);
                                         last_activity.store(now, Ordering::Relaxed);
                                         last_keyboard_event = Instant::now();
+                                        if jiggler_enabled {
+                                            kb_tracker.record(now);
+                                        }
                                     }
                                 }
                             }
@@ -223,8 +370,26 @@ pub fn start_idle_monitor(start: Instant) -> InputStats {
                                     );
                                     last_activity.store(now, Ordering::Relaxed);
                                     last_mouse_event = Instant::now();
-                                } else if code == REL_HWHEEL || code == REL_WHEEL_HI_RES {
+                                    if jiggler_enabled {
+                                        mouse_tracker.record(now);
+                                    }
+                                } else if code == REL_WHEEL
+                                    || code == REL_HWHEEL
+                                    || code == REL_WHEEL_HI_RES
+                                    || code == REL_HWHEEL_HI_RES
+                                {
                                     scroll_events.fetch_add(1, Ordering::Relaxed);
+                                    last_activity.store(now, Ordering::Relaxed);
+                                    last_mouse_event = Instant::now();
+                                }
+                            }
+                            evdev::EventType::ABSOLUTE => {
+                                let code = ev.code();
+                                if code == ABS_X
+                                    || code == ABS_Y
+                                    || code == ABS_MT_POSITION_X
+                                    || code == ABS_MT_POSITION_Y
+                                {
                                     last_activity.store(now, Ordering::Relaxed);
                                     last_mouse_event = Instant::now();
                                 }
@@ -234,6 +399,14 @@ pub fn start_idle_monitor(start: Instant) -> InputStats {
                     }
                 }
             }
+            if jiggler_enabled
+                && loop_now.duration_since(last_jiggler_check) >= JIGGLER_CHECK_INTERVAL
+            {
+                let artificial = kb_tracker.is_artificial() || mouse_tracker.is_artificial();
+                jiggler_pattern_flag.store(artificial, Ordering::Relaxed);
+                last_jiggler_check = loop_now;
+            }
+
             thread::sleep(Duration::from_millis(10));
         }
     });

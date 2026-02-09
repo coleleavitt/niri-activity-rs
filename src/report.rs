@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use chrono::{Local, LocalResult, Timelike, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
-use crate::config::{get_data_dir, load_config, Category, Config};
+use crate::config::{Category, Config, get_data_dir, load_config};
 use crate::db::run_migrations;
 use crate::error::Error;
 use crate::fmt::{fmt_distance, fmt_duration, fmt_duration_compact, fmt_hms, pct, truncate};
@@ -34,7 +34,7 @@ fn local_day_start_utc(date: chrono::NaiveDate) -> Result<String, Error> {
         LocalResult::None => {
             return Err(Error::NiriError(
                 "local day start is not representable".into(),
-            ))
+            ));
         }
     };
     Ok(local_dt.with_timezone(&Utc).to_rfc3339())
@@ -57,7 +57,7 @@ pub fn show_today(app: &App) -> Result<(), Error> {
     let day_start_utc = local_day_start_utc(local_today)?;
 
     let mut stmt = app.conn.prepare(
-        "SELECT app_id, category, SUM(active_ms + idle_ms) as total_ms 
+        "SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) as total_ms 
          FROM events 
          WHERE timestamp >= ?1 
          GROUP BY app_id 
@@ -103,6 +103,7 @@ struct Metrics {
     unproductive_ms: i64,
     neutral_ms: i64,
     productive_active_ms: i64,
+    productive_passive_ms: i64,
     productive_idle_ms: i64,
 }
 
@@ -111,7 +112,7 @@ pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
     let since_utc = local_day_start_utc(since_local)?;
 
     let mut stmt = app.conn.prepare(
-        "SELECT category, SUM(active_ms) as active, SUM(idle_ms) as idle
+        "SELECT category, SUM(active_ms) as active, COALESCE(SUM(passive_ms),0) as passive, SUM(idle_ms) as idle
          FROM events 
          WHERE timestamp >= ?1 
          GROUP BY category",
@@ -124,18 +125,20 @@ pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
         ))
     })?;
 
     for row in rows {
-        let (category_raw, active_ms, idle_ms) = row?;
-        let total = active_ms + idle_ms;
+        let (category_raw, active_ms, passive_ms, idle_ms) = row?;
+        let total = active_ms + passive_ms + idle_ms;
         m.total_ms += total;
 
         match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
             Category::Productive => {
                 m.productive_ms += total;
                 m.productive_active_ms += active_ms;
+                m.productive_passive_ms += passive_ms;
                 m.productive_idle_ms += idle_ms;
             }
             Category::Unproductive => {
@@ -171,12 +174,17 @@ pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
     );
     println!();
     println!(
-        "Productive Active Time:  {} ({})",
+        "Productive Active:       {} ({})",
         fmt_duration(m.productive_active_ms),
         pct(m.productive_active_ms, m.productive_ms)
     );
     println!(
-        "Productive Passive Time: {} ({})",
+        "Productive Passive:      {} ({})",
+        fmt_duration(m.productive_passive_ms),
+        pct(m.productive_passive_ms, m.productive_ms)
+    );
+    println!(
+        "Productive Idle:         {} ({})",
         fmt_duration(m.productive_idle_ms),
         pct(m.productive_idle_ms, m.productive_ms)
     );
@@ -191,7 +199,7 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
     let day_end_utc = local_day_end_utc(target_local)?;
 
     let mut stmt = app.conn.prepare(
-        "SELECT timestamp, app_id, category, active_ms, idle_ms, keystrokes
+        "SELECT timestamp, app_id, category, active_ms, COALESCE(passive_ms,0), idle_ms, keystrokes
          FROM events
          WHERE timestamp >= ?1 AND timestamp < ?2
          ORDER BY timestamp",
@@ -202,6 +210,7 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
         app_id: String,
         category: String,
         active_ms: i64,
+        passive_ms: i64,
         idle_ms: i64,
         keystrokes: i64,
     }
@@ -213,8 +222,9 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
                 app_id: row.get(1)?,
                 category: row.get(2)?,
                 active_ms: row.get(3)?,
-                idle_ms: row.get(4)?,
-                keystrokes: row.get(5)?,
+                passive_ms: row.get(4)?,
+                idle_ms: row.get(5)?,
+                keystrokes: row.get(6)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -244,7 +254,7 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
 
         let minutes_since_midnight = ts.hour() * 60 + ts.minute();
         let bucket_key = minutes_since_midnight / bucket_min * bucket_min;
-        let total_ms = ev.active_ms + ev.idle_ms;
+        let total_ms = ev.active_ms + ev.passive_ms + ev.idle_ms;
 
         let b = buckets.entry(bucket_key).or_insert_with(|| Bucket {
             productive_ms: 0,
@@ -261,7 +271,7 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
             Category::Unproductive => b.unproductive_ms += total_ms,
             Category::Neutral => b.neutral_ms += total_ms,
         }
-        b.idle_ms += ev.idle_ms;
+        b.idle_ms += ev.passive_ms + ev.idle_ms;
         b.keystrokes += ev.keystrokes;
 
         if total_ms > b.dominant_app_ms {
@@ -347,17 +357,22 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
     let (
         total_ms,
         active_ms,
+        passive_ms,
         idle_ms,
         total_keys,
         total_clicks,
         total_scroll,
         total_distance,
         total_events,
-    ): (i64, i64, i64, i64, i64, i64, i64, i64) = app.conn.query_row(
-        "SELECT COALESCE(SUM(active_ms + idle_ms),0), COALESCE(SUM(active_ms),0),
+        jiggler_count,
+    ): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = app.conn.query_row(
+        "SELECT COALESCE(SUM(active_ms + COALESCE(passive_ms,0) + idle_ms),0),
+                COALESCE(SUM(active_ms),0),
+                COALESCE(SUM(passive_ms),0),
                 COALESCE(SUM(idle_ms),0), COALESCE(SUM(keystrokes),0),
                 COALESCE(SUM(mouse_clicks),0), COALESCE(SUM(scroll_events),0),
-                COALESCE(SUM(mouse_distance),0), COUNT(*)
+                COALESCE(SUM(mouse_distance),0), COUNT(*),
+                COALESCE(SUM(CASE WHEN jiggler_detected = 1 THEN 1 ELSE 0 END),0)
          FROM events WHERE timestamp >= ?1",
         params![&since_utc],
         |row| {
@@ -370,6 +385,8 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
                 row.get(5)?,
                 row.get(6)?,
                 row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
             ))
         },
     )?;
@@ -387,6 +404,11 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
         pct(active_ms, total_ms)
     );
     println!(
+        "  Passive:            {} ({})",
+        fmt_duration(passive_ms),
+        pct(passive_ms, total_ms)
+    );
+    println!(
         "  Idle/AFK:           {} ({})",
         fmt_duration(idle_ms),
         pct(idle_ms, total_ms)
@@ -399,13 +421,19 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
         "  Mouse Travel:       {}",
         fmt_distance(total_distance, app.config.mouse_dpi)
     );
+    if jiggler_count > 0 {
+        println!(
+            "  Jiggler Events:     {} (artificial input detected)",
+            jiggler_count
+        );
+    }
 
     println!("\n── Productivity ──────────────────────────────────────");
 
     let mut cat_stmt = app.conn.prepare(
-        "SELECT category, SUM(active_ms + idle_ms), SUM(active_ms), SUM(idle_ms)
+        "SELECT category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(idle_ms)
          FROM events WHERE timestamp >= ?1
-         GROUP BY category ORDER BY SUM(active_ms + idle_ms) DESC",
+         GROUP BY category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC",
     )?;
 
     let cats: Vec<(String, i64, i64, i64)> = cat_stmt
@@ -442,9 +470,9 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
     println!("\n── Top Applications ──────────────────────────────────");
 
     let mut app_stmt = app.conn.prepare(
-        "SELECT app_id, category, SUM(active_ms + idle_ms), SUM(active_ms), SUM(keystrokes), SUM(mouse_clicks)
+        "SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(keystrokes), SUM(mouse_clicks)
          FROM events WHERE timestamp >= ?1
-         GROUP BY app_id, category ORDER BY SUM(active_ms + idle_ms) DESC
+         GROUP BY app_id, category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC
          LIMIT 15",
     )?;
 
@@ -493,13 +521,14 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
     }
 
     let mut raw_stmt = app.conn.prepare(
-        "SELECT timestamp, active_ms, idle_ms, keystrokes
+        "SELECT timestamp, active_ms, COALESCE(passive_ms,0), idle_ms, keystrokes
          FROM events WHERE timestamp >= ?1",
     )?;
 
     struct RawRow {
         timestamp: String,
         active_ms: i64,
+        passive_ms: i64,
         idle_ms: i64,
         keystrokes: i64,
     }
@@ -509,8 +538,9 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
             Ok(RawRow {
                 timestamp: row.get(0)?,
                 active_ms: row.get(1)?,
-                idle_ms: row.get(2)?,
-                keystrokes: row.get(3)?,
+                passive_ms: row.get(2)?,
+                idle_ms: row.get(3)?,
+                keystrokes: row.get(4)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -529,7 +559,7 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
 
         let day_key = local_dt.format("%Y-%m-%d").to_string();
         let hour_key = local_dt.hour();
-        let total = row.active_ms + row.idle_ms;
+        let total = row.active_ms + row.passive_ms + row.idle_ms;
 
         let d = daily.entry(day_key).or_insert((0, 0, 0, 0));
         d.0 += total;
@@ -567,7 +597,7 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
             let Some(local_dt) = parse_timestamp_local(&row.timestamp) else {
                 continue;
             };
-            let total = row.active_ms + row.idle_ms;
+            let total = row.active_ms + row.passive_ms + row.idle_ms;
             if app.config.schedule.is_in_schedule(&local_dt) {
                 work_total_ms += total;
                 work_active_ms += row.active_ms;
@@ -634,7 +664,7 @@ pub fn export_csv(app: &App, days: u32) -> Result<(), Error> {
 
     println!(
         "Date,Screen Time (h:mm:ss),Productive (h:mm:ss),Unproductive (h:mm:ss),\
-         Undefined (h:mm:ss),ProdActive (h:mm:ss),ProdPassive (h:mm:ss),\
+         Undefined (h:mm:ss),ProdActive (h:mm:ss),ProdPassive (h:mm:ss),ProdIdle (h:mm:ss),\
          Productive Ratio,Productive Active %"
     );
 
@@ -644,7 +674,7 @@ pub fn export_csv(app: &App, days: u32) -> Result<(), Error> {
         let day_end = local_day_end_utc(date)?;
 
         let mut stmt = app.conn.prepare(
-            "SELECT category, SUM(active_ms), SUM(idle_ms)
+            "SELECT category, SUM(active_ms), COALESCE(SUM(passive_ms),0), SUM(idle_ms)
              FROM events
              WHERE timestamp >= ?1 AND timestamp < ?2
              GROUP BY category",
@@ -657,18 +687,20 @@ pub fn export_csv(app: &App, days: u32) -> Result<(), Error> {
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })?;
 
         for row in rows {
-            let (category_raw, active_ms, idle_ms) = row?;
-            let total = active_ms.saturating_add(idle_ms);
+            let (category_raw, active_ms, passive_ms, idle_ms) = row?;
+            let total = active_ms.saturating_add(passive_ms).saturating_add(idle_ms);
             m.total_ms = m.total_ms.saturating_add(total);
 
             match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
                 Category::Productive => {
                     m.productive_ms = m.productive_ms.saturating_add(total);
                     m.productive_active_ms = m.productive_active_ms.saturating_add(active_ms);
+                    m.productive_passive_ms = m.productive_passive_ms.saturating_add(passive_ms);
                     m.productive_idle_ms = m.productive_idle_ms.saturating_add(idle_ms);
                 }
                 Category::Unproductive => {
@@ -695,13 +727,14 @@ pub fn export_csv(app: &App, days: u32) -> Result<(), Error> {
         };
 
         println!(
-            "{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{}",
             date,
             fmt_hms(m.total_ms),
             fmt_hms(m.productive_ms),
             fmt_hms(m.unproductive_ms),
             fmt_hms(m.neutral_ms),
             fmt_hms(m.productive_active_ms),
+            fmt_hms(m.productive_passive_ms),
             fmt_hms(m.productive_idle_ms),
             prod_ratio,
             prod_active_pct,
