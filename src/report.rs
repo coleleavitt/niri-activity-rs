@@ -895,12 +895,19 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
     );
 
     const BAR_WIDTH: usize = 20;
+    let max_app_ms = data
+        .top_apps
+        .first()
+        .map(|g| g.total_ms)
+        .unwrap_or(1)
+        .max(1);
 
     for group in &data.top_apps {
         if group.children.len() == 1 {
             let row = &group.children[0];
             let filled =
-                (row.total_ms as f64 / data.total_ms as f64 * BAR_WIDTH as f64).round() as usize;
+                (row.total_ms as f64 / max_app_ms as f64 * BAR_WIDTH as f64).round() as usize;
+            let filled = filled.max(1);
             let bar = format!(
                 "{}{}",
                 cat_bar(row.category, filled),
@@ -912,9 +919,10 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
             } else {
                 "-".to_string()
             };
+            let name = format!("{:<22}", truncate(&row.app_id, 22));
             println!(
-                "  {:<22} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks  ({})",
-                cat_colored(row.category, &truncate(&row.app_id, 22)),
+                "  {} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks  ({})",
+                cat_colored(row.category, &name),
                 bar,
                 fmt_duration(row.total_ms).bold(),
                 row.keys,
@@ -924,7 +932,8 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
             );
         } else {
             let filled =
-                (group.total_ms as f64 / data.total_ms as f64 * BAR_WIDTH as f64).round() as usize;
+                (group.total_ms as f64 / max_app_ms as f64 * BAR_WIDTH as f64).round() as usize;
+            let filled = filled.max(1);
             let active_min = group.active_ms as f64 / 60_000.0;
             let keys_per_min = if active_min > 0.5 {
                 format!("{:.0}/m", group.keys as f64 / active_min)
@@ -953,9 +962,10 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
                 " ".repeat(BAR_WIDTH.saturating_sub(filled))
             );
 
+            let name = format!("{:<22}", truncate(&group.app_id, 22));
             println!(
-                "  {:<22} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks",
-                truncate(&group.app_id, 22).bold(),
+                "  {} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks",
+                name.bold(),
                 bar,
                 fmt_duration(group.total_ms).bold(),
                 group.keys,
