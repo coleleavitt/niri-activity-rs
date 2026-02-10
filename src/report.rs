@@ -971,10 +971,21 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
             let last_idx = group.children.len().saturating_sub(1);
             for (i, child) in group.children.iter().enumerate() {
                 let connector = if i == last_idx { "└─" } else { "├─" };
+                let label_raw = match child.category {
+                    Category::Productive => "productive",
+                    Category::Unproductive => "unproductive",
+                    Category::Neutral => "neutral",
+                };
+                let padded = format!("{:<14}", label_raw);
+                let label = match child.category {
+                    Category::Productive => padded.green().bold().to_string(),
+                    Category::Unproductive => padded.red().bold().to_string(),
+                    Category::Neutral => padded.yellow().bold().to_string(),
+                };
                 println!(
-                    "    {} {:<14} {:>8}  {:>5} keys  {:>3} clicks",
+                    "    {} {} {:>8}  {:>5} keys  {:>3} clicks",
                     connector.dimmed(),
-                    cat_label(child.category),
+                    label,
                     fmt_duration(child.total_ms),
                     child.keys,
                     child.clicks,
