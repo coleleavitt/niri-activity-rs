@@ -187,7 +187,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let mut last_idle_check = Instant::now();
     let mut last_flush = Instant::now();
     let mut is_locked = false;
-    let mut jiggler_was_detected = false;
     let mut current_state = ActivityState::Active;
     const FLUSH_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -210,7 +209,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         passive_ms: accumulated_passive_ms,
                         idle_ms: accumulated_idle_ms,
                         input,
-                        jiggler_detected: jiggler || jiggler_was_detected,
+                        jiggler_detected: jiggler,
                     },
                 )?;
                 let total = accumulated_active_ms + accumulated_passive_ms + accumulated_idle_ms;
@@ -241,7 +240,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         passive_ms: accumulated_passive_ms,
                         idle_ms: accumulated_idle_ms,
                         input,
-                        jiggler_detected: jiggler || jiggler_was_detected,
+                        jiggler_detected: jiggler,
                     },
                 )?;
             }
@@ -262,7 +261,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             accumulated_active_ms = 0;
             accumulated_passive_ms = 0;
             accumulated_idle_ms = 0;
-            jiggler_was_detected = false;
             last_idle_check = now_instant;
             last_flush = now_instant;
             if !quiet {
@@ -293,10 +291,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             }
             current_state = new_state;
 
-            if input_stats.jiggler_detected() {
-                jiggler_was_detected = true;
-            }
-
             let elapsed_since_last_check =
                 now_instant.duration_since(last_idle_check).as_millis() as i64;
             match current_state {
@@ -321,9 +315,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             passive_ms: accumulated_passive_ms,
                             idle_ms: accumulated_idle_ms,
                             input,
-                            jiggler_detected: jiggler || jiggler_was_detected,
-                        },
-                    )?;
+                        jiggler_detected: jiggler,
+                    },
+                )?;
                     if !quiet {
                         let total =
                             accumulated_active_ms + accumulated_passive_ms + accumulated_idle_ms;
@@ -338,7 +332,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     accumulated_active_ms = 0;
                     accumulated_passive_ms = 0;
                     accumulated_idle_ms = 0;
-                    jiggler_was_detected = false;
                 }
                 last_flush = now_instant;
             }
@@ -397,7 +390,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     accumulated_active_ms = 0;
                     accumulated_passive_ms = 0;
                     accumulated_idle_ms = 0;
-                    jiggler_was_detected = false;
                     last_idle_check = now_instant;
                     last_flush = now_instant;
                     continue;
@@ -406,7 +398,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 let jiggler = input_stats.jiggler_detected();
 
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
-                    let session_jiggler = jiggler || jiggler_was_detected;
                     insert_event(
                         &conn,
                         SessionSnapshot {
@@ -417,7 +408,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             passive_ms: accumulated_passive_ms,
                             idle_ms: accumulated_idle_ms,
                             input,
-                            jiggler_detected: session_jiggler,
+                            jiggler_detected: jiggler,
                         },
                     )?;
 
@@ -443,7 +434,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         } else {
                             0
                         };
-                        let jiggler_tag = if session_jiggler {
+                        let jiggler_tag = if jiggler {
                             format!(" {}", "[JIGGLER]".red().bold())
                         } else {
                             String::new()
@@ -478,7 +469,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 accumulated_active_ms = 0;
                 accumulated_passive_ms = 0;
                 accumulated_idle_ms = 0;
-                jiggler_was_detected = false;
                 current_state = ActivityState::Active;
                 last_idle_check = now_instant;
                 last_flush = now_instant;

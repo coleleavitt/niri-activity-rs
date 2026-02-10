@@ -38,6 +38,9 @@ pub struct InputStats {
     mouse_distance: Arc<AtomicU64>,
     jiggler_pattern: Arc<AtomicBool>,
     jiggler_process: Arc<AtomicBool>,
+    /// Timestamp (ms since start) of the last keyboard event — used to suppress
+    /// jiggler detection when the user is also typing (real jigglers don't type).
+    last_keyboard_ms: Arc<AtomicU64>,
 }
 
 impl InputStats {
@@ -200,6 +203,7 @@ pub fn start_idle_monitor(start: Instant, jiggler_config: JigglerConfig) -> Inpu
         mouse_distance: Arc::new(AtomicU64::new(0)),
         jiggler_pattern: Arc::new(AtomicBool::new(false)),
         jiggler_process: Arc::new(AtomicBool::new(false)),
+        last_keyboard_ms: Arc::new(AtomicU64::new(0)),
     };
 
     let last_activity = Arc::clone(&stats.last_activity_ms);
@@ -208,6 +212,7 @@ pub fn start_idle_monitor(start: Instant, jiggler_config: JigglerConfig) -> Inpu
     let scroll_events = Arc::clone(&stats.scroll_events);
     let mouse_distance = Arc::clone(&stats.mouse_distance);
     let jiggler_pattern_flag = Arc::clone(&stats.jiggler_pattern);
+    let last_keyboard_ms = Arc::clone(&stats.last_keyboard_ms);
 
     let devices_changed = Arc::new(AtomicBool::new(false));
     let devices_changed_clone = Arc::clone(&devices_changed);
@@ -356,6 +361,7 @@ pub fn start_idle_monitor(start: Instant, jiggler_config: JigglerConfig) -> Inpu
                                         keystrokes.fetch_add(1, Ordering::Relaxed);
                                         last_activity.store(now, Ordering::Relaxed);
                                         last_keyboard_event = Instant::now();
+                                        last_keyboard_ms.store(now, Ordering::Relaxed);
                                         if jiggler_enabled {
                                             kb_tracker.record(now);
                                         }
@@ -406,7 +412,13 @@ pub fn start_idle_monitor(start: Instant, jiggler_config: JigglerConfig) -> Inpu
             if jiggler_enabled
                 && loop_now.duration_since(last_jiggler_check) >= JIGGLER_CHECK_INTERVAL
             {
-                let artificial = kb_tracker.is_artificial() || mouse_tracker.is_artificial();
+                let now_ms = start.elapsed().as_millis() as u64;
+                let kb_ms = last_keyboard_ms.load(Ordering::Relaxed);
+                let kb_age_ms = now_ms.saturating_sub(kb_ms);
+                let window_ms = jiggler_config.window_secs.saturating_mul(1000);
+
+                let mouse_artificial = mouse_tracker.is_artificial() && kb_age_ms >= window_ms;
+                let artificial = kb_tracker.is_artificial() || mouse_artificial;
                 jiggler_pattern_flag.store(artificial, Ordering::Relaxed);
                 last_jiggler_check = loop_now;
             }
