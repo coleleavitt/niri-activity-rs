@@ -9,8 +9,8 @@ use crate::config::{get_data_dir, load_config, Category, Config};
 use crate::db::{reclassify_all, run_migrations};
 use crate::error::Error;
 use crate::fmt::{
-    cat_bar, cat_colored, cat_label, colored_bar, fmt_distance, fmt_duration, fmt_duration_compact,
-    fmt_hms, pct, section_header, truncate,
+    cat_bar, cat_bar_fractional, cat_colored, cat_label, colored_bar, fmt_distance, fmt_duration,
+    fmt_duration_compact, fmt_hms, pct, section_header, truncate,
 };
 
 pub struct App {
@@ -905,14 +905,9 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
     for group in &data.top_apps {
         if group.children.len() == 1 {
             let row = &group.children[0];
-            let filled =
-                (row.total_ms as f64 / max_app_ms as f64 * BAR_WIDTH as f64).round() as usize;
-            let filled = filled.max(1);
-            let bar = format!(
-                "{}{}",
-                cat_bar(row.category, filled),
-                " ".repeat(BAR_WIDTH.saturating_sub(filled))
-            );
+            let frac_blocks =
+                (row.total_ms as f64 / max_app_ms as f64 * BAR_WIDTH as f64).max(0.125);
+            let bar = cat_bar_fractional(row.category, frac_blocks, BAR_WIDTH);
             let active_min = row.active_ms as f64 / 60_000.0;
             let keys_per_min = if active_min > 0.5 {
                 format!("{:.0}/m", row.keys as f64 / active_min)

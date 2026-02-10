@@ -58,17 +58,44 @@ pub fn fmt_distance(counts: i64, mouse_dpi: f64) -> String {
     }
 }
 
-pub fn colored_bar(prod_frac: f64, neutral_frac: f64, unprod_frac: f64, width: usize) -> String {
+fn fractional_block(remainder: f64) -> &'static str {
+    let idx = (remainder * 8.0).round() as usize;
+    match idx {
+        0 => "",
+        1 => "▏",
+        2 => "▎",
+        3 => "▍",
+        4 => "▌",
+        5 => "▋",
+        6 => "▊",
+        7 => "▉",
+        _ => "█",
+    }
+}
+
+pub fn cat_bar_fractional(category: Category, frac_blocks: f64, width: usize) -> String {
+    let full = frac_blocks.floor() as usize;
+    let remainder = frac_blocks - full as f64;
+    let partial = fractional_block(remainder);
+    let used = full + if partial.is_empty() { 0 } else { 1 };
+    let pad = width.saturating_sub(used);
+    let bar = format!("{}{}{}", "█".repeat(full), partial, " ".repeat(pad));
+    match category {
+        Category::Productive => bar.green().to_string(),
+        Category::Unproductive => bar.red().to_string(),
+        Category::Neutral => bar.yellow().to_string(),
+    }
+}
+
+pub fn colored_bar(prod_frac: f64, neutral_frac: f64, _unprod_frac: f64, width: usize) -> String {
     let prod_chars = (prod_frac * width as f64).round() as usize;
     let neutral_chars = (neutral_frac * width as f64).round() as usize;
-    let unprod_chars = (unprod_frac * width as f64).round() as usize;
-    let remaining = width.saturating_sub(prod_chars + neutral_chars + unprod_chars);
+    let unprod_chars = width.saturating_sub(prod_chars + neutral_chars);
     format!(
-        "{}{}{}{}",
+        "{}{}{}",
         "█".repeat(prod_chars).green(),
         "█".repeat(neutral_chars).yellow(),
         "█".repeat(unprod_chars).red(),
-        " ".repeat(remaining),
     )
 }
 
