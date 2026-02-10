@@ -42,11 +42,21 @@ impl FromStr for Category {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawTitleRule {
+    pattern: String,
+    category: Category,
+    #[serde(default)]
+    app: Vec<String>,
+    #[serde(default)]
+    regex: bool,
+}
+
+#[derive(Debug)]
 pub struct TitleRule {
     pub pattern: String,
     pub category: Category,
-    #[serde(default)]
     pub app: Vec<String>,
+    pub compiled: Option<regex::Regex>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,20 +90,31 @@ pub struct Schedule {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Config {
+struct RawConfig {
     #[serde(default = "default_idle_threshold")]
-    pub idle_threshold_secs: u64,
+    idle_threshold_secs: u64,
     #[serde(default = "default_deep_idle")]
-    pub deep_idle_secs: u64,
+    deep_idle_secs: u64,
     #[serde(default = "default_mouse_dpi")]
+    mouse_dpi: f64,
+    #[serde(default)]
+    schedule: Schedule,
+    #[serde(default)]
+    jiggler: JigglerConfig,
+    #[serde(default)]
+    categories: HashMap<String, Category>,
+    #[serde(default)]
+    title_rules: Vec<RawTitleRule>,
+}
+
+#[derive(Debug)]
+pub struct Config {
+    pub idle_threshold_secs: u64,
+    pub deep_idle_secs: u64,
     pub mouse_dpi: f64,
-    #[serde(default)]
     pub schedule: Schedule,
-    #[serde(default)]
     pub jiggler: JigglerConfig,
-    #[serde(default)]
     pub categories: HashMap<String, Category>,
-    #[serde(default)]
     pub title_rules: Vec<TitleRule>,
 }
 
@@ -158,6 +179,46 @@ fn default_schedule_days() -> Vec<String> {
         "Thu".to_string(),
         "Fri".to_string(),
     ]
+}
+
+impl From<RawConfig> for Config {
+    fn from(raw: RawConfig) -> Self {
+        let title_rules = raw
+            .title_rules
+            .into_iter()
+            .map(|r| {
+                let compiled = if r.regex {
+                    match regex::RegexBuilder::new(&r.pattern)
+                        .case_insensitive(true)
+                        .build()
+                    {
+                        Ok(re) => Some(re),
+                        Err(e) => {
+                            eprintln!("Warning: invalid regex pattern '{}': {}", r.pattern, e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                TitleRule {
+                    pattern: r.pattern,
+                    category: r.category,
+                    app: r.app,
+                    compiled,
+                }
+            })
+            .collect();
+        Self {
+            idle_threshold_secs: raw.idle_threshold_secs,
+            deep_idle_secs: raw.deep_idle_secs,
+            mouse_dpi: raw.mouse_dpi,
+            schedule: raw.schedule,
+            jiggler: raw.jiggler,
+            categories: raw.categories,
+            title_rules,
+        }
+    }
 }
 
 impl Default for Config {
@@ -233,7 +294,12 @@ impl Config {
             if !rule.app.is_empty() && !rule.app.iter().any(|a| a.eq_ignore_ascii_case(app_id)) {
                 continue;
             }
-            if title_lower.contains(&rule.pattern.to_lowercase()) {
+            let matched = if let Some(re) = &rule.compiled {
+                re.is_match(title)
+            } else {
+                title_lower.contains(&rule.pattern.to_lowercase())
+            };
+            if matched {
                 return rule.category;
             }
         }
@@ -305,7 +371,8 @@ pub fn load_config() -> Result<Config, Error> {
     let config_path = get_config_path()?;
     if config_path.exists() {
         let content = fs::read_to_string(&config_path)?;
-        Ok(toml::from_str(&content)?)
+        let raw: RawConfig = toml::from_str(&content)?;
+        Ok(Config::from(raw))
     } else {
         Ok(Config::default())
     }
@@ -379,53 +446,23 @@ process_blacklist = [
 \"vlc\" = \"unproductive\"
 \"mpv\" = \"unproductive\"
 
-# Title rules — override category based on window title (case-insensitive substring match)
-# Checked BEFORE app-level categories, so these take priority.
-#
-# Optional: add app = [\"zen\", \"firefox\"] to limit a rule to specific apps.
-# Without app, the rule applies to ALL windows (including terminals, IDEs, etc).
+# Title rules — override category based on window title (case-insensitive).
+# Default: substring match. Add regex = true for regex patterns.
+# Optional: app = [\"zen\", \"firefox\"] limits rule to those apps.
+# Checked BEFORE app-level categories.
 
-# Browser-only rules — won't misclassify terminal windows working on \"spotify-rs\"
+# Browser-only: one regex rule replaces many substring rules
 [[title_rules]]
-pattern = \"YouTube\"
+pattern = \"YouTube|Instagram|Spotify|Discord|Reddit|TikTok|Twitter|Twitch|Netflix\"
 category = \"unproductive\"
-app = [\"zen\", \"firefox\", \"chromium\"]
+app = [\"zen\", \"firefox\", \"chromium\", \"chromium-browser\", \"spotify\"]
+regex = true
 
+# Global productive patterns
 [[title_rules]]
-pattern = \"Instagram\"
-category = \"unproductive\"
-app = [\"zen\", \"firefox\", \"chromium\"]
-
-[[title_rules]]
-pattern = \"Spotify\"
-category = \"unproductive\"
-app = [\"zen\", \"firefox\", \"chromium\", \"spotify\"]
-
-[[title_rules]]
-pattern = \"Discord\"
-category = \"unproductive\"
-app = [\"zen\", \"firefox\", \"chromium\"]
-
-[[title_rules]]
-pattern = \"Reddit\"
-category = \"unproductive\"
-app = [\"zen\", \"firefox\", \"chromium\"]
-
-# These are safe as global rules — unlikely false positives
-[[title_rules]]
-pattern = \"GitHub\"
+pattern = \"GitHub|Stack Overflow|docs\\.rs|LinkedIn\"
 category = \"productive\"
-
-[[title_rules]]
-pattern = \"LinkedIn\"
-category = \"productive\"
-
-[[title_rules]]
-pattern = \"Stack Overflow\"
-category = \"productive\"
-
-[[title_rules]]
-pattern = \"docs.rs\"
+regex = true
 category = \"productive\"
 
 # Work schedule — only affects report breakdown (tracking is always on)
@@ -504,5 +541,98 @@ mod tests {
         };
         assert_eq!(config.classify("jetbrains-clion", ""), Category::Productive);
         assert_eq!(config.classify("code", ""), Category::Neutral);
+    }
+
+    #[test]
+    fn title_rule_substring_default() {
+        let config = Config {
+            title_rules: vec![TitleRule {
+                pattern: "YouTube".to_string(),
+                category: Category::Unproductive,
+                app: vec![],
+                compiled: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            config.classify("zen", "Watching YouTube - Firefox"),
+            Category::Unproductive
+        );
+        assert_eq!(config.classify("zen", "GitHub PR #42"), Category::Neutral);
+    }
+
+    #[test]
+    fn title_rule_regex() {
+        let re = regex::RegexBuilder::new("YouTube|Reddit|TikTok")
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let config = Config {
+            title_rules: vec![TitleRule {
+                pattern: "YouTube|Reddit|TikTok".to_string(),
+                category: Category::Unproductive,
+                app: vec![],
+                compiled: Some(re),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            config.classify("zen", "Funny reddit thread"),
+            Category::Unproductive
+        );
+        assert_eq!(
+            config.classify("zen", "TikTok - For You"),
+            Category::Unproductive
+        );
+        assert_eq!(
+            config.classify("zen", "Rust documentation"),
+            Category::Neutral
+        );
+    }
+
+    #[test]
+    fn title_rule_regex_case_insensitive() {
+        let re = regex::RegexBuilder::new("GitHub")
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let config = Config {
+            title_rules: vec![TitleRule {
+                pattern: "GitHub".to_string(),
+                category: Category::Productive,
+                app: vec![],
+                compiled: Some(re),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            config.classify("zen", "github.com/coleleavitt"),
+            Category::Productive
+        );
+    }
+
+    #[test]
+    fn title_rule_app_scoped_regex() {
+        let re = regex::RegexBuilder::new("YouTube|Spotify")
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let config = Config {
+            title_rules: vec![TitleRule {
+                pattern: "YouTube|Spotify".to_string(),
+                category: Category::Unproductive,
+                app: vec!["zen".to_string(), "firefox".to_string()],
+                compiled: Some(re),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            config.classify("zen", "YouTube - Music"),
+            Category::Unproductive
+        );
+        assert_eq!(
+            config.classify("Alacritty", "vim spotify-rs/src/main.rs"),
+            Category::Neutral
+        );
     }
 }

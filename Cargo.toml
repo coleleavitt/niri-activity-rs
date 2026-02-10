@@ -19,3 +19,4 @@ inotify = { version = "0.11", default-features = false }
 owo-colors = "4.2.3"
 ratatui = "0.30.0"
 crossterm = { path = "../../forks/crossterm" }
+regex = "1.12.3"
