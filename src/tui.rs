@@ -489,30 +489,98 @@ fn render_apps(app: &TuiApp, area: Rect, frame: &mut Frame) {
         Cell::from("Category").style(THEME.table_header),
     ]);
 
-    let rows: Vec<Row> = rpt
-        .top_apps
-        .iter()
-        .enumerate()
-        .map(|(i, a)| {
-            let base = if i % 2 == 0 {
-                THEME.table_row
-            } else {
-                THEME.table_row_alt
-            };
+    let mut rows: Vec<Row> = Vec::new();
+
+    for (row_idx, group) in rpt.top_apps.iter().enumerate() {
+        let base = if row_idx.is_multiple_of(2) {
+            THEME.table_row
+        } else {
+            THEME.table_row_alt
+        };
+
+        if group.children.len() == 1 {
+            let a = &group.children[0];
             let bar_len = (a.total_ms as f64 / total_ms as f64 * 20.0).round() as usize;
             let bar_span = Span::styled("█".repeat(bar_len), category_style(a.category));
 
-            Row::new(vec![
-                Cell::from(a.app_id.clone()).style(category_style(a.category)),
-                Cell::from(Line::from(bar_span)),
-                Cell::from(fmt_duration(a.total_ms)).style(THEME.value),
-                Cell::from(format!("{}", a.keys)).style(THEME.value_dim),
-                Cell::from(format!("{}", a.clicks)).style(THEME.value_dim),
-                Cell::from(format!("{}", a.category)).style(category_style(a.category)),
-            ])
-            .style(base)
-        })
-        .collect();
+            rows.push(
+                Row::new(vec![
+                    Cell::from(a.app_id.clone()).style(category_style(a.category)),
+                    Cell::from(Line::from(bar_span)),
+                    Cell::from(fmt_duration(a.total_ms)).style(THEME.value),
+                    Cell::from(format!("{}", a.keys)).style(THEME.value_dim),
+                    Cell::from(format!("{}", a.clicks)).style(THEME.value_dim),
+                    Cell::from(format!("{}", a.category)).style(category_style(a.category)),
+                ])
+                .style(base),
+            );
+        } else {
+            let bar_len = (group.total_ms as f64 / total_ms as f64 * 20.0).round() as usize;
+            let mut prod_ms: i64 = 0;
+            let mut neutral_ms: i64 = 0;
+            let mut unprod_ms: i64 = 0;
+            for child in &group.children {
+                match child.category {
+                    crate::config::Category::Productive => prod_ms += child.total_ms,
+                    crate::config::Category::Neutral => neutral_ms += child.total_ms,
+                    crate::config::Category::Unproductive => unprod_ms += child.total_ms,
+                }
+            }
+            let total = (prod_ms + neutral_ms + unprod_ms).max(1);
+            let prod_chars =
+                (prod_ms as f64 / total as f64 * bar_len as f64).round() as usize;
+            let neutral_chars =
+                (neutral_ms as f64 / total as f64 * bar_len as f64).round() as usize;
+            let unprod_chars = bar_len.saturating_sub(prod_chars + neutral_chars);
+            let bar_line = Line::from(vec![
+                Span::styled(
+                    "█".repeat(prod_chars),
+                    category_style(crate::config::Category::Productive),
+                ),
+                Span::styled(
+                    "█".repeat(neutral_chars),
+                    category_style(crate::config::Category::Neutral),
+                ),
+                Span::styled(
+                    "█".repeat(unprod_chars),
+                    category_style(crate::config::Category::Unproductive),
+                ),
+            ]);
+
+            rows.push(
+                Row::new(vec![
+                    Cell::from(group.app_id.clone()).style(THEME.value),
+                    Cell::from(bar_line),
+                    Cell::from(fmt_duration(group.total_ms)).style(THEME.value),
+                    Cell::from(format!("{}", group.keys)).style(THEME.value_dim),
+                    Cell::from(format!("{}", group.clicks)).style(THEME.value_dim),
+                    Cell::from("mixed").style(THEME.value_dim),
+                ])
+                .style(base),
+            );
+
+            for (i, child) in group.children.iter().enumerate() {
+                let connector = if i == group.children.len() - 1 {
+                    "└─ "
+                } else {
+                    "├─ "
+                };
+                let sub_base = base;
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(format!("  {}{}", connector, child.category))
+                            .style(category_style(child.category)),
+                        Cell::from(""),
+                        Cell::from(fmt_duration(child.total_ms)).style(THEME.value_dim),
+                        Cell::from(format!("{}", child.keys)).style(THEME.value_dim),
+                        Cell::from(format!("{}", child.clicks)).style(THEME.value_dim),
+                        Cell::from(""),
+                    ])
+                    .style(sub_base),
+                );
+            }
+        }
+    }
 
     let table = Table::new(
         rows,

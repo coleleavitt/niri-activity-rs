@@ -85,6 +85,16 @@ pub struct AppBreakdown {
     pub clicks: i64,
 }
 
+/// Grouped view: one entry per app with per-category sub-entries.
+pub struct AppGroup {
+    pub app_id: String,
+    pub total_ms: i64,
+    pub active_ms: i64,
+    pub keys: i64,
+    pub clicks: i64,
+    pub children: Vec<AppBreakdown>,
+}
+
 pub struct DailyBreakdown {
     pub date: String,
     pub total_ms: i64,
@@ -123,7 +133,7 @@ pub struct ReportData {
     pub total_events: i64,
     pub jiggler_count: i64,
     pub categories: Vec<CategoryBreakdown>,
-    pub top_apps: Vec<AppBreakdown>,
+    pub top_apps: Vec<AppGroup>,
     pub daily: Vec<DailyBreakdown>,
     pub peak_hours: Vec<HourBreakdown>,
     pub schedule: Option<ScheduleBreakdown>,
@@ -510,6 +520,37 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
     Ok(())
 }
 
+fn group_apps(flat: Vec<AppBreakdown>, limit: usize) -> Vec<AppGroup> {
+    let mut map: Vec<(String, AppGroup)> = Vec::new();
+
+    for entry in flat {
+        if let Some((_, group)) = map.iter_mut().find(|(id, _)| *id == entry.app_id) {
+            group.total_ms = group.total_ms.saturating_add(entry.total_ms);
+            group.active_ms = group.active_ms.saturating_add(entry.active_ms);
+            group.keys = group.keys.saturating_add(entry.keys);
+            group.clicks = group.clicks.saturating_add(entry.clicks);
+            group.children.push(entry);
+        } else {
+            let id = entry.app_id.clone();
+            map.push((
+                id,
+                AppGroup {
+                    app_id: entry.app_id.clone(),
+                    total_ms: entry.total_ms,
+                    active_ms: entry.active_ms,
+                    keys: entry.keys,
+                    clicks: entry.clicks,
+                    children: vec![entry],
+                },
+            ));
+        }
+    }
+
+    map.sort_by_key(|(_, g)| std::cmp::Reverse(g.total_ms));
+    map.truncate(limit);
+    map.into_iter().map(|(_, g)| g).collect()
+}
+
 pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
     assert!(days > 0, "report must cover at least 1 day");
     let since_date = Local::now().date_naive() - chrono::Duration::days(days as i64);
@@ -582,11 +623,10 @@ pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
     let mut app_stmt = app.conn.prepare(
         "SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(keystrokes), SUM(mouse_clicks)
          FROM events WHERE timestamp >= ?1
-         GROUP BY app_id, category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC
-         LIMIT 15",
+         GROUP BY app_id, category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC",
     )?;
 
-    let top_apps: Vec<AppBreakdown> = app_stmt
+    let flat_apps: Vec<AppBreakdown> = app_stmt
         .query_map(params![&since_utc], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -609,6 +649,8 @@ pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
             },
         )
         .collect();
+
+    let top_apps = group_apps(flat_apps, 15);
 
     let mut raw_stmt = app.conn.prepare(
         "SELECT timestamp, active_ms, COALESCE(passive_ms,0), idle_ms, keystrokes
@@ -852,24 +894,75 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
         section_header("── Top Applications ──────────────────────────────────")
     );
 
-    for row in &data.top_apps {
-        let bar_len = (row.total_ms as f64 / data.total_ms as f64 * 25.0).round() as usize;
-        let active_min = row.active_ms as f64 / 60_000.0;
-        let keys_per_min = if active_min > 0.5 {
-            format!("{:.0}/m", row.keys as f64 / active_min)
+    for group in &data.top_apps {
+        if group.children.len() == 1 {
+            let row = &group.children[0];
+            let bar_len = (row.total_ms as f64 / data.total_ms as f64 * 25.0).round() as usize;
+            let active_min = row.active_ms as f64 / 60_000.0;
+            let keys_per_min = if active_min > 0.5 {
+                format!("{:.0}/m", row.keys as f64 / active_min)
+            } else {
+                "-".to_string()
+            };
+            println!(
+                "  {:<22} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks  ({})",
+                cat_colored(row.category, &truncate(&row.app_id, 22)),
+                cat_bar(row.category, bar_len),
+                fmt_duration(row.total_ms).bold(),
+                row.keys,
+                keys_per_min.dimmed(),
+                row.clicks,
+                cat_label(row.category),
+            );
         } else {
-            "-".to_string()
-        };
-        println!(
-            "  {:<22} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks  ({})",
-            cat_colored(row.category, &truncate(&row.app_id, 22)),
-            cat_bar(row.category, bar_len),
-            fmt_duration(row.total_ms).bold(),
-            row.keys,
-            keys_per_min.dimmed(),
-            row.clicks,
-            cat_label(row.category),
-        );
+            let bar_len = (group.total_ms as f64 / data.total_ms as f64 * 25.0).round() as usize;
+            let active_min = group.active_ms as f64 / 60_000.0;
+            let keys_per_min = if active_min > 0.5 {
+                format!("{:.0}/m", group.keys as f64 / active_min)
+            } else {
+                "-".to_string()
+            };
+
+            let mut prod_ms: i64 = 0;
+            let mut neutral_ms: i64 = 0;
+            let mut unprod_ms: i64 = 0;
+            for child in &group.children {
+                match child.category {
+                    Category::Productive => prod_ms += child.total_ms,
+                    Category::Neutral => neutral_ms += child.total_ms,
+                    Category::Unproductive => unprod_ms += child.total_ms,
+                }
+            }
+            let bar = colored_bar(
+                prod_ms as f64 / group.total_ms as f64,
+                neutral_ms as f64 / group.total_ms as f64,
+                unprod_ms as f64 / group.total_ms as f64,
+                bar_len,
+            );
+
+            println!(
+                "  {:<22} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks",
+                truncate(&group.app_id, 22).bold(),
+                bar,
+                fmt_duration(group.total_ms).bold(),
+                group.keys,
+                keys_per_min.dimmed(),
+                group.clicks,
+            );
+
+            let last_idx = group.children.len().saturating_sub(1);
+            for (i, child) in group.children.iter().enumerate() {
+                let connector = if i == last_idx { "└─" } else { "├─" };
+                println!(
+                    "    {} {:<14} {:>8}  {:>5} keys  {:>3} clicks",
+                    connector.dimmed(),
+                    cat_label(child.category),
+                    fmt_duration(child.total_ms),
+                    child.keys,
+                    child.clicks,
+                );
+            }
+        }
     }
 
     println!(
