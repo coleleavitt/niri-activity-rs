@@ -894,10 +894,18 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
         section_header("── Top Applications ──────────────────────────────────")
     );
 
+    const BAR_WIDTH: usize = 20;
+
     for group in &data.top_apps {
         if group.children.len() == 1 {
             let row = &group.children[0];
-            let bar_len = (row.total_ms as f64 / data.total_ms as f64 * 25.0).round() as usize;
+            let filled =
+                (row.total_ms as f64 / data.total_ms as f64 * BAR_WIDTH as f64).round() as usize;
+            let bar = format!(
+                "{}{}",
+                cat_bar(row.category, filled),
+                " ".repeat(BAR_WIDTH.saturating_sub(filled))
+            );
             let active_min = row.active_ms as f64 / 60_000.0;
             let keys_per_min = if active_min > 0.5 {
                 format!("{:.0}/m", row.keys as f64 / active_min)
@@ -907,7 +915,7 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
             println!(
                 "  {:<22} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks  ({})",
                 cat_colored(row.category, &truncate(&row.app_id, 22)),
-                cat_bar(row.category, bar_len),
+                bar,
                 fmt_duration(row.total_ms).bold(),
                 row.keys,
                 keys_per_min.dimmed(),
@@ -915,7 +923,8 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
                 cat_label(row.category),
             );
         } else {
-            let bar_len = (group.total_ms as f64 / data.total_ms as f64 * 25.0).round() as usize;
+            let filled =
+                (group.total_ms as f64 / data.total_ms as f64 * BAR_WIDTH as f64).round() as usize;
             let active_min = group.active_ms as f64 / 60_000.0;
             let keys_per_min = if active_min > 0.5 {
                 format!("{:.0}/m", group.keys as f64 / active_min)
@@ -933,11 +942,15 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
                     Category::Unproductive => unprod_ms += child.total_ms,
                 }
             }
-            let bar = colored_bar(
-                prod_ms as f64 / group.total_ms as f64,
-                neutral_ms as f64 / group.total_ms as f64,
-                unprod_ms as f64 / group.total_ms as f64,
-                bar_len,
+            let bar = format!(
+                "{}{}",
+                colored_bar(
+                    prod_ms as f64 / group.total_ms as f64,
+                    neutral_ms as f64 / group.total_ms as f64,
+                    unprod_ms as f64 / group.total_ms as f64,
+                    filled,
+                ),
+                " ".repeat(BAR_WIDTH.saturating_sub(filled))
             );
 
             println!(
