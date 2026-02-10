@@ -16,7 +16,7 @@ use signal_hook::iterator::Signals;
 use owo_colors::OwoColorize;
 
 use crate::config::{Category, get_config_path, get_data_dir, load_config};
-use crate::db::{SessionSnapshot, init_db, insert_event, run_migrations};
+use crate::db::{SessionSnapshot, init_db, insert_event, reclassify_all, run_migrations};
 use crate::error::Error;
 use crate::fmt::{cat_colored, cat_label, fmt_duration_compact, truncate};
 use crate::input::start_idle_monitor;
@@ -138,6 +138,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let conn = Connection::open(&db_path)?;
     init_db(&conn)?;
     run_migrations(&conn, &config)?;
+    reclassify_all(&conn, &config)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);

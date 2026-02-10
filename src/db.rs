@@ -1,5 +1,5 @@
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
 use crate::config::Config;
 use crate::error::Error;
@@ -174,6 +174,37 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
         eprintln!("Migration 004: added passive_ms and jiggler_detected columns");
     }
 
+    Ok(())
+}
+
+pub fn reclassify_all(conn: &Connection, config: &Config) -> Result<(), Error> {
+    let mut stmt = conn.prepare("SELECT id, app_id, title, category FROM events")?;
+    let rows: Vec<(i64, String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut updated = 0i64;
+    for (id, app_id, title, old_category) in &rows {
+        let correct = config.classify(app_id, title).to_string();
+        if correct != *old_category {
+            conn.execute(
+                "UPDATE events SET category = ?1 WHERE id = ?2",
+                params![correct, id],
+            )?;
+            updated += 1;
+        }
+    }
+    if updated > 0 {
+        eprintln!("Reclassified {} events to match current config", updated);
+    }
     Ok(())
 }
 

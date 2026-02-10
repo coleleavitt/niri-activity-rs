@@ -3,10 +3,10 @@ use std::str::FromStr;
 
 use chrono::{Local, LocalResult, Timelike, Utc};
 use owo_colors::OwoColorize;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
-use crate::config::{Category, Config, get_data_dir, load_config};
-use crate::db::run_migrations;
+use crate::config::{get_data_dir, load_config, Category, Config};
+use crate::db::{reclassify_all, run_migrations};
 use crate::error::Error;
 use crate::fmt::{
     cat_bar, cat_colored, cat_label, colored_bar, fmt_distance, fmt_duration, fmt_duration_compact,
@@ -24,6 +24,7 @@ impl App {
         let db_path = get_data_dir()?.join("activity.db");
         let conn = Connection::open(&db_path)?;
         run_migrations(&conn, &config)?;
+        reclassify_all(&conn, &config)?;
         Ok(App { config, conn })
     }
 }
