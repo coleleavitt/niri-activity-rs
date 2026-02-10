@@ -971,23 +971,34 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
             let last_idx = group.children.len().saturating_sub(1);
             for (i, child) in group.children.iter().enumerate() {
                 let connector = if i == last_idx { "└─" } else { "├─" };
+                let active_min = child.active_ms as f64 / 60_000.0;
+                let keys_per_min = if active_min > 0.5 {
+                    format!("{:.0}/m", child.keys as f64 / active_min)
+                } else {
+                    "-".to_string()
+                };
                 let label_raw = match child.category {
                     Category::Productive => "productive",
                     Category::Unproductive => "unproductive",
                     Category::Neutral => "neutral",
                 };
-                let padded = format!("{:<14}", label_raw);
-                let label = match child.category {
-                    Category::Productive => padded.green().bold().to_string(),
-                    Category::Unproductive => padded.red().bold().to_string(),
-                    Category::Neutral => padded.yellow().bold().to_string(),
-                };
+                // Sub layout: "    {conn} {label:<name_col} {bar_pad} {:>8}"
+                // Parent: "  " (2) + name (22) + " " (1) + bar (20) + " " (1) + dur (8) = 54
+                // Sub:    "    " (4) + conn (2) + " " (1) + label + pad + dur = 54
+                // label sits in the name column; remaining space pads through bar area
+                let dur = fmt_duration(child.total_ms);
+                let prefix = 4 + 2 + 1;
+                let dur_len = dur.len();
+                let gap = 54_usize.saturating_sub(prefix + label_raw.len() + dur_len);
+                let label_colored = cat_colored(child.category, label_raw);
                 println!(
-                    "    {} {} {:>8}  {:>5} keys  {:>3} clicks",
+                    "    {} {}{}{}  {:>5} keys ({:>5}) {:>3} clicks",
                     connector.dimmed(),
-                    label,
-                    fmt_duration(child.total_ms),
+                    label_colored,
+                    " ".repeat(gap),
+                    dur.bold(),
                     child.keys,
+                    keys_per_min.dimmed(),
                     child.clicks,
                 );
             }
