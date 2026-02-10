@@ -197,6 +197,35 @@ impl Default for Schedule {
     }
 }
 
+fn glob_match(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    match (pattern.starts_with('*'), pattern.ends_with('*')) {
+        (true, true) => {
+            let inner = &pattern[1..pattern.len() - 1];
+            value.contains(inner)
+        }
+        (true, false) => {
+            let suffix = &pattern[1..];
+            value.ends_with(suffix)
+        }
+        (false, true) => {
+            let prefix = &pattern[..pattern.len() - 1];
+            value.starts_with(prefix)
+        }
+        (false, false) => {
+            if let Some(pos) = pattern.find('*') {
+                let prefix = &pattern[..pos];
+                let suffix = &pattern[pos + 1..];
+                value.starts_with(prefix) && value.ends_with(suffix)
+            } else {
+                pattern == value
+            }
+        }
+    }
+}
+
 impl Config {
     pub fn classify(&self, app_id: &str, title: &str) -> Category {
         let title_lower = title.to_lowercase();
@@ -208,10 +237,18 @@ impl Config {
                 return rule.category;
             }
         }
-        self.categories
-            .get(app_id)
-            .copied()
-            .unwrap_or(Category::Neutral)
+
+        if let Some(&cat) = self.categories.get(app_id) {
+            return cat;
+        }
+
+        for (pattern, &cat) in &self.categories {
+            if pattern.contains('*') && glob_match(pattern, app_id) {
+                return cat;
+            }
+        }
+
+        Category::Neutral
     }
 }
 
@@ -404,4 +441,68 @@ days = [\"Mon\", \"Tue\", \"Wed\", \"Thu\", \"Fri\"]
     println!("\nEdit this file to customize your categories.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_exact_match() {
+        assert!(glob_match("spotify", "spotify"));
+        assert!(!glob_match("spotify", "spotify-web"));
+    }
+
+    #[test]
+    fn glob_prefix() {
+        assert!(glob_match("jetbrains-*", "jetbrains-rustrover"));
+        assert!(glob_match("jetbrains-*", "jetbrains-clion"));
+        assert!(!glob_match("jetbrains-*", "code"));
+    }
+
+    #[test]
+    fn glob_suffix() {
+        assert!(glob_match("*.desktop", "com.ayugram.desktop"));
+        assert!(!glob_match("*.desktop", "Alacritty"));
+    }
+
+    #[test]
+    fn glob_contains() {
+        assert!(glob_match("*hex_rays*", "com.hex_rays.IDA.pro._9_3"));
+        assert!(!glob_match("*hex_rays*", "jetbrains-idea"));
+    }
+
+    #[test]
+    fn glob_middle() {
+        assert!(glob_match("com.*desktop", "com.ayugram.desktop"));
+        assert!(!glob_match("com.*desktop", "org.pulseaudio.pavucontrol"));
+    }
+
+    #[test]
+    fn classify_exact_before_glob() {
+        let mut categories = HashMap::new();
+        categories.insert("jetbrains-*".to_string(), Category::Productive);
+        categories.insert("jetbrains-idea".to_string(), Category::Neutral);
+        let config = Config {
+            categories,
+            ..Default::default()
+        };
+        assert_eq!(config.classify("jetbrains-idea", ""), Category::Neutral);
+        assert_eq!(
+            config.classify("jetbrains-rustrover", ""),
+            Category::Productive
+        );
+    }
+
+    #[test]
+    fn classify_glob_fallback() {
+        let mut categories = HashMap::new();
+        categories.insert("jetbrains-*".to_string(), Category::Productive);
+        let config = Config {
+            categories,
+            ..Default::default()
+        };
+        assert_eq!(config.classify("jetbrains-clion", ""), Category::Productive);
+        assert_eq!(config.classify("code", ""), Category::Neutral);
+    }
 }
