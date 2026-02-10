@@ -18,7 +18,12 @@ pub fn fmt_duration_compact(ms: i64) -> String {
 pub fn fmt_duration(ms: i64) -> String {
     let hours = ms / 3_600_000;
     let mins = (ms % 3_600_000) / 60_000;
-    format!("{}h {}m", hours, mins)
+    if hours == 0 && mins == 0 {
+        let secs = (ms % 60_000) / 1000;
+        format!("{}s", secs)
+    } else {
+        format!("{}h {}m", hours, mins)
+    }
 }
 
 /// Format milliseconds as `h:mm:ss` for ActivTrak-compatible CSV export.
