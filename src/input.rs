@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -260,12 +260,10 @@ pub fn start_idle_monitor(start: Instant, jiggler_config: JigglerConfig) -> Inpu
     if jiggler_config.enabled {
         let jiggler_process_flag = Arc::clone(&stats.jiggler_process);
         let blacklist = jiggler_config.process_blacklist.clone();
-        thread::spawn(move || {
-            loop {
-                let found = scan_jiggler_processes(&blacklist);
-                jiggler_process_flag.store(found, Ordering::Relaxed);
-                thread::sleep(Duration::from_secs(30));
-            }
+        thread::spawn(move || loop {
+            let found = scan_jiggler_processes(&blacklist);
+            jiggler_process_flag.store(found, Ordering::Relaxed);
+            thread::sleep(Duration::from_secs(30));
         });
     }
 
@@ -288,6 +286,7 @@ pub fn start_idle_monitor(start: Instant, jiggler_config: JigglerConfig) -> Inpu
 
         let mut kb_tracker = IntervalTracker::new(&jiggler_config);
         let mut mouse_tracker = IntervalTracker::new(&jiggler_config);
+        let mut last_mouse_tracker_ms: u64 = 0;
         let mut last_jiggler_check = Instant::now();
 
         const REENUMERATE_INTERVAL: Duration = Duration::from_secs(60);
@@ -372,8 +371,11 @@ pub fn start_idle_monitor(start: Instant, jiggler_config: JigglerConfig) -> Inpu
                                     );
                                     last_activity.store(now, Ordering::Relaxed);
                                     last_mouse_event = Instant::now();
-                                    if jiggler_enabled {
+                                    if jiggler_enabled
+                                        && now.saturating_sub(last_mouse_tracker_ms) >= 1000
+                                    {
                                         mouse_tracker.record(now);
+                                        last_mouse_tracker_ms = now;
                                     }
                                 } else if code == REL_WHEEL
                                     || code == REL_HWHEEL

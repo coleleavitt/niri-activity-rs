@@ -118,7 +118,7 @@ fn default_jiggler_window() -> u64 {
 }
 
 fn default_jiggler_min_events() -> usize {
-    5
+    10
 }
 
 fn default_jiggler_variance() -> u64 {
