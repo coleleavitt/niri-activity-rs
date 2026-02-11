@@ -105,6 +105,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     println!("Config: {}", get_config_path()?.display());
     println!("Idle threshold: {}s", config.idle_threshold_secs);
     println!("Away threshold: {}s", config.away_threshold_secs);
+    println!("Mouse idle threshold: {} raw units", config.mouse_idle_threshold);
     println!("Categories configured: {}", config.categories.len());
 
     let conn = Connection::open(&db_path)?;
@@ -123,7 +124,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     });
 
     let monitor_start = Instant::now();
-    let input_stats = start_idle_monitor(monitor_start, config.jiggler.clone());
+    let input_stats = start_idle_monitor(monitor_start, config.jiggler.clone(), config.mouse_idle_threshold);
     let logind = start_logind_monitor()?;
     let idle_threshold_ms = config.idle_threshold_secs.saturating_mul(1000);
     let deep_idle_threshold_ms = config.deep_idle_secs.saturating_mul(1000);

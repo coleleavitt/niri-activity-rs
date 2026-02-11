@@ -99,6 +99,8 @@ struct RawConfig {
     away_threshold_secs: u64,
     #[serde(default = "default_mouse_dpi")]
     mouse_dpi: f64,
+    #[serde(default = "default_mouse_idle_threshold")]
+    mouse_idle_threshold: u64,
     #[serde(default)]
     schedule: Schedule,
     #[serde(default)]
@@ -115,6 +117,11 @@ pub struct Config {
     pub deep_idle_secs: u64,
     pub away_threshold_secs: u64,
     pub mouse_dpi: f64,
+    /// Minimum accumulated mouse motion (raw sensor units) within a 2-second window
+    /// before it counts as user activity for idle detection. Filters sensor noise
+    /// that would otherwise prevent the Away state from triggering.
+    /// Default: 50 (~0.06 inches at 800 DPI). Set to 0 to disable filtering.
+    pub mouse_idle_threshold: u64,
     pub schedule: Schedule,
     pub jiggler: JigglerConfig,
     pub categories: HashMap<String, Category>,
@@ -135,6 +142,10 @@ fn default_away_threshold() -> u64 {
 
 fn default_mouse_dpi() -> f64 {
     800.0
+}
+
+fn default_mouse_idle_threshold() -> u64 {
+    50
 }
 
 fn default_jiggler_enabled() -> bool {
@@ -221,6 +232,7 @@ impl From<RawConfig> for Config {
             deep_idle_secs: raw.deep_idle_secs,
             away_threshold_secs: raw.away_threshold_secs,
             mouse_dpi: raw.mouse_dpi,
+            mouse_idle_threshold: raw.mouse_idle_threshold,
             schedule: raw.schedule,
             jiggler: raw.jiggler,
             categories: raw.categories,
@@ -236,6 +248,7 @@ impl Default for Config {
             deep_idle_secs: default_deep_idle(),
             away_threshold_secs: default_away_threshold(),
             mouse_dpi: default_mouse_dpi(),
+            mouse_idle_threshold: default_mouse_idle_threshold(),
             schedule: Schedule::default(),
             jiggler: JigglerConfig::default(),
             categories: HashMap::new(),

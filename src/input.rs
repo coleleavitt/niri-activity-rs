@@ -194,7 +194,11 @@ pub fn enumerate_input_devices() -> Vec<evdev::Device> {
         .collect()
 }
 
-pub fn start_idle_monitor(start: Instant, jiggler_config: JigglerConfig) -> InputStats {
+pub fn start_idle_monitor(
+    start: Instant,
+    jiggler_config: JigglerConfig,
+    mouse_idle_threshold: u64,
+) -> InputStats {
     let stats = InputStats {
         last_activity_ms: Arc::new(AtomicU64::new(0)),
         keystrokes: Arc::new(AtomicU64::new(0)),
@@ -294,6 +298,10 @@ pub fn start_idle_monitor(start: Instant, jiggler_config: JigglerConfig) -> Inpu
         let mut last_mouse_tracker_ms: u64 = 0;
         let mut last_jiggler_check = Instant::now();
 
+        let mut motion_accum: u64 = 0;
+        let mut motion_window_start_ms: u64 = 0;
+        const MOTION_WINDOW_MS: u64 = 2000;
+
         const REENUMERATE_INTERVAL: Duration = Duration::from_secs(60);
         const STALE_MOUSE_THRESHOLD: Duration = Duration::from_secs(30);
         const REENUMERATE_COOLDOWN: Duration = Duration::from_secs(10);
@@ -371,11 +379,23 @@ pub fn start_idle_monitor(start: Instant, jiggler_config: JigglerConfig) -> Inpu
                             evdev::EventType::RELATIVE => {
                                 let code = ev.code();
                                 if code == REL_X || code == REL_Y {
-                                    mouse_distance.fetch_add(
-                                        ev.value().unsigned_abs() as u64,
-                                        Ordering::Relaxed,
-                                    );
-                                    last_activity.store(now, Ordering::Relaxed);
+                                    let delta = ev.value().unsigned_abs() as u64;
+                                    mouse_distance.fetch_add(delta, Ordering::Relaxed);
+
+                                    motion_accum = motion_accum.saturating_add(delta);
+                                    if now.saturating_sub(motion_window_start_ms) > MOTION_WINDOW_MS
+                                    {
+                                        if motion_accum >= mouse_idle_threshold {
+                                            last_activity.store(now, Ordering::Relaxed);
+                                        }
+                                        motion_accum = 0;
+                                        motion_window_start_ms = now;
+                                    } else if motion_accum >= mouse_idle_threshold {
+                                        last_activity.store(now, Ordering::Relaxed);
+                                        motion_accum = 0;
+                                        motion_window_start_ms = now;
+                                    }
+
                                     last_mouse_event = Instant::now();
                                     if jiggler_enabled
                                         && now.saturating_sub(last_mouse_tracker_ms) >= 1000
