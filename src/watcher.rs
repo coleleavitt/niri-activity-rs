@@ -27,6 +27,7 @@ pub enum ActivityState {
     Passive,
     Idle,
     Locked,
+    Away,
 }
 
 impl std::fmt::Display for ActivityState {
@@ -36,6 +37,7 @@ impl std::fmt::Display for ActivityState {
             ActivityState::Passive => write!(f, "passive"),
             ActivityState::Idle => write!(f, "idle"),
             ActivityState::Locked => write!(f, "locked"),
+            ActivityState::Away => write!(f, "away"),
         }
     }
 }
@@ -46,6 +48,7 @@ fn color_state(state: ActivityState) -> String {
         ActivityState::Passive => "passive".yellow().bold().to_string(),
         ActivityState::Idle => "idle".red().to_string(),
         ActivityState::Locked => "locked".magenta().bold().to_string(),
+        ActivityState::Away => "away".blue().bold().to_string(),
     }
 }
 
@@ -133,6 +136,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     println!("Database: {}", db_path.display());
     println!("Config: {}", get_config_path()?.display());
     println!("Idle threshold: {}s", config.idle_threshold_secs);
+    println!("Away threshold: {}s", config.away_threshold_secs);
     println!("Categories configured: {}", config.categories.len());
 
     let conn = Connection::open(&db_path)?;
@@ -154,6 +158,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let input_stats = start_idle_monitor(monitor_start, config.jiggler.clone());
     let idle_threshold_ms = config.idle_threshold_secs.saturating_mul(1000);
     let deep_idle_threshold_ms = config.deep_idle_secs.saturating_mul(1000);
+    let away_threshold_ms = config.away_threshold_secs.saturating_mul(1000);
 
     let mut socket = connect_to_niri()?;
     let reply = socket.send(Request::EventStream)?;
@@ -190,6 +195,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let mut is_locked = false;
     let mut current_state = ActivityState::Active;
     const FLUSH_INTERVAL: Duration = Duration::from_secs(300);
+    const SUSPEND_JUMP_THRESHOLD_SECS: i64 = 30;
+    let mut last_wall_time = Utc::now();
+    let mut last_loop_instant = Instant::now();
 
     println!("\nWatching window focus (event-driven)...");
     println!("Press Ctrl+C to stop gracefully\n");
@@ -225,6 +233,58 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         }
 
         let now_instant = Instant::now();
+
+        // Suspend detection: wall clock advancing faster than monotonic clock
+        // means the system was suspended (CLOCK_MONOTONIC pauses during suspend).
+        let wall_now = Utc::now();
+        let wall_elapsed_secs = (wall_now - last_wall_time).num_seconds();
+        let mono_elapsed_secs = now_instant
+            .duration_since(last_loop_instant)
+            .as_secs() as i64;
+        let time_jump_secs = wall_elapsed_secs.saturating_sub(mono_elapsed_secs);
+
+        if time_jump_secs > SUSPEND_JUMP_THRESHOLD_SECS {
+            if !quiet {
+                eprintln!(
+                    "{} System resume detected ({}s wall clock, {}s monotonic, {}s jump)",
+                    "[SUSPEND]".blue().bold(),
+                    wall_elapsed_secs,
+                    mono_elapsed_secs,
+                    time_jump_secs,
+                );
+            }
+            if (accumulated_active_ms > 0
+                || accumulated_passive_ms > 0
+                || accumulated_idle_ms > 0)
+                && let Some(info) = focused_id.and_then(|id| windows.get(&id))
+            {
+                let input = input_stats.snapshot();
+                let jiggler = input_stats.jiggler_detected();
+                insert_event(
+                    &conn,
+                    SessionSnapshot {
+                        window: info.clone(),
+                        config: &config,
+                        focus_start,
+                        active_ms: accumulated_active_ms,
+                        passive_ms: accumulated_passive_ms,
+                        idle_ms: accumulated_idle_ms,
+                        input,
+                        jiggler_detected: jiggler,
+                    },
+                )?;
+            }
+            focus_start = Utc::now();
+            accumulated_active_ms = 0;
+            accumulated_passive_ms = 0;
+            accumulated_idle_ms = 0;
+            current_state = ActivityState::Active;
+            last_idle_check = now_instant;
+            last_flush = now_instant;
+        }
+        last_wall_time = wall_now;
+        last_loop_instant = now_instant;
+
         let locked_now = is_session_locked();
 
         if locked_now && !is_locked {
@@ -277,13 +337,62 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             let last_input_ms = input_stats.last_activity_ms();
             let idle_duration_ms = now_ms.saturating_sub(last_input_ms);
 
-            let new_state = if idle_duration_ms > deep_idle_threshold_ms {
+            let new_state = if idle_duration_ms > away_threshold_ms {
+                ActivityState::Away
+            } else if idle_duration_ms > deep_idle_threshold_ms {
                 ActivityState::Idle
             } else if idle_duration_ms > idle_threshold_ms {
                 ActivityState::Passive
             } else {
                 ActivityState::Active
             };
+
+            if new_state == ActivityState::Away && current_state != ActivityState::Away {
+                if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
+                    let input = input_stats.snapshot();
+                    let jiggler = input_stats.jiggler_detected();
+                    insert_event(
+                        &conn,
+                        SessionSnapshot {
+                            window: info.clone(),
+                            config: &config,
+                            focus_start,
+                            active_ms: accumulated_active_ms,
+                            passive_ms: accumulated_passive_ms,
+                            idle_ms: accumulated_idle_ms,
+                            input,
+                            jiggler_detected: jiggler,
+                        },
+                    )?;
+                }
+                if !quiet {
+                    eprintln!(
+                        "{} Entering away state after {}s idle, pausing tracking",
+                        "[AWAY]".blue().bold(),
+                        idle_duration_ms / 1000,
+                    );
+                }
+                focus_start = Utc::now();
+                accumulated_active_ms = 0;
+                accumulated_passive_ms = 0;
+                accumulated_idle_ms = 0;
+                last_flush = now_instant;
+            }
+
+            if current_state == ActivityState::Away && new_state != ActivityState::Away {
+                if !quiet {
+                    eprintln!(
+                        "{} Resuming tracking (user activity detected)",
+                        "[RESUMED]".green().bold(),
+                    );
+                }
+                focus_start = Utc::now();
+                accumulated_active_ms = 0;
+                accumulated_passive_ms = 0;
+                accumulated_idle_ms = 0;
+                last_idle_check = now_instant;
+                last_flush = now_instant;
+            }
 
             if new_state != current_state && !quiet {
                 let from = color_state(current_state);
@@ -298,11 +407,13 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 ActivityState::Active => accumulated_active_ms += elapsed_since_last_check,
                 ActivityState::Passive => accumulated_passive_ms += elapsed_since_last_check,
                 ActivityState::Idle => accumulated_idle_ms += elapsed_since_last_check,
-                ActivityState::Locked => {}
+                ActivityState::Locked | ActivityState::Away => {}
             }
             last_idle_check = now_instant;
 
-            if now_instant.duration_since(last_flush) >= FLUSH_INTERVAL {
+            if current_state != ActivityState::Away
+                && now_instant.duration_since(last_flush) >= FLUSH_INTERVAL
+            {
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
                     let input = input_stats.snapshot();
                     let jiggler = input_stats.jiggler_detected();
@@ -316,9 +427,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             passive_ms: accumulated_passive_ms,
                             idle_ms: accumulated_idle_ms,
                             input,
-                        jiggler_detected: jiggler,
-                    },
-                )?;
+                            jiggler_detected: jiggler,
+                        },
+                    )?;
                     if !quiet {
                         let total =
                             accumulated_active_ms + accumulated_passive_ms + accumulated_idle_ms;

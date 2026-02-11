@@ -95,6 +95,8 @@ struct RawConfig {
     idle_threshold_secs: u64,
     #[serde(default = "default_deep_idle")]
     deep_idle_secs: u64,
+    #[serde(default = "default_away_threshold")]
+    away_threshold_secs: u64,
     #[serde(default = "default_mouse_dpi")]
     mouse_dpi: f64,
     #[serde(default)]
@@ -111,6 +113,7 @@ struct RawConfig {
 pub struct Config {
     pub idle_threshold_secs: u64,
     pub deep_idle_secs: u64,
+    pub away_threshold_secs: u64,
     pub mouse_dpi: f64,
     pub schedule: Schedule,
     pub jiggler: JigglerConfig,
@@ -124,6 +127,10 @@ fn default_idle_threshold() -> u64 {
 
 fn default_deep_idle() -> u64 {
     300
+}
+
+fn default_away_threshold() -> u64 {
+    1800
 }
 
 fn default_mouse_dpi() -> f64 {
@@ -212,6 +219,7 @@ impl From<RawConfig> for Config {
         Self {
             idle_threshold_secs: raw.idle_threshold_secs,
             deep_idle_secs: raw.deep_idle_secs,
+            away_threshold_secs: raw.away_threshold_secs,
             mouse_dpi: raw.mouse_dpi,
             schedule: raw.schedule,
             jiggler: raw.jiggler,
@@ -226,6 +234,7 @@ impl Default for Config {
         Self {
             idle_threshold_secs: default_idle_threshold(),
             deep_idle_secs: default_deep_idle(),
+            away_threshold_secs: default_away_threshold(),
             mouse_dpi: default_mouse_dpi(),
             schedule: Schedule::default(),
             jiggler: JigglerConfig::default(),
@@ -391,6 +400,11 @@ idle_threshold_secs = 60
 
 # Seconds without input before Passive transitions to Idle (default: 300)
 deep_idle_secs = 300
+
+# Seconds of continuous idle before entering Away state and pausing tracking (default: 1800 = 30 min)
+# When Away, the daemon stops recording events until user input resumes.
+# This prevents overnight/sleep idle from inflating your tracked time.
+away_threshold_secs = 1800
 
 # Jiggler / artificial input detection
 [jiggler]
