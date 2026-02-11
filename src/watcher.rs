@@ -167,6 +167,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     const SUSPEND_JUMP_THRESHOLD_SECS: i64 = 30;
     let mut last_wall_time = Utc::now();
     let mut last_loop_instant = Instant::now();
+    let mut input_baseline_ms: u64 = input_stats.last_activity_ms();
+    let mut session_start_mono_ms: u64 = monitor_start.elapsed().as_millis() as u64;
 
     println!("\nWatching window focus (event-driven)...");
     println!("Press Ctrl+C to stop gracefully\n");
@@ -250,6 +252,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             current_state = ActivityState::Active;
             last_idle_check = now_instant;
             last_flush = now_instant;
+            input_baseline_ms = input_stats.last_activity_ms();
+            session_start_mono_ms = monitor_start.elapsed().as_millis() as u64;
         }
         last_wall_time = wall_now;
         last_loop_instant = now_instant;
@@ -293,6 +297,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             current_state = ActivityState::Active;
             last_idle_check = now_instant;
             last_flush = now_instant;
+            input_baseline_ms = input_stats.last_activity_ms();
+            session_start_mono_ms = monitor_start.elapsed().as_millis() as u64;
         }
 
         let locked_now = logind.is_locked();
@@ -334,6 +340,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             accumulated_idle_ms = 0;
             last_idle_check = now_instant;
             last_flush = now_instant;
+            input_baseline_ms = input_stats.last_activity_ms();
+            session_start_mono_ms = monitor_start.elapsed().as_millis() as u64;
             if !quiet {
                 eprintln!(
                     "{} Screen unlocked, resuming tracking",
@@ -345,7 +353,11 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         if !is_locked {
             let now_ms = monitor_start.elapsed().as_millis() as u64;
             let last_input_ms = input_stats.last_activity_ms();
-            let idle_duration_ms = now_ms.saturating_sub(last_input_ms);
+            let idle_duration_ms = if last_input_ms > input_baseline_ms {
+                now_ms.saturating_sub(last_input_ms)
+            } else {
+                now_ms.saturating_sub(session_start_mono_ms)
+            };
 
             let new_state = if idle_duration_ms > away_threshold_ms {
                 ActivityState::Away
@@ -387,6 +399,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 accumulated_passive_ms = 0;
                 accumulated_idle_ms = 0;
                 last_flush = now_instant;
+                input_baseline_ms = input_stats.last_activity_ms();
+                session_start_mono_ms = now_ms;
             }
 
             if current_state == ActivityState::Away && new_state != ActivityState::Away {
@@ -402,6 +416,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 accumulated_idle_ms = 0;
                 last_idle_check = now_instant;
                 last_flush = now_instant;
+                input_baseline_ms = input_stats.last_activity_ms();
+                session_start_mono_ms = now_ms;
             }
 
             if new_state != current_state && !quiet {
@@ -454,6 +470,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     accumulated_active_ms = 0;
                     accumulated_passive_ms = 0;
                     accumulated_idle_ms = 0;
+                    input_baseline_ms = input_stats.last_activity_ms();
+                    session_start_mono_ms = now_ms;
                 }
                 last_flush = now_instant;
             }
@@ -486,8 +504,11 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         focused_id = Some(w.id);
                         focus_start = now;
                         accumulated_active_ms = 0;
+                        accumulated_passive_ms = 0;
                         accumulated_idle_ms = 0;
                         last_idle_check = now_instant;
+                        input_baseline_ms = input_stats.last_activity_ms();
+                        session_start_mono_ms = monitor_start.elapsed().as_millis() as u64;
                     }
                 }
                 eprintln!(
@@ -514,6 +535,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     accumulated_idle_ms = 0;
                     last_idle_check = now_instant;
                     last_flush = now_instant;
+                    input_baseline_ms = input_stats.last_activity_ms();
+                    session_start_mono_ms = monitor_start.elapsed().as_millis() as u64;
                     continue;
                 }
                 let input = input_stats.snapshot();
@@ -594,6 +617,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 current_state = ActivityState::Active;
                 last_idle_check = now_instant;
                 last_flush = now_instant;
+                input_baseline_ms = input_stats.last_activity_ms();
+                session_start_mono_ms = monitor_start.elapsed().as_millis() as u64;
             }
 
             _ => {}
