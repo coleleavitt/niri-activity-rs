@@ -3,6 +3,7 @@ mod db;
 mod error;
 mod fmt;
 mod input;
+mod logind;
 mod report;
 mod theme;
 mod tui;

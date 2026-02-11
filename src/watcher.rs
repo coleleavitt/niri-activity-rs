@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -20,6 +19,7 @@ use crate::db::{SessionSnapshot, init_db, insert_event, reclassify_all, run_migr
 use crate::error::Error;
 use crate::fmt::{cat_colored, cat_label, fmt_duration_compact, truncate};
 use crate::input::start_idle_monitor;
+use crate::logind::start_logind_monitor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityState {
@@ -64,38 +64,6 @@ impl From<&Window> for WindowInfo {
             app_id: w.app_id.clone().unwrap_or_else(|| "unknown".into()),
             title: w.title.clone().unwrap_or_default(),
         }
-    }
-}
-
-fn is_session_locked() -> bool {
-    let session_id = match Command::new("loginctl")
-        .args(["list-sessions", "--no-legend"])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .and_then(|line| line.split_whitespace().next())
-                .map(|id| id.to_string())
-        }
-        _ => None,
-    };
-
-    let Some(session_id) = session_id else {
-        return false;
-    };
-
-    match Command::new("loginctl")
-        .args(["show-session", &session_id, "-p", "LockedHint", "--value"])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.trim().eq_ignore_ascii_case("yes")
-        }
-        _ => false,
     }
 }
 
@@ -156,6 +124,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
 
     let monitor_start = Instant::now();
     let input_stats = start_idle_monitor(monitor_start, config.jiggler.clone());
+    let logind = start_logind_monitor()?;
     let idle_threshold_ms = config.idle_threshold_secs.saturating_mul(1000);
     let deep_idle_threshold_ms = config.deep_idle_secs.saturating_mul(1000);
     let away_threshold_ms = config.away_threshold_secs.saturating_mul(1000);
@@ -285,7 +254,48 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         last_wall_time = wall_now;
         last_loop_instant = now_instant;
 
-        let locked_now = is_session_locked();
+        // D-Bus PrepareForSleep(false) complements wall-clock detection.
+        // If the wall-clock jump already handled the resume above (time_jump_secs >
+        // threshold), this flag was set too — but no harm in clearing it. If the
+        // wall-clock method missed it (very short suspend), this catches it.
+        if logind.take_suspend_resumed() && time_jump_secs <= SUSPEND_JUMP_THRESHOLD_SECS {
+            if !quiet {
+                eprintln!(
+                    "{} System resume detected via D-Bus signal",
+                    "[SUSPEND]".blue().bold(),
+                );
+            }
+            if (accumulated_active_ms > 0
+                || accumulated_passive_ms > 0
+                || accumulated_idle_ms > 0)
+                && let Some(info) = focused_id.and_then(|id| windows.get(&id))
+            {
+                let input = input_stats.snapshot();
+                let jiggler = input_stats.jiggler_detected();
+                insert_event(
+                    &conn,
+                    SessionSnapshot {
+                        window: info.clone(),
+                        config: &config,
+                        focus_start,
+                        active_ms: accumulated_active_ms,
+                        passive_ms: accumulated_passive_ms,
+                        idle_ms: accumulated_idle_ms,
+                        input,
+                        jiggler_detected: jiggler,
+                    },
+                )?;
+            }
+            focus_start = Utc::now();
+            accumulated_active_ms = 0;
+            accumulated_passive_ms = 0;
+            accumulated_idle_ms = 0;
+            current_state = ActivityState::Active;
+            last_idle_check = now_instant;
+            last_flush = now_instant;
+        }
+
+        let locked_now = logind.is_locked();
 
         if locked_now && !is_locked {
             if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {

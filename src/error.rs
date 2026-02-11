@@ -14,4 +14,6 @@ pub enum Error {
     Config(#[from] toml::de::Error),
     #[error("unexpected response from niri")]
     UnexpectedResponse,
+    #[error("logind: {0}")]
+    Logind(String),
 }

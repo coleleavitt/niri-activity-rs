@@ -20,3 +20,5 @@ owo-colors = "4.2.3"
 ratatui = "0.30.0"
 crossterm = { path = "../../forks/crossterm" }
 regex = "1.12.3"
+logind-zbus = "5.3"
+zbus = { version = "5", default-features = false, features = ["blocking-api"] }
