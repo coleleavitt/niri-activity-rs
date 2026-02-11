@@ -298,7 +298,10 @@ pub fn start_idle_monitor(
         let mut last_mouse_tracker_ms: u64 = 0;
         let mut last_jiggler_check = Instant::now();
 
-        let mut motion_accum: u64 = 0;
+        // Track signed displacement per axis so oscillatory tremor
+        // (which cancels out) is distinguished from intentional motion.
+        let mut motion_dx: i64 = 0;
+        let mut motion_dy: i64 = 0;
         let mut motion_window_start_ms: u64 = 0;
         const MOTION_WINDOW_MS: u64 = 2000;
 
@@ -379,20 +382,36 @@ pub fn start_idle_monitor(
                             evdev::EventType::RELATIVE => {
                                 let code = ev.code();
                                 if code == REL_X || code == REL_Y {
-                                    let delta = ev.value().unsigned_abs() as u64;
-                                    mouse_distance.fetch_add(delta, Ordering::Relaxed);
+                                    let delta = ev.value();
+                                    mouse_distance
+                                        .fetch_add(delta.unsigned_abs() as u64, Ordering::Relaxed);
 
-                                    motion_accum = motion_accum.saturating_add(delta);
-                                    if now.saturating_sub(motion_window_start_ms) > MOTION_WINDOW_MS
-                                    {
-                                        if motion_accum >= mouse_idle_threshold {
+                                    if code == REL_X {
+                                        motion_dx = motion_dx.saturating_add(delta as i64);
+                                    } else {
+                                        motion_dy = motion_dy.saturating_add(delta as i64);
+                                    }
+
+                                    let window_expired = now.saturating_sub(motion_window_start_ms)
+                                        > MOTION_WINDOW_MS;
+
+                                    let net_sq = (motion_dx.saturating_mul(motion_dx))
+                                        .saturating_add(motion_dy.saturating_mul(motion_dy));
+                                    let threshold_sq = (mouse_idle_threshold as i64)
+                                        .saturating_mul(mouse_idle_threshold as i64);
+                                    let above_threshold = net_sq >= threshold_sq;
+
+                                    if window_expired {
+                                        if above_threshold {
                                             last_activity.store(now, Ordering::Relaxed);
                                         }
-                                        motion_accum = 0;
+                                        motion_dx = 0;
+                                        motion_dy = 0;
                                         motion_window_start_ms = now;
-                                    } else if motion_accum >= mouse_idle_threshold {
+                                    } else if above_threshold {
                                         last_activity.store(now, Ordering::Relaxed);
-                                        motion_accum = 0;
+                                        motion_dx = 0;
+                                        motion_dy = 0;
                                         motion_window_start_ms = now;
                                     }
 
