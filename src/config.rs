@@ -310,12 +310,33 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 }
 
 impl Config {
+    fn app_category(&self, app_id: &str) -> Option<Category> {
+        if let Some(&cat) = self.categories.get(app_id) {
+            return Some(cat);
+        }
+        for (pattern, &cat) in &self.categories {
+            if pattern.contains('*') && glob_match(pattern, app_id) {
+                return Some(cat);
+            }
+        }
+        None
+    }
+
     pub fn classify(&self, app_id: &str, title: &str) -> Category {
         let title_lower = title.to_lowercase();
+        let explicit_cat = self.app_category(app_id);
+
         for rule in &self.title_rules {
-            if !rule.app.is_empty() && !rule.app.iter().any(|a| a.eq_ignore_ascii_case(app_id)) {
+            let scoped = !rule.app.is_empty();
+
+            if scoped && !rule.app.iter().any(|a| a.eq_ignore_ascii_case(app_id)) {
                 continue;
             }
+
+            if !scoped && explicit_cat.is_some() {
+                continue;
+            }
+
             let matched = if let Some(re) = &rule.compiled {
                 re.is_match(title)
             } else {
@@ -326,17 +347,7 @@ impl Config {
             }
         }
 
-        if let Some(&cat) = self.categories.get(app_id) {
-            return cat;
-        }
-
-        for (pattern, &cat) in &self.categories {
-            if pattern.contains('*') && glob_match(pattern, app_id) {
-                return cat;
-            }
-        }
-
-        Category::Neutral
+        explicit_cat.unwrap_or(Category::Neutral)
     }
 }
 
