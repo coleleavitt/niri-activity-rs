@@ -1908,8 +1908,8 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         "Avg Total",
         "Avg Productive",
         &days_header,
-        "Workday Prod Ratio",
-        "Workday Prod Active %",
+        // TODO: "Workday Prod Ratio",
+        // TODO: "Workday Prod Active %",
     ];
 
     let daily_sheet = workbook.add_worksheet();
@@ -2046,12 +2046,13 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     } else {
         0.0
     };
-    let workday_prod_ratio = if workday_total.total_ms > 0 {
+    // TODO: workday prod columns
+    let _workday_prod_ratio = if workday_total.total_ms > 0 {
         workday_total.productive_ms as f64 / workday_total.total_ms as f64
     } else {
         0.0
     };
-    let workday_prod_active_pct = if workday_total.productive_ms > 0 {
+    let _workday_prod_active_pct = if workday_total.productive_ms > 0 {
         workday_total.productive_active_ms as f64 / workday_total.productive_ms as f64
     } else {
         0.0
@@ -2101,12 +2102,13 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     daily_sheet
         .write_number_with_format(row, 12, workdays as f64, &total_fmt)
         .map_err(|e| Error::NiriError(e.to_string()))?;
-    daily_sheet
-        .write_number_with_format(row, 13, workday_prod_ratio, &total_pct_fmt)
-        .map_err(|e| Error::NiriError(e.to_string()))?;
-    daily_sheet
-        .write_number_with_format(row, 14, workday_prod_active_pct, &total_pct_fmt)
-        .map_err(|e| Error::NiriError(e.to_string()))?;
+    // TODO: workday prod columns
+    // daily_sheet
+    //     .write_number_with_format(row, 13, workday_prod_ratio, &total_pct_fmt)
+    //     .map_err(|e| Error::NiriError(e.to_string()))?;
+    // daily_sheet
+    //     .write_number_with_format(row, 14, workday_prod_active_pct, &total_pct_fmt)
+    //     .map_err(|e| Error::NiriError(e.to_string()))?;
 
     daily_sheet.autofit();
 
