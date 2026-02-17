@@ -1891,6 +1891,9 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     let pct_fmt = Format::new().set_num_format("0.0%");
     let total_fmt = Format::new().set_bold().set_background_color(0xE0E0E0);
 
+    let workdays = app.config.schedule.count_workdays(since_local, today_local);
+    let days_header = format!("Days ({})", workdays);
+    
     let headers = [
         "Date",
         "Screen Time",
@@ -1904,7 +1907,9 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         "Productive Active %",
         "Avg Total",
         "Avg Productive",
-        "Days",
+        &days_header,
+        "Workday Prod Ratio",
+        "Workday Prod Active %",
     ];
 
     let daily_sheet = workbook.add_worksheet();
@@ -1920,7 +1925,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
 
     let mut row: u32 = 1;
     let mut date = since_local;
-    let mut daily_metrics: Vec<(NaiveDate, Metrics)> = Vec::new();
+    let mut daily_metrics: Vec<(NaiveDate, Metrics, bool)> = Vec::new();
 
     while date <= today_local {
         let day_start = local_day_start_utc(date)?;
@@ -2007,13 +2012,15 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
             .write_number_with_format(row, 9, prod_active_pct, &pct_fmt)
             .map_err(|e| Error::NiriError(e.to_string()))?;
 
-        daily_metrics.push((date, m));
+        let is_workday = app.config.schedule.is_workday(date);
+        daily_metrics.push((date, m, is_workday));
         row += 1;
         date += chrono::Duration::days(1);
     }
 
     let mut daily_total = Metrics::default();
-    for (_, m) in &daily_metrics {
+    let mut workday_total = Metrics::default();
+    for (_, m, is_workday) in &daily_metrics {
         daily_total.total_ms = daily_total.total_ms.saturating_add(m.total_ms);
         daily_total.productive_ms = daily_total.productive_ms.saturating_add(m.productive_ms);
         daily_total.unproductive_ms = daily_total.unproductive_ms.saturating_add(m.unproductive_ms);
@@ -2021,6 +2028,12 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         daily_total.productive_active_ms = daily_total.productive_active_ms.saturating_add(m.productive_active_ms);
         daily_total.productive_passive_ms = daily_total.productive_passive_ms.saturating_add(m.productive_passive_ms);
         daily_total.productive_idle_ms = daily_total.productive_idle_ms.saturating_add(m.productive_idle_ms);
+        
+        if *is_workday {
+            workday_total.total_ms = workday_total.total_ms.saturating_add(m.total_ms);
+            workday_total.productive_ms = workday_total.productive_ms.saturating_add(m.productive_ms);
+            workday_total.productive_active_ms = workday_total.productive_active_ms.saturating_add(m.productive_active_ms);
+        }
     }
 
     let total_prod_ratio = if daily_total.total_ms > 0 {
@@ -2033,12 +2046,21 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     } else {
         0.0
     };
+    let workday_prod_ratio = if workday_total.total_ms > 0 {
+        workday_total.productive_ms as f64 / workday_total.total_ms as f64
+    } else {
+        0.0
+    };
+    let workday_prod_active_pct = if workday_total.productive_ms > 0 {
+        workday_total.productive_active_ms as f64 / workday_total.productive_ms as f64
+    } else {
+        0.0
+    };
 
     let total_pct_fmt = Format::new().set_bold().set_background_color(0xE0E0E0).set_num_format("0.0%");
 
-    let days_count = daily_metrics.len() as i64;
-    let avg_total_ms = if days_count > 0 { daily_total.total_ms / days_count } else { 0 };
-    let avg_productive_ms = if days_count > 0 { daily_total.productive_ms / days_count } else { 0 };
+    let avg_total_ms = if workdays > 0 { daily_total.total_ms / workdays } else { 0 };
+    let avg_productive_ms = if workdays > 0 { daily_total.productive_ms / workdays } else { 0 };
 
     daily_sheet
         .write_string_with_format(row, 0, "TOTAL", &total_fmt)
@@ -2077,7 +2099,13 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         .write_string_with_format(row, 11, &fmt_hms(avg_productive_ms), &total_fmt)
         .map_err(|e| Error::NiriError(e.to_string()))?;
     daily_sheet
-        .write_number_with_format(row, 12, days_count as f64, &total_fmt)
+        .write_number_with_format(row, 12, workdays as f64, &total_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_number_with_format(row, 13, workday_prod_ratio, &total_pct_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_number_with_format(row, 14, workday_prod_active_pct, &total_pct_fmt)
         .map_err(|e| Error::NiriError(e.to_string()))?;
 
     daily_sheet.autofit();

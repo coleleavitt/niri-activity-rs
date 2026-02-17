@@ -87,6 +87,43 @@ pub struct Schedule {
     pub end: String,
     #[serde(default = "default_schedule_days")]
     pub days: Vec<String>,
+    #[serde(default = "default_holidays")]
+    pub holidays: Vec<String>,
+}
+
+fn default_holidays() -> Vec<String> {
+    vec![
+        "2025-01-01".into(), // New Year's Day
+        "2025-01-20".into(), // MLK Jr. Day
+        "2025-02-17".into(), // Presidents Day
+        "2025-04-18".into(), // Good Friday
+        "2025-05-26".into(), // Memorial Day
+        "2025-06-19".into(), // Juneteenth
+        "2025-07-04".into(), // Independence Day
+        "2025-09-01".into(), // Labor Day
+        "2025-11-27".into(), // Thanksgiving
+        "2025-12-25".into(), // Christmas
+        "2026-01-01".into(), // New Year's Day
+        "2026-01-19".into(), // MLK Jr. Day
+        "2026-02-16".into(), // Presidents Day
+        "2026-04-03".into(), // Good Friday
+        "2026-05-25".into(), // Memorial Day
+        "2026-06-19".into(), // Juneteenth
+        "2026-07-03".into(), // Independence Day (observed)
+        "2026-09-07".into(), // Labor Day
+        "2026-11-26".into(), // Thanksgiving
+        "2026-12-25".into(), // Christmas
+        "2027-01-01".into(), // New Year's Day
+        "2027-01-18".into(), // MLK Jr. Day
+        "2027-02-15".into(), // Presidents Day
+        "2027-03-26".into(), // Good Friday
+        "2027-05-31".into(), // Memorial Day
+        "2027-06-18".into(), // Juneteenth (observed)
+        "2027-07-05".into(), // Independence Day (observed)
+        "2027-09-06".into(), // Labor Day
+        "2027-11-25".into(), // Thanksgiving
+        "2027-12-24".into(), // Christmas (observed)
+    ]
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -332,6 +369,7 @@ impl Default for Schedule {
             start: default_schedule_start(),
             end: default_schedule_end(),
             days: default_schedule_days(),
+            holidays: default_holidays(),
         }
     }
 }
@@ -437,6 +475,44 @@ impl Schedule {
         } else {
             current >= start || current <= end
         }
+    }
+
+    pub fn count_workdays(
+        &self,
+        start_date: chrono::NaiveDate,
+        end_date: chrono::NaiveDate,
+    ) -> i64 {
+        let mut count = 0i64;
+        let mut date = start_date;
+        while date <= end_date {
+            if self.is_workday(date) {
+                count += 1;
+            }
+            date += chrono::Duration::days(1);
+        }
+        count
+    }
+
+    pub fn is_workday(&self, date: chrono::NaiveDate) -> bool {
+        use std::collections::HashSet;
+
+        let holiday_set: HashSet<chrono::NaiveDate> = self
+            .holidays
+            .iter()
+            .filter_map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .collect();
+
+        if holiday_set.contains(&date) {
+            return false;
+        }
+
+        let weekday = date.weekday().to_string().to_lowercase();
+        let weekday_short = &weekday[..3];
+
+        self.days.iter().any(|d| {
+            let d_lower = d.to_lowercase();
+            d_lower == weekday || d_lower == weekday_short
+        })
     }
 }
 
@@ -565,6 +641,13 @@ enabled = false
 start = "09:00"
 end = "17:00"
 days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+# NYSE market holidays (used for calculating daily averages in exports)
+holidays = [
+    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
+    "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+]
 
 # Goals / targets — show progress towards daily/weekly goals in reports
 [goals]
