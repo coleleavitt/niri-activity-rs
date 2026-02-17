@@ -24,3 +24,4 @@ regex = "1.12.3"
 logind-zbus = "5.3"
 zbus = { version = "5", default-features = false, features = ["blocking-api"] }
 rust_xlsxwriter = "0.93.0"
+lettre = "0.11"

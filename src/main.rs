@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod email;
 mod error;
 mod fmt;
 mod input;
@@ -200,6 +201,21 @@ enum Commands {
     },
     /// Initialize config file with examples
     Init,
+    /// Send activity report via email
+    Email {
+        /// Send weekly report (last Mon-Sun)
+        #[arg(long)]
+        weekly: bool,
+        /// Send monthly report (last full month)
+        #[arg(long)]
+        monthly: bool,
+        /// Test email configuration
+        #[arg(long)]
+        test: bool,
+        /// Secure config file permissions (chmod 600)
+        #[arg(long)]
+        secure: bool,
+    },
 }
 
 fn main() {
@@ -256,6 +272,27 @@ fn main() {
                 }))
         }
         Some(Commands::Init) => config::init_config(),
+        Some(Commands::Email { weekly, monthly, test, secure }) => {
+            (|| -> Result<(), Error> {
+                if secure {
+                    let config_path = config::get_config_path()?;
+                    email::secure_config_permissions(&config_path)?;
+                }
+                if test {
+                    let cfg = config::load_config()?;
+                    email::test_email_config(&cfg)?;
+                } else if weekly {
+                    report::App::open().and_then(|app| email::send_weekly_report(&app))?;
+                } else if monthly {
+                    report::App::open().and_then(|app| email::send_monthly_report(&app))?;
+                } else if !secure {
+                    return Err(Error::NiriError(
+                        "Specify --weekly, --monthly, --test, or --secure".into(),
+                    ));
+                }
+                Ok(())
+            })()
+        }
     };
 
     if let Err(e) = result {

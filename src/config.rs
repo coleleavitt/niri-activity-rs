@@ -136,6 +136,44 @@ pub struct Goals {
     pub weekly: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct Email {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    #[serde(default)]
+    smtp_user: String,
+    #[serde(default)]
+    smtp_password: String,
+    #[serde(default)]
+    pub from_address: String,
+    #[serde(default)]
+    pub to_addresses: Vec<String>,
+    #[serde(default)]
+    pub cc_addresses: Vec<String>,
+    #[serde(default)]
+    pub subject_prefix: String,
+    #[serde(default)]
+    pub report_name: String,
+}
+
+impl Email {
+    pub fn smtp_user(&self) -> String {
+        std::env::var("NIRI_SMTP_USER").unwrap_or_else(|_| self.smtp_user.clone())
+    }
+
+    pub fn smtp_password(&self) -> String {
+        std::env::var("NIRI_SMTP_PASSWORD").unwrap_or_else(|_| self.smtp_password.clone())
+    }
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
 fn default_daily_goal() -> String {
     "8h".to_string()
 }
@@ -198,6 +236,8 @@ struct RawConfig {
     #[serde(default)]
     goals: Goals,
     #[serde(default)]
+    email: Email,
+    #[serde(default)]
     jiggler: JigglerConfig,
     #[serde(default)]
     categories: HashMap<String, Category>,
@@ -214,6 +254,7 @@ pub struct Config {
     pub mouse_idle_threshold: u64,
     pub schedule: Schedule,
     pub goals: Goals,
+    pub email: Email,
     pub jiggler: JigglerConfig,
     pub categories: HashMap<String, Category>,
     pub title_rules: Vec<TitleRule>,
@@ -326,6 +367,7 @@ impl From<RawConfig> for Config {
             mouse_idle_threshold: raw.mouse_idle_threshold,
             schedule: raw.schedule,
             goals: raw.goals,
+            email: raw.email,
             jiggler: raw.jiggler,
             categories: raw.categories,
             title_rules,
@@ -343,6 +385,7 @@ impl Default for Config {
             mouse_idle_threshold: default_mouse_idle_threshold(),
             schedule: Schedule::default(),
             goals: Goals::default(),
+            email: Email::default(),
             jiggler: JigglerConfig::default(),
             categories: HashMap::new(),
             title_rules: Vec::new(),
