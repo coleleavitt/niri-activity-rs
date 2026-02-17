@@ -471,8 +471,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     accumulated_active_ms = 0;
                     accumulated_passive_ms = 0;
                     accumulated_idle_ms = 0;
-                    input_baseline_ms = input_stats.last_activity_ms();
-                    session_start_mono_ms = now_ms;
+                    // Intentionally preserve input_baseline_ms and session_start_mono_ms:
+                    // resetting them here would zero idle_duration_ms every flush cycle,
+                    // making the Away threshold unreachable without a focus change.
                 }
                 last_flush = now_instant;
             }
