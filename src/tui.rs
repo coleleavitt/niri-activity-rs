@@ -9,8 +9,8 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::error::Error;
 use crate::fmt::{fmt_distance, fmt_duration, fmt_duration_compact, pct};
 use crate::report::{
-    App, MetricsData, ReportData, TimelineData, TodayData, query_metrics, query_report,
-    query_timeline, query_today,
+    App, MetricsData, ReportData, TimeRange, TimelineData, TodayData, 
+    query_metrics_range, query_report_range, query_timeline, query_today,
 };
 use crate::theme::{THEME, category_style};
 
@@ -42,7 +42,7 @@ impl Tab {
 #[allow(dead_code)]
 struct TuiApp {
     tab: Tab,
-    days: u32,
+    range: TimeRange,
     today: Option<TodayData>,
     metrics: Option<MetricsData>,
     timeline: Option<TimelineData>,
@@ -54,19 +54,19 @@ struct TuiApp {
 }
 
 impl TuiApp {
-    fn load(days: u32) -> Result<Self, Error> {
+    fn load(range: TimeRange) -> Result<Self, Error> {
         let app = App::open()?;
         let today = query_today(&app).ok();
-        let metrics = query_metrics(&app, days).ok();
+        let metrics = query_metrics_range(&app, range.clone()).ok();
         let timeline = query_timeline(&app, 0, 15).ok();
-        let report = query_report(&app, days).ok();
+        let report = query_report_range(&app, range.clone()).ok();
         let mouse_dpi = app.config.mouse_dpi;
         let schedule_start = app.config.schedule.start.clone();
         let schedule_end = app.config.schedule.end.clone();
 
         Ok(Self {
             tab: Tab::Dashboard,
-            days,
+            range,
             today,
             metrics,
             timeline,
@@ -81,9 +81,9 @@ impl TuiApp {
     fn reload(&mut self) {
         if let Ok(app) = App::open() {
             self.today = query_today(&app).ok();
-            self.metrics = query_metrics(&app, self.days).ok();
+            self.metrics = query_metrics_range(&app, self.range.clone()).ok();
             self.timeline = query_timeline(&app, 0, 15).ok();
-            self.report = query_report(&app, self.days).ok();
+            self.report = query_report_range(&app, self.range.clone()).ok();
         }
     }
 
@@ -100,8 +100,13 @@ impl TuiApp {
     }
 }
 
+#[allow(dead_code)]
 pub fn run_tui(days: u32) -> Result<(), Error> {
-    let mut app = TuiApp::load(days)?;
+    run_tui_range(TimeRange::Days(days))
+}
+
+pub fn run_tui_range(range: TimeRange) -> Result<(), Error> {
+    let mut app = TuiApp::load(range)?;
     let terminal = ratatui::init();
     let result = run_loop(&mut app, terminal);
     ratatui::restore();
@@ -629,7 +634,7 @@ fn render_overview(app: &TuiApp, rpt: &ReportData, area: Rect, frame: &mut Frame
         .borders(Borders::ALL)
         .border_style(THEME.border)
         .title(
-            Line::from(format!(" Overview ({} → {}) ", rpt.since_date, rpt.now_str))
+            Line::from(format!(" Overview ({} → {}) ", rpt.since_str, rpt.now_str))
                 .style(THEME.header),
         )
         .padding(Padding::horizontal(1));

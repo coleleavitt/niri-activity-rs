@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use chrono::{Local, LocalResult, Timelike, Utc};
+use chrono::{Datelike, Local, LocalResult, NaiveDate, Timelike, Utc};
 use owo_colors::OwoColorize;
 use rusqlite::{params, Connection};
+use rust_xlsxwriter::{Format, Workbook};
+use serde::Serialize;
 
 use crate::config::{get_data_dir, load_config, Category, Config};
 use crate::db::{reclassify_all, run_migrations};
@@ -26,6 +28,164 @@ impl App {
         run_migrations(&conn, &config)?;
         reclassify_all(&conn, &config)?;
         Ok(App { config, conn })
+    }
+}
+
+/// Time range specification for reports
+#[derive(Debug, Clone)]
+pub enum TimeRange {
+    Days(u32),
+    DaysAligned(u32),
+    Yesterday,
+    LastWeek,
+    ThisWeek,
+    LastMonth,
+    ThisMonth,
+    DateRange(NaiveDate, NaiveDate),
+}
+
+/// Resolved time boundaries for queries
+pub struct TimeBounds {
+    /// Start timestamp in RFC3339 UTC format for SQL queries
+    pub since_utc: String,
+    /// End timestamp in RFC3339 UTC format for SQL queries (None = now)
+    pub until_utc: Option<String>,
+    /// Display string for start (local time)
+    pub since_str: String,
+    /// Display string for end (local time)
+    pub now_str: String,
+    /// Start date for daily iteration
+    pub start_date: NaiveDate,
+    /// End date for daily iteration
+    pub end_date: NaiveDate,
+}
+
+impl TimeRange {
+    /// Resolve the time range to concrete UTC timestamps
+    pub fn resolve(&self) -> Result<TimeBounds, Error> {
+        let now = Local::now();
+        let today = now.date_naive();
+
+        match self {
+            TimeRange::Days(days) => {
+                let since = now - chrono::Duration::days(*days as i64);
+                let since_date = since.date_naive();
+                let since_utc = local_day_start_utc(since_date)?;
+                Ok(TimeBounds {
+                    since_utc,
+                    until_utc: None,
+                    since_str: since.format("%Y-%m-%d %H:%M").to_string(),
+                    now_str: now.format("%Y-%m-%d %H:%M").to_string(),
+                    start_date: since_date,
+                    end_date: today,
+                })
+            }
+            TimeRange::DaysAligned(days) => {
+                // End at yesterday 23:59:59, go back N full days
+                let end_date = today - chrono::Duration::days(1);
+                let start_date = end_date - chrono::Duration::days(*days as i64 - 1);
+                let since_utc = local_day_start_utc(start_date)?;
+                let until_utc = local_day_end_utc(end_date)?;
+                Ok(TimeBounds {
+                    since_utc,
+                    until_utc: Some(until_utc),
+                    since_str: format!("{} 00:00", start_date),
+                    now_str: format!("{} 23:59", end_date),
+                    start_date,
+                    end_date,
+                })
+            }
+            TimeRange::LastWeek => {
+                // Find last Monday (start of last week)
+                let days_since_monday = today.weekday().num_days_from_monday();
+                let this_monday = today - chrono::Duration::days(days_since_monday as i64);
+                let last_monday = this_monday - chrono::Duration::days(7);
+                let last_sunday = last_monday + chrono::Duration::days(6);
+                let since_utc = local_day_start_utc(last_monday)?;
+                let until_utc = local_day_end_utc(last_sunday)?;
+                Ok(TimeBounds {
+                    since_utc,
+                    until_utc: Some(until_utc),
+                    since_str: format!("{} 00:00", last_monday),
+                    now_str: format!("{} 23:59", last_sunday),
+                    start_date: last_monday,
+                    end_date: last_sunday,
+                })
+            }
+            TimeRange::ThisWeek => {
+                // This Monday 00:00 → now
+                let days_since_monday = today.weekday().num_days_from_monday();
+                let this_monday = today - chrono::Duration::days(days_since_monday as i64);
+                let since_utc = local_day_start_utc(this_monday)?;
+                Ok(TimeBounds {
+                    since_utc,
+                    until_utc: None,
+                    since_str: format!("{} 00:00", this_monday),
+                    now_str: now.format("%Y-%m-%d %H:%M").to_string(),
+                    start_date: this_monday,
+                    end_date: today,
+                })
+            }
+            TimeRange::LastMonth => {
+                // First day of last month → last day of last month
+                let first_of_this_month = today.with_day(1).ok_or_else(|| {
+                    Error::NiriError("invalid date calculation".into())
+                })?;
+                let last_day_prev_month = first_of_this_month - chrono::Duration::days(1);
+                let first_of_last_month = last_day_prev_month.with_day(1).ok_or_else(|| {
+                    Error::NiriError("invalid date calculation".into())
+                })?;
+                let since_utc = local_day_start_utc(first_of_last_month)?;
+                let until_utc = local_day_end_utc(last_day_prev_month)?;
+                Ok(TimeBounds {
+                    since_utc,
+                    until_utc: Some(until_utc),
+                    since_str: format!("{} 00:00", first_of_last_month),
+                    now_str: format!("{} 23:59", last_day_prev_month),
+                    start_date: first_of_last_month,
+                    end_date: last_day_prev_month,
+                })
+            }
+            TimeRange::ThisMonth => {
+                let first_of_month = today.with_day(1).ok_or_else(|| {
+                    Error::NiriError("invalid date calculation".into())
+                })?;
+                let since_utc = local_day_start_utc(first_of_month)?;
+                Ok(TimeBounds {
+                    since_utc,
+                    until_utc: None,
+                    since_str: format!("{} 00:00", first_of_month),
+                    now_str: now.format("%Y-%m-%d %H:%M").to_string(),
+                    start_date: first_of_month,
+                    end_date: today,
+                })
+            }
+            TimeRange::Yesterday => {
+                let yesterday = today - chrono::Duration::days(1);
+                let since_utc = local_day_start_utc(yesterday)?;
+                let until_utc = local_day_end_utc(yesterday)?;
+                Ok(TimeBounds {
+                    since_utc,
+                    until_utc: Some(until_utc),
+                    since_str: format!("{} 00:00", yesterday),
+                    now_str: format!("{} 23:59", yesterday),
+                    start_date: yesterday,
+                    end_date: yesterday,
+                })
+            }
+            TimeRange::DateRange(start, end) => {
+                let since_utc = local_day_start_utc(*start)?;
+                let until_utc = local_day_end_utc(*end)?;
+                Ok(TimeBounds {
+                    since_utc,
+                    until_utc: Some(until_utc),
+                    since_str: format!("{} 00:00", start),
+                    now_str: format!("{} 23:59", end),
+                    start_date: *start,
+                    end_date: *end,
+                })
+            }
+        }
     }
 }
 
@@ -68,6 +228,7 @@ pub struct TimelineData {
     pub buckets: Vec<TimelineBucket>,
 }
 
+#[derive(Serialize)]
 #[allow(dead_code)]
 pub struct CategoryBreakdown {
     pub category: Category,
@@ -76,6 +237,7 @@ pub struct CategoryBreakdown {
     pub idle_ms: i64,
 }
 
+#[derive(Serialize)]
 pub struct AppBreakdown {
     pub app_id: String,
     pub category: Category,
@@ -85,7 +247,7 @@ pub struct AppBreakdown {
     pub clicks: i64,
 }
 
-/// Grouped view: one entry per app with per-category sub-entries.
+#[derive(Serialize)]
 pub struct AppGroup {
     pub app_id: String,
     pub total_ms: i64,
@@ -95,6 +257,7 @@ pub struct AppGroup {
     pub children: Vec<AppBreakdown>,
 }
 
+#[derive(Serialize)]
 pub struct DailyBreakdown {
     pub date: String,
     pub total_ms: i64,
@@ -103,12 +266,57 @@ pub struct DailyBreakdown {
     pub switches: i64,
 }
 
+#[derive(Serialize)]
 pub struct HourBreakdown {
     pub hour: u32,
     pub total_ms: i64,
     pub keystrokes: i64,
 }
 
+#[derive(Serialize)]
+#[allow(dead_code)]
+pub struct GapEntry {
+    pub gap_type: GapType,
+    pub start_time: String,
+    pub end_time: String,
+    pub duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum GapType {
+    Sleep,
+    LongBreak,
+    ShortBreak,
+}
+
+impl GapType {
+    #[allow(dead_code)]
+    pub fn label(&self) -> &'static str {
+        match self {
+            GapType::Sleep => "Sleep",
+            GapType::LongBreak => "Long Break",
+            GapType::ShortBreak => "Short Break",
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct GapSummary {
+    pub gap_type: GapType,
+    pub count: i64,
+    pub total_ms: i64,
+    pub avg_ms: i64,
+}
+
+#[derive(Serialize)]
+pub struct AwayData {
+    pub summaries: Vec<GapSummary>,
+    pub total_away_ms: i64,
+    #[allow(dead_code)]
+    pub entries: Vec<GapEntry>,
+}
+
+#[derive(Serialize)]
 pub struct ScheduleBreakdown {
     pub work_label: String,
     pub work_total_ms: i64,
@@ -119,8 +327,26 @@ pub struct ScheduleBreakdown {
     pub after_keys: i64,
 }
 
+#[derive(Serialize)]
+pub struct FocusStreak {
+    pub app_id: String,
+    pub start_time: String,
+    pub duration_ms: i64,
+    pub keystrokes: i64,
+}
+
+#[derive(Serialize)]
+pub struct StreakSummary {
+    pub longest_productive_ms: i64,
+    pub longest_productive_app: String,
+    pub avg_productive_streak_ms: i64,
+    pub total_productive_streaks: i64,
+    pub top_streaks: Vec<FocusStreak>,
+}
+
+#[derive(Serialize)]
 pub struct ReportData {
-    pub since_date: chrono::NaiveDate,
+    pub since_str: String,
     pub now_str: String,
     pub total_ms: i64,
     pub active_ms: i64,
@@ -137,6 +363,8 @@ pub struct ReportData {
     pub daily: Vec<DailyBreakdown>,
     pub peak_hours: Vec<HourBreakdown>,
     pub schedule: Option<ScheduleBreakdown>,
+    pub away: Option<AwayData>,
+    pub streaks: Option<StreakSummary>,
 }
 
 fn local_day_start_utc(date: chrono::NaiveDate) -> Result<String, Error> {
@@ -240,16 +468,27 @@ struct Metrics {
     productive_idle_ms: i64,
 }
 
+#[allow(dead_code)]
 pub fn query_metrics(app: &App, days: u32) -> Result<MetricsData, Error> {
-    let since_local = Local::now().date_naive() - chrono::Duration::days(days as i64);
-    let since_utc = local_day_start_utc(since_local)?;
+    query_metrics_range(app, TimeRange::Days(days))
+}
 
-    let mut stmt = app.conn.prepare(
+pub fn query_metrics_range(app: &App, range: TimeRange) -> Result<MetricsData, Error> {
+    let bounds = range.resolve()?;
+    let time_filter = if let Some(ref until) = bounds.until_utc {
+        format!("timestamp >= '{}' AND timestamp <= '{}'", bounds.since_utc, until)
+    } else {
+        format!("timestamp >= '{}'", bounds.since_utc)
+    };
+    let days = (bounds.end_date - bounds.start_date).num_days() as u32 + 1;
+
+    let mut stmt = app.conn.prepare(&format!(
         "SELECT category, SUM(active_ms) as active, COALESCE(SUM(passive_ms),0) as passive, SUM(idle_ms) as idle
          FROM events 
-         WHERE timestamp >= ?1 
+         WHERE {} 
          GROUP BY category",
-    )?;
+        time_filter
+    ))?;
 
     let mut m = MetricsData {
         days,
@@ -262,7 +501,7 @@ pub fn query_metrics(app: &App, days: u32) -> Result<MetricsData, Error> {
         productive_idle_ms: 0,
     };
 
-    let rows = stmt.query_map([&since_utc], |row| {
+    let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
@@ -295,8 +534,13 @@ pub fn query_metrics(app: &App, days: u32) -> Result<MetricsData, Error> {
     Ok(m)
 }
 
+#[allow(dead_code)]
 pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
-    let m = query_metrics(app, days)?;
+    show_metrics_range(app, TimeRange::Days(days))
+}
+
+pub fn show_metrics_range(app: &App, range: TimeRange) -> Result<(), Error> {
+    let m = query_metrics_range(app, range)?;
 
     println!(
         "{}\n",
@@ -551,11 +795,285 @@ fn group_apps(flat: Vec<AppBreakdown>, limit: usize) -> Vec<AppGroup> {
     map.into_iter().map(|(_, g)| g).collect()
 }
 
+fn classify_gap(start_hour: u32, gap_hours: f64) -> Option<GapType> {
+    // Sleep: started 8pm-6am AND lasted 4+ hours
+    // Long Break: 2+ hours (not sleep)
+    // Short Break: 30min-2h
+    // Gaps < 30min or > 24h are ignored
+    if !(0.5..=24.0).contains(&gap_hours) {
+        return None;
+    }
+
+    let is_night_start = !(6..20).contains(&start_hour);
+
+    if is_night_start && gap_hours >= 4.0 {
+        Some(GapType::Sleep)
+    } else if gap_hours >= 2.0 {
+        Some(GapType::LongBreak)
+    } else {
+        Some(GapType::ShortBreak)
+    }
+}
+
+fn query_streaks(conn: &Connection, config: &Config, time_filter: &str) -> Result<StreakSummary, Error> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT timestamp, app_id, category, active_ms + COALESCE(passive_ms,0) + idle_ms as total_ms, keystrokes
+         FROM events
+         WHERE {}
+         ORDER BY timestamp",
+        time_filter
+    ))?;
+
+    struct EventRow {
+        timestamp: String,
+        app_id: String,
+        category: String,
+        total_ms: i64,
+        keystrokes: i64,
+    }
+
+    let events: Vec<EventRow> = stmt
+        .query_map([], |row| {
+            Ok(EventRow {
+                timestamp: row.get(0)?,
+                app_id: row.get(1)?,
+                category: row.get(2)?,
+                total_ms: row.get(3)?,
+                keystrokes: row.get(4)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut streaks: Vec<FocusStreak> = Vec::new();
+    let mut current_streak_start: Option<String> = None;
+    let mut current_streak_app = String::new();
+    let mut current_streak_ms: i64 = 0;
+    let mut current_streak_keys: i64 = 0;
+    let mut in_productive_streak = false;
+
+    for ev in &events {
+        let cat = Category::from_str(&ev.category).unwrap_or(Category::Neutral);
+        let is_productive = cat == Category::Productive;
+        
+        if is_productive {
+            if in_productive_streak {
+                current_streak_ms = current_streak_ms.saturating_add(ev.total_ms);
+                current_streak_keys = current_streak_keys.saturating_add(ev.keystrokes);
+                if ev.total_ms > 0 {
+                    current_streak_app.clone_from(&ev.app_id);
+                }
+            } else {
+                in_productive_streak = true;
+                current_streak_start = Some(ev.timestamp.clone());
+                current_streak_app.clone_from(&ev.app_id);
+                current_streak_ms = ev.total_ms;
+                current_streak_keys = ev.keystrokes;
+            }
+        } else if in_productive_streak && current_streak_ms >= 300_000 {
+            let start_str = current_streak_start.take().unwrap_or_default();
+            let start_local = parse_timestamp_local(&start_str)
+                .map(|dt| dt.format("%m-%d %H:%M").to_string())
+                .unwrap_or(start_str);
+            
+            streaks.push(FocusStreak {
+                app_id: current_streak_app.clone(),
+                start_time: start_local,
+                duration_ms: current_streak_ms,
+                keystrokes: current_streak_keys,
+            });
+            
+            in_productive_streak = false;
+            current_streak_ms = 0;
+            current_streak_keys = 0;
+        } else {
+            in_productive_streak = false;
+            current_streak_ms = 0;
+            current_streak_keys = 0;
+        }
+    }
+
+    if in_productive_streak && current_streak_ms >= 300_000 {
+        let start_str = current_streak_start.take().unwrap_or_default();
+        let start_local = parse_timestamp_local(&start_str)
+            .map(|dt| dt.format("%m-%d %H:%M").to_string())
+            .unwrap_or(start_str);
+        
+        streaks.push(FocusStreak {
+            app_id: current_streak_app.clone(),
+            start_time: start_local,
+            duration_ms: current_streak_ms,
+            keystrokes: current_streak_keys,
+        });
+    }
+
+    streaks.sort_by_key(|s| std::cmp::Reverse(s.duration_ms));
+    
+    let total_streaks = streaks.len() as i64;
+    let total_streak_ms: i64 = streaks.iter().map(|s| s.duration_ms).sum();
+    let avg_streak_ms = if total_streaks > 0 {
+        total_streak_ms / total_streaks
+    } else {
+        0
+    };
+    
+    let longest = streaks.first();
+    let longest_ms = longest.map(|s| s.duration_ms).unwrap_or(0);
+    let longest_app = longest.map(|s| s.app_id.clone()).unwrap_or_default();
+    
+    streaks.truncate(5);
+    
+    let _ = config;
+    
+    Ok(StreakSummary {
+        longest_productive_ms: longest_ms,
+        longest_productive_app: longest_app,
+        avg_productive_streak_ms: avg_streak_ms,
+        total_productive_streaks: total_streaks,
+        top_streaks: streaks,
+    })
+}
+
+fn query_gaps(conn: &Connection, since_utc: &str) -> Result<AwayData, Error> {
+    let mut stmt = conn.prepare(
+        "WITH ordered AS (
+            SELECT 
+                timestamp,
+                LAG(timestamp) OVER (ORDER BY timestamp) as prev_ts
+            FROM events
+            WHERE timestamp >= ?1
+        ),
+        gaps AS (
+            SELECT 
+                prev_ts as gap_start,
+                timestamp as gap_end,
+                CAST(strftime('%H', prev_ts, 'localtime') AS INT) as start_hour,
+                (julianday(timestamp) - julianday(prev_ts)) * 24.0 as gap_hours
+            FROM ordered
+            WHERE prev_ts IS NOT NULL
+        )
+        SELECT gap_start, gap_end, start_hour, gap_hours
+        FROM gaps
+        WHERE gap_hours BETWEEN 0.5 AND 24.0
+        ORDER BY gap_start",
+    )?;
+
+    let mut entries: Vec<GapEntry> = Vec::new();
+    let mut sleep_total_ms: i64 = 0;
+    let mut sleep_count: i64 = 0;
+    let mut long_break_total_ms: i64 = 0;
+    let mut long_break_count: i64 = 0;
+    let mut short_break_total_ms: i64 = 0;
+    let mut short_break_count: i64 = 0;
+
+    let rows = stmt.query_map(params![since_utc], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, u32>(2)?,
+            row.get::<_, f64>(3)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (gap_start, gap_end, start_hour, gap_hours) = row?;
+
+        let Some(gap_type) = classify_gap(start_hour, gap_hours) else {
+            continue;
+        };
+
+        let duration_ms = (gap_hours * 3_600_000.0) as i64;
+
+        match gap_type {
+            GapType::Sleep => {
+                sleep_total_ms = sleep_total_ms.saturating_add(duration_ms);
+                sleep_count += 1;
+            }
+            GapType::LongBreak => {
+                long_break_total_ms = long_break_total_ms.saturating_add(duration_ms);
+                long_break_count += 1;
+            }
+            GapType::ShortBreak => {
+                short_break_total_ms = short_break_total_ms.saturating_add(duration_ms);
+                short_break_count += 1;
+            }
+        }
+
+        let start_local = parse_timestamp_local(&gap_start)
+            .map(|dt| dt.format("%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| gap_start.clone());
+        let end_local = parse_timestamp_local(&gap_end)
+            .map(|dt| dt.format("%H:%M").to_string())
+            .unwrap_or_else(|| gap_end.clone());
+
+        entries.push(GapEntry {
+            gap_type,
+            start_time: start_local,
+            end_time: end_local,
+            duration_ms,
+        });
+    }
+
+    let mut summaries = Vec::new();
+
+    if sleep_count > 0 {
+        summaries.push(GapSummary {
+            gap_type: GapType::Sleep,
+            count: sleep_count,
+            total_ms: sleep_total_ms,
+            avg_ms: sleep_total_ms.checked_div(sleep_count).unwrap_or(0),
+        });
+    }
+
+    if long_break_count > 0 {
+        summaries.push(GapSummary {
+            gap_type: GapType::LongBreak,
+            count: long_break_count,
+            total_ms: long_break_total_ms,
+            avg_ms: long_break_total_ms
+                .checked_div(long_break_count)
+                .unwrap_or(0),
+        });
+    }
+
+    if short_break_count > 0 {
+        summaries.push(GapSummary {
+            gap_type: GapType::ShortBreak,
+            count: short_break_count,
+            total_ms: short_break_total_ms,
+            avg_ms: short_break_total_ms
+                .checked_div(short_break_count)
+                .unwrap_or(0),
+        });
+    }
+
+    let total_away_ms = sleep_total_ms
+        .saturating_add(long_break_total_ms)
+        .saturating_add(short_break_total_ms);
+
+    Ok(AwayData {
+        summaries,
+        total_away_ms,
+        entries,
+    })
+}
+
+#[allow(dead_code)]
 pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
-    assert!(days > 0, "report must cover at least 1 day");
-    let since_date = Local::now().date_naive() - chrono::Duration::days(days as i64);
-    let since_utc = local_day_start_utc(since_date)?;
-    let now_str = Local::now().format("%Y-%m-%d %H:%M").to_string();
+    query_report_range(app, TimeRange::Days(days))
+}
+
+pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Error> {
+    let bounds = range.resolve()?;
+    let since_utc = &bounds.since_utc;
+    let since_str = bounds.since_str.clone();
+    let now_str = bounds.now_str.clone();
+    
+    let time_filter = if let Some(ref until) = bounds.until_utc {
+        format!("timestamp >= '{}' AND timestamp <= '{}'", since_utc, until)
+    } else {
+        format!("timestamp >= '{}'", since_utc)
+    };
 
     let (
         total_ms,
@@ -569,15 +1087,17 @@ pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
         total_events,
         jiggler_count,
     ): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = app.conn.query_row(
-        "SELECT COALESCE(SUM(active_ms + COALESCE(passive_ms,0) + idle_ms),0),
-                COALESCE(SUM(active_ms),0),
-                COALESCE(SUM(passive_ms),0),
-                COALESCE(SUM(idle_ms),0), COALESCE(SUM(keystrokes),0),
-                COALESCE(SUM(mouse_clicks),0), COALESCE(SUM(scroll_events),0),
-                COALESCE(SUM(mouse_distance),0), COUNT(*),
-                COALESCE(SUM(CASE WHEN jiggler_detected = 1 THEN 1 ELSE 0 END),0)
-         FROM events WHERE timestamp >= ?1",
-        params![&since_utc],
+        &format!(
+            "SELECT COALESCE(SUM(active_ms + COALESCE(passive_ms,0) + idle_ms),0),
+                    COALESCE(SUM(active_ms),0),
+                    COALESCE(SUM(passive_ms),0),
+                    COALESCE(SUM(idle_ms),0), COALESCE(SUM(keystrokes),0),
+                    COALESCE(SUM(mouse_clicks),0), COALESCE(SUM(scroll_events),0),
+                    COALESCE(SUM(mouse_distance),0), COUNT(*),
+                    COALESCE(SUM(CASE WHEN jiggler_detected = 1 THEN 1 ELSE 0 END),0)
+             FROM events WHERE {}", time_filter
+        ),
+        [],
         |row| {
             Ok((
                 row.get(0)?,
@@ -594,14 +1114,15 @@ pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
         },
     )?;
 
-    let mut cat_stmt = app.conn.prepare(
+    let mut cat_stmt = app.conn.prepare(&format!(
         "SELECT category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(idle_ms)
-         FROM events WHERE timestamp >= ?1
+         FROM events WHERE {}
          GROUP BY category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC",
-    )?;
+        time_filter
+    ))?;
 
     let categories: Vec<CategoryBreakdown> = cat_stmt
-        .query_map(params![&since_utc], |row| {
+        .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
@@ -620,14 +1141,15 @@ pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
         )
         .collect();
 
-    let mut app_stmt = app.conn.prepare(
+    let mut app_stmt = app.conn.prepare(&format!(
         "SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(keystrokes), SUM(mouse_clicks)
-         FROM events WHERE timestamp >= ?1
+         FROM events WHERE {}
          GROUP BY app_id, category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC",
-    )?;
+        time_filter
+    ))?;
 
     let flat_apps: Vec<AppBreakdown> = app_stmt
-        .query_map(params![&since_utc], |row| {
+        .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -652,10 +1174,11 @@ pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
 
     let top_apps = group_apps(flat_apps, 15);
 
-    let mut raw_stmt = app.conn.prepare(
+    let mut raw_stmt = app.conn.prepare(&format!(
         "SELECT timestamp, active_ms, COALESCE(passive_ms,0), idle_ms, keystrokes
-         FROM events WHERE timestamp >= ?1",
-    )?;
+         FROM events WHERE {}",
+        time_filter
+    ))?;
 
     struct RawRow {
         timestamp: String,
@@ -666,7 +1189,7 @@ pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
     }
 
     let raw_rows: Vec<RawRow> = raw_stmt
-        .query_map(params![&since_utc], |row| {
+        .query_map([], |row| {
             Ok(RawRow {
                 timestamp: row.get(0)?,
                 active_ms: row.get(1)?,
@@ -688,7 +1211,6 @@ pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
         };
 
         let day_key = local_dt.format("%Y-%m-%d").to_string();
-        let hour_key = local_dt.hour();
         let total = row.active_ms + row.passive_ms + row.idle_ms;
 
         let d = daily_map.entry(day_key).or_insert((0, 0, 0, 0));
@@ -697,9 +1219,34 @@ pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
         d.2 += row.keystrokes;
         d.3 += 1;
 
-        let h = hourly.entry(hour_key).or_insert((0, 0));
-        h.0 += total;
-        h.1 += row.keystrokes;
+        // Split event duration across hour boundaries
+        // ms_left_in_hour = ms until the next hour starts
+        let minute = local_dt.minute() as i64;
+        let second = local_dt.second() as i64;
+        let ms_into_hour = (minute * 60 + second) * 1000;
+        let ms_left_in_hour = 3_600_000_i64.saturating_sub(ms_into_hour);
+
+        let mut remaining_ms = total;
+        let mut current_hour = local_dt.hour();
+        let mut first_chunk = true;
+
+        while remaining_ms > 0 {
+            let chunk_ms = if first_chunk {
+                remaining_ms.min(ms_left_in_hour)
+            } else {
+                remaining_ms.min(3_600_000)
+            };
+
+            let h = hourly.entry(current_hour).or_insert((0, 0));
+            h.0 += chunk_ms;
+            if first_chunk {
+                h.1 += row.keystrokes;
+            }
+
+            remaining_ms = remaining_ms.saturating_sub(chunk_ms);
+            current_hour = (current_hour + 1) % 24;
+            first_chunk = false;
+        }
     }
 
     let daily: Vec<DailyBreakdown> = daily_map
@@ -771,8 +1318,11 @@ pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
         None
     };
 
+    let away = query_gaps(&app.conn, &since_utc).ok();
+    let streaks = query_streaks(&app.conn, &app.config, &time_filter).ok();
+
     Ok(ReportData {
-        since_date,
+        since_str,
         now_str,
         total_ms,
         active_ms,
@@ -789,11 +1339,18 @@ pub fn query_report(app: &App, days: u32) -> Result<ReportData, Error> {
         daily,
         peak_hours,
         schedule,
+        away,
+        streaks,
     })
 }
 
+#[allow(dead_code)]
 pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
-    let data = query_report(app, days)?;
+    generate_report_range(app, TimeRange::Days(days))
+}
+
+pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
+    let data = query_report_range(app, range)?;
 
     println!(
         "{}",
@@ -810,8 +1367,8 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
         "║".cyan().bold()
     );
     let period_line = format!(
-        "  Period: {} → {}              ",
-        data.since_date, data.now_str
+        "  Period: {} → {}       ",
+        data.since_str, data.now_str
     );
     println!("{}{}{}", "║".cyan().bold(), period_line, "║".cyan().bold());
     println!(
@@ -864,6 +1421,69 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
                 .red()
                 .bold()
         );
+    }
+
+    if app.config.goals.enabled {
+        let productive_ms = data.categories
+            .iter()
+            .find(|c| c.category == Category::Productive)
+            .map(|c| c.total_ms)
+            .unwrap_or(0);
+        
+        println!(
+            "\n{}",
+            section_header("── Goals ─────────────────────────────────────────────")
+        );
+        
+        if let Some(daily_goal) = app.config.goals.daily_ms() {
+            let days = (data.daily.len() as i64).max(1);
+            let daily_avg = productive_ms / days;
+            let daily_pct = (daily_avg as f64 / daily_goal as f64 * 100.0).min(999.0);
+            let bar_len = ((daily_pct / 5.0).round() as usize).min(20);
+            let progress_bar = "█".repeat(bar_len);
+            let remaining_bar = "░".repeat(20 - bar_len);
+            
+            let status = if daily_pct >= 100.0 {
+                format!("{}%", daily_pct.round()).green().bold().to_string()
+            } else if daily_pct >= 75.0 {
+                format!("{}%", daily_pct.round()).yellow().to_string()
+            } else {
+                format!("{}%", daily_pct.round()).red().to_string()
+            };
+            
+            println!(
+                "  Daily Goal:         {}{} {} (avg {} / {})",
+                progress_bar.green(),
+                remaining_bar.dimmed(),
+                status,
+                fmt_duration(daily_avg).bold(),
+                app.config.goals.daily,
+            );
+        }
+        
+        if let Some(weekly_goal) = app.config.goals.weekly_ms() {
+            let weekly_pct = (productive_ms as f64 / weekly_goal as f64 * 100.0).min(999.0);
+            let bar_len = ((weekly_pct / 5.0).round() as usize).min(20);
+            let progress_bar = "█".repeat(bar_len);
+            let remaining_bar = "░".repeat(20 - bar_len);
+            
+            let status = if weekly_pct >= 100.0 {
+                format!("{}%", weekly_pct.round()).green().bold().to_string()
+            } else if weekly_pct >= 75.0 {
+                format!("{}%", weekly_pct.round()).yellow().to_string()
+            } else {
+                format!("{}%", weekly_pct.round()).red().to_string()
+            };
+            
+            println!(
+                "  Weekly Goal:        {}{} {} ({} / {})",
+                progress_bar.green(),
+                remaining_bar.dimmed(),
+                status,
+                fmt_duration(productive_ms).bold(),
+                app.config.goals.weekly,
+            );
+        }
     }
 
     println!(
@@ -1056,6 +1676,51 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
         );
     }
 
+    if let Some(away) = &data.away
+        && !away.summaries.is_empty()
+    {
+        println!(
+            "\n{}",
+            section_header("── Away Time ─────────────────────────────────────────")
+        );
+
+        // Visible col layout: "  X label:  " padded to col 20, then right-aligned duration
+        // Using text symbols (1-col wide) to avoid emoji width inconsistencies
+        let col_target: usize = 20;
+        for summary in &away.summaries {
+            let (icon, label_colored, visible_cols) = match summary.gap_type {
+                GapType::Sleep => ("◑".blue().to_string(), "Sleep:".blue().to_string(), 8),
+                GapType::LongBreak => {
+                    ("◐".yellow().to_string(), "Long Break:".yellow().to_string(), 13)
+                }
+                GapType::ShortBreak => {
+                    ("◌".dimmed().to_string(), "Short Break:".dimmed().to_string(), 14)
+                }
+            };
+            let total_str = fmt_duration(summary.total_ms);
+            let avg_str = fmt_duration(summary.avg_ms);
+            let pad = col_target.saturating_sub(visible_cols);
+
+            println!(
+                "  {} {}{}{:>8} total  ({} × {} avg)",
+                icon,
+                label_colored,
+                " ".repeat(pad),
+                total_str.bold(),
+                summary.count,
+                avg_str.dimmed(),
+            );
+        }
+
+        let pad = col_target.saturating_sub(13) + 1;
+        println!(
+            "  {}{}{:>8}",
+            "Total Away:".dimmed(),
+            " ".repeat(pad),
+            fmt_duration(away.total_away_ms).dimmed(),
+        );
+    }
+
     println!(
         "\n{}",
         section_header("── Peak Hours ────────────────────────────────────────")
@@ -1073,16 +1738,58 @@ pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
         );
     }
 
+    if let Some(streaks) = &data.streaks
+        && streaks.total_productive_streaks > 0
+    {
+        println!(
+            "\n{}",
+            section_header("── Focus Streaks ─────────────────────────────────────")
+        );
+        
+        println!(
+            "  Longest Streak:     {} in {}",
+            fmt_duration(streaks.longest_productive_ms).green().bold(),
+            streaks.longest_productive_app.bold()
+        );
+        println!(
+            "  Average Streak:     {}",
+            fmt_duration(streaks.avg_productive_streak_ms)
+        );
+        println!(
+            "  Total Streaks:      {} (5+ min productive sessions)",
+            streaks.total_productive_streaks
+        );
+        
+        if !streaks.top_streaks.is_empty() {
+            println!();
+            for (i, streak) in streaks.top_streaks.iter().enumerate() {
+                let rank = format!("{}.", i + 1);
+                println!(
+                    "  {:>3} {:>8}  {}  {} keys  {}",
+                    rank.dimmed(),
+                    fmt_duration(streak.duration_ms).green(),
+                    streak.start_time.dimmed(),
+                    streak.keystrokes,
+                    truncate(&streak.app_id, 20),
+                );
+            }
+        }
+    }
+
     println!();
 
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn export_csv(app: &App, days: u32) -> Result<(), Error> {
-    assert!(days > 0, "export must cover at least 1 day");
+    export_csv_range(app, TimeRange::Days(days))
+}
 
-    let since_local = Local::now().date_naive() - chrono::Duration::days(days as i64);
-    let today_local = Local::now().date_naive();
+pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
+    let bounds = range.resolve()?;
+    let since_local = bounds.start_date;
+    let today_local = bounds.end_date;
 
     println!(
         "Date,Screen Time (h:mm:ss),Productive (h:mm:ss),Unproductive (h:mm:ss),\
@@ -1165,5 +1872,492 @@ pub fn export_csv(app: &App, days: u32) -> Result<(), Error> {
         date += chrono::Duration::days(1);
     }
 
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn export_xlsx(app: &App, days: u32, path: &str) -> Result<(), Error> {
+    export_xlsx_range(app, TimeRange::Days(days), path)
+}
+
+pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), Error> {
+    let bounds = range.resolve()?;
+    let since_local = bounds.start_date;
+    let today_local = bounds.end_date;
+
+    let mut workbook = Workbook::new();
+    
+    let header_fmt = Format::new().set_bold();
+    let pct_fmt = Format::new().set_num_format("0.0%");
+    let total_fmt = Format::new().set_bold().set_background_color(0xE0E0E0);
+
+    let headers = [
+        "Date",
+        "Screen Time",
+        "Productive",
+        "Unproductive",
+        "Undefined",
+        "Prod Active",
+        "Prod Passive",
+        "Prod Idle",
+        "Productive Ratio",
+        "Productive Active %",
+        "Avg Total",
+        "Avg Productive",
+        "Days",
+    ];
+
+    let daily_sheet = workbook.add_worksheet();
+    daily_sheet
+        .set_name("Daily Summary")
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+
+    for (col, header) in headers.iter().enumerate() {
+        daily_sheet
+            .write_string_with_format(0, col as u16, *header, &header_fmt)
+            .map_err(|e| Error::NiriError(e.to_string()))?;
+    }
+
+    let mut row: u32 = 1;
+    let mut date = since_local;
+    let mut daily_metrics: Vec<(NaiveDate, Metrics)> = Vec::new();
+
+    while date <= today_local {
+        let day_start = local_day_start_utc(date)?;
+        let day_end = local_day_end_utc(date)?;
+
+        let mut stmt = app.conn.prepare(
+            "SELECT category, SUM(active_ms), COALESCE(SUM(passive_ms),0), SUM(idle_ms)
+             FROM events
+             WHERE timestamp >= ?1 AND timestamp < ?2
+             GROUP BY category",
+        )?;
+
+        let mut m = Metrics::default();
+
+        let rows = stmt.query_map(params![&day_start, &day_end], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+
+        for r in rows {
+            let (category_raw, active_ms, passive_ms, idle_ms) = r?;
+            let total = active_ms.saturating_add(passive_ms).saturating_add(idle_ms);
+            m.total_ms = m.total_ms.saturating_add(total);
+
+            match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
+                Category::Productive => {
+                    m.productive_ms = m.productive_ms.saturating_add(total);
+                    m.productive_active_ms = m.productive_active_ms.saturating_add(active_ms);
+                    m.productive_passive_ms = m.productive_passive_ms.saturating_add(passive_ms);
+                    m.productive_idle_ms = m.productive_idle_ms.saturating_add(idle_ms);
+                }
+                Category::Unproductive => {
+                    m.unproductive_ms = m.unproductive_ms.saturating_add(total);
+                }
+                Category::Neutral => {
+                    m.neutral_ms = m.neutral_ms.saturating_add(total);
+                }
+            }
+        }
+
+        let prod_ratio = if m.total_ms > 0 {
+            m.productive_ms as f64 / m.total_ms as f64
+        } else {
+            0.0
+        };
+        let prod_active_pct = if m.productive_ms > 0 {
+            m.productive_active_ms as f64 / m.productive_ms as f64
+        } else {
+            0.0
+        };
+
+        daily_sheet
+            .write_string(row, 0, &date.to_string())
+            .map_err(|e| Error::NiriError(e.to_string()))?;
+        daily_sheet
+            .write_string(row, 1, &fmt_hms(m.total_ms))
+            .map_err(|e| Error::NiriError(e.to_string()))?;
+        daily_sheet
+            .write_string(row, 2, &fmt_hms(m.productive_ms))
+            .map_err(|e| Error::NiriError(e.to_string()))?;
+        daily_sheet
+            .write_string(row, 3, &fmt_hms(m.unproductive_ms))
+            .map_err(|e| Error::NiriError(e.to_string()))?;
+        daily_sheet
+            .write_string(row, 4, &fmt_hms(m.neutral_ms))
+            .map_err(|e| Error::NiriError(e.to_string()))?;
+        daily_sheet
+            .write_string(row, 5, &fmt_hms(m.productive_active_ms))
+            .map_err(|e| Error::NiriError(e.to_string()))?;
+        daily_sheet
+            .write_string(row, 6, &fmt_hms(m.productive_passive_ms))
+            .map_err(|e| Error::NiriError(e.to_string()))?;
+        daily_sheet
+            .write_string(row, 7, &fmt_hms(m.productive_idle_ms))
+            .map_err(|e| Error::NiriError(e.to_string()))?;
+        daily_sheet
+            .write_number_with_format(row, 8, prod_ratio, &pct_fmt)
+            .map_err(|e| Error::NiriError(e.to_string()))?;
+        daily_sheet
+            .write_number_with_format(row, 9, prod_active_pct, &pct_fmt)
+            .map_err(|e| Error::NiriError(e.to_string()))?;
+
+        daily_metrics.push((date, m));
+        row += 1;
+        date += chrono::Duration::days(1);
+    }
+
+    let mut daily_total = Metrics::default();
+    for (_, m) in &daily_metrics {
+        daily_total.total_ms = daily_total.total_ms.saturating_add(m.total_ms);
+        daily_total.productive_ms = daily_total.productive_ms.saturating_add(m.productive_ms);
+        daily_total.unproductive_ms = daily_total.unproductive_ms.saturating_add(m.unproductive_ms);
+        daily_total.neutral_ms = daily_total.neutral_ms.saturating_add(m.neutral_ms);
+        daily_total.productive_active_ms = daily_total.productive_active_ms.saturating_add(m.productive_active_ms);
+        daily_total.productive_passive_ms = daily_total.productive_passive_ms.saturating_add(m.productive_passive_ms);
+        daily_total.productive_idle_ms = daily_total.productive_idle_ms.saturating_add(m.productive_idle_ms);
+    }
+
+    let total_prod_ratio = if daily_total.total_ms > 0 {
+        daily_total.productive_ms as f64 / daily_total.total_ms as f64
+    } else {
+        0.0
+    };
+    let total_prod_active_pct = if daily_total.productive_ms > 0 {
+        daily_total.productive_active_ms as f64 / daily_total.productive_ms as f64
+    } else {
+        0.0
+    };
+
+    let total_pct_fmt = Format::new().set_bold().set_background_color(0xE0E0E0).set_num_format("0.0%");
+
+    let days_count = daily_metrics.len() as i64;
+    let avg_total_ms = if days_count > 0 { daily_total.total_ms / days_count } else { 0 };
+    let avg_productive_ms = if days_count > 0 { daily_total.productive_ms / days_count } else { 0 };
+
+    daily_sheet
+        .write_string_with_format(row, 0, "TOTAL", &total_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_string_with_format(row, 1, &fmt_hms(daily_total.total_ms), &total_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_string_with_format(row, 2, &fmt_hms(daily_total.productive_ms), &total_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_string_with_format(row, 3, &fmt_hms(daily_total.unproductive_ms), &total_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_string_with_format(row, 4, &fmt_hms(daily_total.neutral_ms), &total_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_string_with_format(row, 5, &fmt_hms(daily_total.productive_active_ms), &total_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_string_with_format(row, 6, &fmt_hms(daily_total.productive_passive_ms), &total_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_string_with_format(row, 7, &fmt_hms(daily_total.productive_idle_ms), &total_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_number_with_format(row, 8, total_prod_ratio, &total_pct_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_number_with_format(row, 9, total_prod_active_pct, &total_pct_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_string_with_format(row, 10, &fmt_hms(avg_total_ms), &total_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_string_with_format(row, 11, &fmt_hms(avg_productive_ms), &total_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+    daily_sheet
+        .write_number_with_format(row, 12, days_count as f64, &total_fmt)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+
+    daily_sheet.autofit();
+
+    workbook
+        .save(path)
+        .map_err(|e| Error::NiriError(e.to_string()))?;
+
+    println!("Exported to {}", path);
+    Ok(())
+}
+
+pub fn export_json_range(app: &App, range: TimeRange) -> Result<(), Error> {
+    let data = query_report_range(app, range)?;
+    let json = serde_json::to_string_pretty(&data)
+        .map_err(|e| Error::NiriError(format!("JSON serialization failed: {}", e)))?;
+    println!("{}", json);
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct HeatmapCell {
+    date: String,
+    hour: u32,
+    productive_ms: i64,
+    unproductive_ms: i64,
+    neutral_ms: i64,
+    total_ms: i64,
+    keystrokes: i64,
+}
+
+pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
+    let data = query_report_range(app, range)?;
+    
+    let productive_ms = data.categories
+        .iter()
+        .find(|c| c.category == Category::Productive)
+        .map(|c| c.total_ms)
+        .unwrap_or(0);
+    
+    let unproductive_ms = data.categories
+        .iter()
+        .find(|c| c.category == Category::Unproductive)
+        .map(|c| c.total_ms)
+        .unwrap_or(0);
+    
+    let ratio = if data.total_ms > 0 {
+        (productive_ms as f64 / data.total_ms as f64 * 100.0).round() as i64
+    } else {
+        0
+    };
+    
+    let top_app = data.top_apps
+        .first()
+        .map(|a| a.app_id.as_str())
+        .unwrap_or("-");
+    
+    println!(
+        "{}|{}|{}|{}|{}%|{}",
+        data.since_str.split_whitespace().next().unwrap_or(&data.since_str),
+        fmt_hms(data.total_ms),
+        fmt_hms(productive_ms),
+        fmt_hms(unproductive_ms),
+        ratio,
+        top_app
+    );
+    
+    Ok(())
+}
+
+pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
+    let bounds = range.resolve()?;
+    let time_filter = if let Some(ref until) = bounds.until_utc {
+        format!("timestamp >= '{}' AND timestamp <= '{}'", bounds.since_utc, until)
+    } else {
+        format!("timestamp >= '{}'", bounds.since_utc)
+    };
+    
+    let mut stmt = app.conn.prepare(&format!(
+        "SELECT timestamp, category, active_ms + COALESCE(passive_ms,0) + idle_ms as total_ms, keystrokes
+         FROM events WHERE {}",
+        time_filter
+    ))?;
+    
+    let mut heatmap: std::collections::BTreeMap<(String, u32), HeatmapCell> = 
+        std::collections::BTreeMap::new();
+    
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    
+    for row in rows {
+        let (timestamp, category_raw, total_ms, keystrokes) = row?;
+        let Some(local_dt) = parse_timestamp_local(&timestamp) else { continue };
+        
+        let date = local_dt.format("%Y-%m-%d").to_string();
+        let hour = local_dt.hour();
+        let key = (date.clone(), hour);
+        
+        let cell = heatmap.entry(key).or_insert_with(|| HeatmapCell {
+            date: date.clone(),
+            hour,
+            productive_ms: 0,
+            unproductive_ms: 0,
+            neutral_ms: 0,
+            total_ms: 0,
+            keystrokes: 0,
+        });
+        
+        match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
+            Category::Productive => cell.productive_ms += total_ms,
+            Category::Unproductive => cell.unproductive_ms += total_ms,
+            Category::Neutral => cell.neutral_ms += total_ms,
+        }
+        cell.total_ms += total_ms;
+        cell.keystrokes += keystrokes;
+    }
+    
+    let cells: Vec<HeatmapCell> = heatmap.into_values().collect();
+    let json = serde_json::to_string_pretty(&cells)
+        .map_err(|e| Error::NiriError(format!("JSON serialization failed: {}", e)))?;
+    println!("{}", json);
+    Ok(())
+}
+
+/// Compare current period with previous period of same length
+pub fn show_comparison(app: &App, range: TimeRange) -> Result<(), Error> {
+    let current_bounds = range.resolve()?;
+    let current_days = (current_bounds.end_date - current_bounds.start_date).num_days() + 1;
+    
+    // Calculate previous period
+    let prev_end = current_bounds.start_date - chrono::Duration::days(1);
+    let prev_start = prev_end - chrono::Duration::days(current_days - 1);
+    let prev_range = TimeRange::DateRange(prev_start, prev_end);
+    
+    let current = query_metrics_range(app, range)?;
+    let previous = query_metrics_range(app, prev_range)?;
+    
+    println!(
+        "{}",
+        "╔══════════════════════════════════════════════════════╗"
+            .cyan()
+            .bold()
+    );
+    println!(
+        "{}{}{}",
+        "║".cyan().bold(),
+        "          PERIOD COMPARISON                           "
+            .white()
+            .bold(),
+        "║".cyan().bold()
+    );
+    println!(
+        "{}\n",
+        "╚══════════════════════════════════════════════════════╝"
+            .cyan()
+            .bold()
+    );
+    
+    println!(
+        "  Current:  {} → {}",
+        current_bounds.since_str.green(),
+        current_bounds.now_str.green()
+    );
+    println!(
+        "  Previous: {} → {}\n",
+        format!("{} 00:00", prev_start).dimmed(),
+        format!("{} 23:59", prev_end).dimmed()
+    );
+    
+    fn delta_str(current: i64, previous: i64) -> String {
+        if previous == 0 {
+            if current > 0 {
+                return "+∞".green().bold().to_string();
+            }
+            return "—".dimmed().to_string();
+        }
+        let pct = ((current as f64 - previous as f64) / previous as f64) * 100.0;
+        if pct > 0.0 {
+            format!("+{:.1}%", pct).green().to_string()
+        } else if pct < 0.0 {
+            format!("{:.1}%", pct).red().to_string()
+        } else {
+            "0%".dimmed().to_string()
+        }
+    }
+    
+    fn delta_str_inverse(current: i64, previous: i64) -> String {
+        // For unproductive time, less is better (green = decrease)
+        if previous == 0 {
+            if current > 0 {
+                return "+∞".red().bold().to_string();
+            }
+            return "—".dimmed().to_string();
+        }
+        let pct = ((current as f64 - previous as f64) / previous as f64) * 100.0;
+        if pct > 0.0 {
+            format!("+{:.1}%", pct).red().to_string()
+        } else if pct < 0.0 {
+            format!("{:.1}%", pct).green().to_string()
+        } else {
+            "0%".dimmed().to_string()
+        }
+    }
+    
+    println!("{:24} {:>12} {:>12} {:>10}", 
+        "Metric".bold(), 
+        "Current".bold(), 
+        "Previous".bold(), 
+        "Change".bold()
+    );
+    println!("{}", "─".repeat(60).dimmed());
+    
+    println!(
+        "{:24} {:>12} {:>12} {:>10}",
+        "Total Time",
+        fmt_duration(current.total_ms),
+        fmt_duration(previous.total_ms),
+        delta_str(current.total_ms, previous.total_ms)
+    );
+    
+    println!(
+        "{:24} {:>12} {:>12} {:>10}",
+        "Productive".green(),
+        fmt_duration(current.productive_ms).green(),
+        fmt_duration(previous.productive_ms),
+        delta_str(current.productive_ms, previous.productive_ms)
+    );
+    
+    println!(
+        "{:24} {:>12} {:>12} {:>10}",
+        "Unproductive".red(),
+        fmt_duration(current.unproductive_ms).red(),
+        fmt_duration(previous.unproductive_ms),
+        delta_str_inverse(current.unproductive_ms, previous.unproductive_ms)
+    );
+    
+    println!(
+        "{:24} {:>12} {:>12} {:>10}",
+        "Neutral".yellow(),
+        fmt_duration(current.neutral_ms).yellow(),
+        fmt_duration(previous.neutral_ms),
+        delta_str(current.neutral_ms, previous.neutral_ms)
+    );
+    
+    // Calculate productivity ratios
+    let current_ratio = if current.total_ms > 0 {
+        (current.productive_ms as f64 / current.total_ms as f64 * 100.0).round() as i64
+    } else { 0 };
+    let previous_ratio = if previous.total_ms > 0 {
+        (previous.productive_ms as f64 / previous.total_ms as f64 * 100.0).round() as i64
+    } else { 0 };
+    
+    println!("{}", "─".repeat(60).dimmed());
+    println!(
+        "{:24} {:>11}% {:>11}% {:>10}",
+        "Productivity Ratio".bold(),
+        current_ratio,
+        previous_ratio,
+        delta_str(current_ratio, previous_ratio)
+    );
+    
+    // Daily averages
+    let current_daily_avg = current.productive_ms / current.days.max(1) as i64;
+    let previous_daily_avg = previous.productive_ms / previous.days.max(1) as i64;
+    
+    println!(
+        "{:24} {:>12} {:>12} {:>10}",
+        "Daily Avg (productive)",
+        fmt_duration(current_daily_avg),
+        fmt_duration(previous_daily_avg),
+        delta_str(current_daily_avg, previous_daily_avg)
+    );
+    
+    println!();
+    
     Ok(())
 }

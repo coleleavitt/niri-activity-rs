@@ -89,6 +89,61 @@ pub struct Schedule {
     pub days: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct Goals {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_daily_goal")]
+    pub daily: String,
+    #[serde(default = "default_weekly_goal")]
+    pub weekly: String,
+}
+
+fn default_daily_goal() -> String {
+    "8h".to_string()
+}
+
+fn default_weekly_goal() -> String {
+    "40h".to_string()
+}
+
+impl Goals {
+    pub fn daily_ms(&self) -> Option<i64> {
+        parse_duration_ms(&self.daily)
+    }
+
+    pub fn weekly_ms(&self) -> Option<i64> {
+        parse_duration_ms(&self.weekly)
+    }
+}
+
+fn parse_duration_ms(s: &str) -> Option<i64> {
+    let s = s.trim().to_lowercase();
+    let mut total_ms: i64 = 0;
+    let mut current_num = String::new();
+
+    for c in s.chars() {
+        if c.is_ascii_digit() || c == '.' {
+            current_num.push(c);
+        } else if !current_num.is_empty() {
+            let num: f64 = current_num.parse().ok()?;
+            current_num.clear();
+            match c {
+                'h' => total_ms += (num * 3600.0 * 1000.0) as i64,
+                'm' => total_ms += (num * 60.0 * 1000.0) as i64,
+                's' => total_ms += (num * 1000.0) as i64,
+                _ => {}
+            }
+        }
+    }
+
+    if total_ms > 0 {
+        Some(total_ms)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default = "default_idle_threshold")]
@@ -104,6 +159,8 @@ struct RawConfig {
     #[serde(default)]
     schedule: Schedule,
     #[serde(default)]
+    goals: Goals,
+    #[serde(default)]
     jiggler: JigglerConfig,
     #[serde(default)]
     categories: HashMap<String, Category>,
@@ -117,12 +174,9 @@ pub struct Config {
     pub deep_idle_secs: u64,
     pub away_threshold_secs: u64,
     pub mouse_dpi: f64,
-    /// Minimum accumulated mouse motion (raw sensor units) within a 2-second window
-    /// before it counts as user activity for idle detection. Filters sensor noise
-    /// that would otherwise prevent the Away state from triggering.
-    /// Default: 50 (~0.06 inches at 800 DPI). Set to 0 to disable filtering.
     pub mouse_idle_threshold: u64,
     pub schedule: Schedule,
+    pub goals: Goals,
     pub jiggler: JigglerConfig,
     pub categories: HashMap<String, Category>,
     pub title_rules: Vec<TitleRule>,
@@ -234,6 +288,7 @@ impl From<RawConfig> for Config {
             mouse_dpi: raw.mouse_dpi,
             mouse_idle_threshold: raw.mouse_idle_threshold,
             schedule: raw.schedule,
+            goals: raw.goals,
             jiggler: raw.jiggler,
             categories: raw.categories,
             title_rules,
@@ -250,6 +305,7 @@ impl Default for Config {
             mouse_dpi: default_mouse_dpi(),
             mouse_idle_threshold: default_mouse_idle_threshold(),
             schedule: Schedule::default(),
+            goals: Goals::default(),
             jiggler: JigglerConfig::default(),
             categories: HashMap::new(),
             title_rules: Vec::new(),
@@ -506,9 +562,15 @@ category = \"productive\"
 # Work schedule — only affects report breakdown (tracking is always on)
 [schedule]
 enabled = false
-start = \"09:00\"
-end = \"17:00\"
-days = [\"Mon\", \"Tue\", \"Wed\", \"Thu\", \"Fri\"]
+start = "09:00"
+end = "17:00"
+days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+# Goals / targets — show progress towards daily/weekly goals in reports
+[goals]
+enabled = false
+daily = "8h"      # Target productive time per day (e.g., "8h", "6h30m")
+weekly = "40h"    # Target productive time per week
 "#;
 
     fs::write(&config_path, example)?;
