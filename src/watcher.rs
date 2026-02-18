@@ -18,8 +18,32 @@ use crate::config::{Category, get_config_path, get_data_dir, load_config};
 use crate::db::{SessionSnapshot, init_db, insert_event, reclassify_all, run_migrations};
 use crate::error::Error;
 use crate::fmt::{cat_colored, cat_label, fmt_duration_compact, truncate};
-use crate::input::start_idle_monitor;
+use crate::input::{InputSnapshot, start_idle_monitor};
 use crate::logind::start_logind_monitor;
+
+fn reclassify_false_active(
+    active_ms: &mut i64,
+    passive_ms: &mut i64,
+    input: &InputSnapshot,
+    input_active_ms: u64,
+    quiet: bool,
+) {
+    if *active_ms > 0
+        && input.keystrokes == 0
+        && input.mouse_clicks == 0
+        && *active_ms as u64 >= input_active_ms
+    {
+        if !quiet {
+            eprintln!(
+                "{} Reclassifying {}ms active → passive (0 keystrokes, 0 clicks)",
+                "[INPUT]".yellow().bold(),
+                *active_ms,
+            );
+        }
+        *passive_ms = passive_ms.saturating_add(*active_ms);
+        *active_ms = 0;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityState {
@@ -106,6 +130,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     println!("Idle threshold: {}s", config.idle_threshold_secs);
     println!("Away threshold: {}s", config.away_threshold_secs);
     println!("Mouse idle threshold: {} raw units", config.mouse_idle_threshold);
+    println!("Input active threshold: {}s", config.input_active_secs);
     println!("Categories configured: {}", config.categories.len());
 
     let conn = Connection::open(&db_path)?;
@@ -129,6 +154,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let idle_threshold_ms = config.idle_threshold_secs.saturating_mul(1000);
     let deep_idle_threshold_ms = config.deep_idle_secs.saturating_mul(1000);
     let away_threshold_ms = config.away_threshold_secs.saturating_mul(1000);
+    let input_active_ms = config.input_active_secs.saturating_mul(1000);
 
     let mut socket = connect_to_niri()?;
     let reply = socket.send(Request::EventStream)?;
@@ -180,6 +206,13 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
                 let input = input_stats.snapshot();
                 let jiggler = input_stats.jiggler_detected();
+                reclassify_false_active(
+                    &mut accumulated_active_ms,
+                    &mut accumulated_passive_ms,
+                    &input,
+                    input_active_ms,
+                    quiet,
+                );
                 insert_event(
                     &conn,
                     SessionSnapshot {
@@ -232,6 +265,13 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             {
                 let input = input_stats.snapshot();
                 let jiggler = input_stats.jiggler_detected();
+                reclassify_false_active(
+                    &mut accumulated_active_ms,
+                    &mut accumulated_passive_ms,
+                    &input,
+                    input_active_ms,
+                    quiet,
+                );
                 insert_event(
                     &conn,
                     SessionSnapshot {
@@ -277,6 +317,13 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             {
                 let input = input_stats.snapshot();
                 let jiggler = input_stats.jiggler_detected();
+                reclassify_false_active(
+                    &mut accumulated_active_ms,
+                    &mut accumulated_passive_ms,
+                    &input,
+                    input_active_ms,
+                    quiet,
+                );
                 insert_event(
                     &conn,
                     SessionSnapshot {
@@ -308,6 +355,13 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
                 let input = input_stats.snapshot();
                 let jiggler = input_stats.jiggler_detected();
+                reclassify_false_active(
+                    &mut accumulated_active_ms,
+                    &mut accumulated_passive_ms,
+                    &input,
+                    input_active_ms,
+                    quiet,
+                );
                 insert_event(
                     &conn,
                     SessionSnapshot {
@@ -374,6 +428,13 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
                     let input = input_stats.snapshot();
                     let jiggler = input_stats.jiggler_detected();
+                    reclassify_false_active(
+                        &mut accumulated_active_ms,
+                        &mut accumulated_passive_ms,
+                        &input,
+                        input_active_ms,
+                        quiet,
+                    );
                     insert_event(
                         &conn,
                         SessionSnapshot {
@@ -444,6 +505,13 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
                     let input = input_stats.snapshot();
                     let jiggler = input_stats.jiggler_detected();
+                    reclassify_false_active(
+                        &mut accumulated_active_ms,
+                        &mut accumulated_passive_ms,
+                        &input,
+                        input_active_ms,
+                        quiet,
+                    );
                     insert_event(
                         &conn,
                         SessionSnapshot {
@@ -545,6 +613,13 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 let jiggler = input_stats.jiggler_detected();
 
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
+                    reclassify_false_active(
+                        &mut accumulated_active_ms,
+                        &mut accumulated_passive_ms,
+                        &input,
+                        input_active_ms,
+                        quiet,
+                    );
                     insert_event(
                         &conn,
                         SessionSnapshot {

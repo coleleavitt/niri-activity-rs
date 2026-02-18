@@ -208,6 +208,19 @@ pub fn reclassify_all(conn: &Connection, config: &Config) -> Result<(), Error> {
     Ok(())
 }
 
+pub fn fix_false_active(conn: &Connection, input_active_ms: u64) -> Result<i64, Error> {
+    let updated = conn.execute(
+        "UPDATE events
+            SET passive_ms = passive_ms + active_ms,
+                active_ms = 0
+          WHERE keystrokes = 0
+            AND mouse_clicks = 0
+            AND active_ms > ?1",
+        params![input_active_ms as i64],
+    )?;
+    Ok(updated as i64)
+}
+
 pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<(), Error> {
     let category = snapshot
         .config

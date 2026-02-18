@@ -201,6 +201,13 @@ enum Commands {
     },
     /// Initialize config file with examples
     Init,
+    /// Fix false-active records in the database (reclassify active → passive
+    /// for events with 0 keystrokes and 0 mouse clicks)
+    FixFalseActive {
+        /// Only show what would be fixed, don't modify the database
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Send activity report via email
     Email {
         /// Send weekly report (last Mon-Sun)
@@ -272,6 +279,44 @@ fn main() {
                 }))
         }
         Some(Commands::Init) => config::init_config(),
+        Some(Commands::FixFalseActive { dry_run }) => {
+            (|| -> Result<(), Error> {
+                let cfg = config::load_config()?;
+                let data_dir = config::get_data_dir()?;
+                let db_path = data_dir.join("activity.db");
+                let conn = rusqlite::Connection::open(&db_path)?;
+                let input_active_ms = cfg.input_active_secs.saturating_mul(1000);
+
+                if dry_run {
+                    let count: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM events
+                          WHERE keystrokes = 0
+                            AND mouse_clicks = 0
+                            AND active_ms > ?1",
+                        rusqlite::params![input_active_ms as i64],
+                        |row| row.get(0),
+                    )?;
+                    let total_ms: i64 = conn.query_row(
+                        "SELECT COALESCE(SUM(active_ms), 0) FROM events
+                          WHERE keystrokes = 0
+                            AND mouse_clicks = 0
+                            AND active_ms > ?1",
+                        rusqlite::params![input_active_ms as i64],
+                        |row| row.get(0),
+                    )?;
+                    let hours = total_ms / 3_600_000;
+                    let mins = (total_ms % 3_600_000) / 60_000;
+                    println!(
+                        "[dry-run] Would reclassify {} events ({} false-active → passive, {}h {}m total)",
+                        count, count, hours, mins
+                    );
+                } else {
+                    let fixed = db::fix_false_active(&conn, input_active_ms)?;
+                    println!("Fixed {} false-active events (active_ms → passive_ms)", fixed);
+                }
+                Ok(())
+            })()
+        }
         Some(Commands::Email { weekly, monthly, test, secure }) => {
             (|| -> Result<(), Error> {
                 if secure {

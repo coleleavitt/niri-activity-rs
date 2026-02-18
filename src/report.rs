@@ -74,7 +74,7 @@ impl TimeRange {
                 Ok(TimeBounds {
                     since_utc,
                     until_utc: None,
-                    since_str: since.format("%Y-%m-%d %H:%M").to_string(),
+                    since_str: format!("{} 00:00", since_date),
                     now_str: now.format("%Y-%m-%d %H:%M").to_string(),
                     start_date: since_date,
                     end_date: today,
@@ -817,7 +817,7 @@ fn classify_gap(start_hour: u32, gap_hours: f64) -> Option<GapType> {
 
 fn query_streaks(conn: &Connection, config: &Config, time_filter: &str) -> Result<StreakSummary, Error> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT timestamp, app_id, category, active_ms + COALESCE(passive_ms,0) + idle_ms as total_ms, keystrokes
+        "SELECT timestamp, app_id, category, active_ms, keystrokes
          FROM events
          WHERE {}
          ORDER BY timestamp",
@@ -828,7 +828,7 @@ fn query_streaks(conn: &Connection, config: &Config, time_filter: &str) -> Resul
         timestamp: String,
         app_id: String,
         category: String,
-        total_ms: i64,
+        active_ms: i64,
         keystrokes: i64,
     }
 
@@ -838,12 +838,14 @@ fn query_streaks(conn: &Connection, config: &Config, time_filter: &str) -> Resul
                 timestamp: row.get(0)?,
                 app_id: row.get(1)?,
                 category: row.get(2)?,
-                total_ms: row.get(3)?,
+                active_ms: row.get(3)?,
                 keystrokes: row.get(4)?,
             })
         })?
         .filter_map(|r| r.ok())
         .collect();
+
+    let away_threshold_ms = (config.away_threshold_secs as i64).saturating_mul(1_000);
 
     let mut streaks: Vec<FocusStreak> = Vec::new();
     let mut current_streak_start: Option<String> = None;
@@ -851,60 +853,101 @@ fn query_streaks(conn: &Connection, config: &Config, time_filter: &str) -> Resul
     let mut current_streak_ms: i64 = 0;
     let mut current_streak_keys: i64 = 0;
     let mut in_productive_streak = false;
+    let mut prev_timestamp: Option<String> = None;
+
+    let finish_streak = |streaks: &mut Vec<FocusStreak>,
+                         start: &mut Option<String>,
+                         app: &str,
+                         ms: i64,
+                         keys: i64| {
+        if ms >= 300_000 {
+            let start_str = start.take().unwrap_or_default();
+            let start_local = parse_timestamp_local(&start_str)
+                .map(|dt| dt.format("%m-%d %H:%M").to_string())
+                .unwrap_or(start_str);
+            streaks.push(FocusStreak {
+                app_id: app.to_string(),
+                start_time: start_local,
+                duration_ms: ms,
+                keystrokes: keys,
+            });
+        } else {
+            let _ = start.take();
+        }
+    };
 
     for ev in &events {
         let cat = Category::from_str(&ev.category).unwrap_or(Category::Neutral);
         let is_productive = cat == Category::Productive;
-        
+
+        // Break any active streak if there is a gap larger than away_threshold between events.
+        let gap_breaks_streak = if let (Some(prev_ts), true) = (&prev_timestamp, in_productive_streak) {
+            if let (Some(prev_dt), Some(cur_dt)) = (
+                parse_timestamp_local(prev_ts),
+                parse_timestamp_local(&ev.timestamp),
+            ) {
+                let gap_ms = (cur_dt - prev_dt).num_milliseconds();
+                gap_ms > away_threshold_ms
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if gap_breaks_streak {
+            finish_streak(
+                &mut streaks,
+                &mut current_streak_start,
+                &current_streak_app,
+                current_streak_ms,
+                current_streak_keys,
+            );
+            in_productive_streak = false;
+            current_streak_ms = 0;
+            current_streak_keys = 0;
+        }
+
         if is_productive {
             if in_productive_streak {
-                current_streak_ms = current_streak_ms.saturating_add(ev.total_ms);
+                current_streak_ms = current_streak_ms.saturating_add(ev.active_ms);
                 current_streak_keys = current_streak_keys.saturating_add(ev.keystrokes);
-                if ev.total_ms > 0 {
+                if ev.active_ms > 0 {
                     current_streak_app.clone_from(&ev.app_id);
                 }
             } else {
                 in_productive_streak = true;
                 current_streak_start = Some(ev.timestamp.clone());
                 current_streak_app.clone_from(&ev.app_id);
-                current_streak_ms = ev.total_ms;
+                current_streak_ms = ev.active_ms;
                 current_streak_keys = ev.keystrokes;
             }
-        } else if in_productive_streak && current_streak_ms >= 300_000 {
-            let start_str = current_streak_start.take().unwrap_or_default();
-            let start_local = parse_timestamp_local(&start_str)
-                .map(|dt| dt.format("%m-%d %H:%M").to_string())
-                .unwrap_or(start_str);
-            
-            streaks.push(FocusStreak {
-                app_id: current_streak_app.clone(),
-                start_time: start_local,
-                duration_ms: current_streak_ms,
-                keystrokes: current_streak_keys,
-            });
-            
-            in_productive_streak = false;
-            current_streak_ms = 0;
-            current_streak_keys = 0;
         } else {
+            if in_productive_streak {
+                finish_streak(
+                    &mut streaks,
+                    &mut current_streak_start,
+                    &current_streak_app,
+                    current_streak_ms,
+                    current_streak_keys,
+                );
+            }
             in_productive_streak = false;
             current_streak_ms = 0;
             current_streak_keys = 0;
         }
+
+        prev_timestamp = Some(ev.timestamp.clone());
     }
 
-    if in_productive_streak && current_streak_ms >= 300_000 {
-        let start_str = current_streak_start.take().unwrap_or_default();
-        let start_local = parse_timestamp_local(&start_str)
-            .map(|dt| dt.format("%m-%d %H:%M").to_string())
-            .unwrap_or(start_str);
-        
-        streaks.push(FocusStreak {
-            app_id: current_streak_app.clone(),
-            start_time: start_local,
-            duration_ms: current_streak_ms,
-            keystrokes: current_streak_keys,
-        });
+    if in_productive_streak {
+        finish_streak(
+            &mut streaks,
+            &mut current_streak_start,
+            &current_streak_app,
+            current_streak_ms,
+            current_streak_keys,
+        );
     }
 
     streaks.sort_by_key(|s| std::cmp::Reverse(s.duration_ms));
@@ -922,8 +965,6 @@ fn query_streaks(conn: &Connection, config: &Config, time_filter: &str) -> Resul
     let longest_app = longest.map(|s| s.app_id.clone()).unwrap_or_default();
     
     streaks.truncate(5);
-    
-    let _ = config;
     
     Ok(StreakSummary {
         longest_productive_ms: longest_ms,

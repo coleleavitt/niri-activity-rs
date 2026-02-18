@@ -231,6 +231,11 @@ struct RawConfig {
     mouse_dpi: f64,
     #[serde(default = "default_mouse_idle_threshold")]
     mouse_idle_threshold: u64,
+    /// Seconds of zero meaningful input (keystrokes + clicks) before active time
+    /// is reclassified as passive at flush boundaries. Prevents false-active from
+    /// compositor events (e.g. Firefox video inhibiting idle). Default: 60.
+    #[serde(default = "default_input_active_secs")]
+    input_active_secs: u64,
     #[serde(default)]
     schedule: Schedule,
     #[serde(default)]
@@ -252,6 +257,7 @@ pub struct Config {
     pub away_threshold_secs: u64,
     pub mouse_dpi: f64,
     pub mouse_idle_threshold: u64,
+    pub input_active_secs: u64,
     pub schedule: Schedule,
     pub goals: Goals,
     pub email: Email,
@@ -278,6 +284,10 @@ fn default_mouse_dpi() -> f64 {
 
 fn default_mouse_idle_threshold() -> u64 {
     50
+}
+
+fn default_input_active_secs() -> u64 {
+    60
 }
 
 fn default_jiggler_enabled() -> bool {
@@ -365,6 +375,7 @@ impl From<RawConfig> for Config {
             away_threshold_secs: raw.away_threshold_secs,
             mouse_dpi: raw.mouse_dpi,
             mouse_idle_threshold: raw.mouse_idle_threshold,
+            input_active_secs: raw.input_active_secs,
             schedule: raw.schedule,
             goals: raw.goals,
             email: raw.email,
@@ -383,6 +394,7 @@ impl Default for Config {
             away_threshold_secs: default_away_threshold(),
             mouse_dpi: default_mouse_dpi(),
             mouse_idle_threshold: default_mouse_idle_threshold(),
+            input_active_secs: default_input_active_secs(),
             schedule: Schedule::default(),
             goals: Goals::default(),
             email: Email::default(),
@@ -604,6 +616,11 @@ deep_idle_secs = 300
 # When Away, the daemon stops recording events until user input resumes.
 # This prevents overnight/sleep idle from inflating your tracked time.
 away_threshold_secs = 1800
+
+# Seconds of zero meaningful input (keystrokes + clicks) before active time
+# is reclassified as passive. Prevents false-active from media playback
+# (e.g. Firefox video playing keeps compositor alive but no real input).
+input_active_secs = 60
 
 # Jiggler / artificial input detection
 [jiggler]

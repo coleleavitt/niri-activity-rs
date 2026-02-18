@@ -38,9 +38,8 @@ pub struct InputStats {
     mouse_distance: Arc<AtomicU64>,
     jiggler_pattern: Arc<AtomicBool>,
     jiggler_process: Arc<AtomicBool>,
-    /// Timestamp (ms since start) of the last keyboard event — used to suppress
-    /// jiggler detection when the user is also typing (real jigglers don't type).
     last_keyboard_ms: Arc<AtomicU64>,
+    last_meaningful_input_ms: Arc<AtomicU64>,
 }
 
 impl InputStats {
@@ -59,6 +58,11 @@ impl InputStats {
 
     pub fn last_activity_ms(&self) -> u64 {
         self.last_activity_ms.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn last_meaningful_input_ms(&self) -> u64 {
+        self.last_meaningful_input_ms.load(Ordering::Relaxed)
     }
 
     pub fn jiggler_detected(&self) -> bool {
@@ -208,6 +212,7 @@ pub fn start_idle_monitor(
         jiggler_pattern: Arc::new(AtomicBool::new(false)),
         jiggler_process: Arc::new(AtomicBool::new(false)),
         last_keyboard_ms: Arc::new(AtomicU64::new(0)),
+        last_meaningful_input_ms: Arc::new(AtomicU64::new(0)),
     };
 
     let last_activity = Arc::clone(&stats.last_activity_ms);
@@ -217,6 +222,7 @@ pub fn start_idle_monitor(
     let mouse_distance = Arc::clone(&stats.mouse_distance);
     let jiggler_pattern_flag = Arc::clone(&stats.jiggler_pattern);
     let last_keyboard_ms = Arc::clone(&stats.last_keyboard_ms);
+    let last_meaningful = Arc::clone(&stats.last_meaningful_input_ms);
 
     let devices_changed = Arc::new(AtomicBool::new(false));
     let devices_changed_clone = Arc::clone(&devices_changed);
@@ -364,6 +370,7 @@ pub fn start_idle_monitor(
                                     if BTN_MOUSE_RANGE.contains(&code) {
                                         mouse_clicks.fetch_add(1, Ordering::Relaxed);
                                         last_activity.store(now, Ordering::Relaxed);
+                                        last_meaningful.store(now, Ordering::Relaxed);
                                         last_mouse_event = Instant::now();
                                         if jiggler_enabled {
                                             mouse_tracker.record(now);
@@ -371,6 +378,7 @@ pub fn start_idle_monitor(
                                     } else {
                                         keystrokes.fetch_add(1, Ordering::Relaxed);
                                         last_activity.store(now, Ordering::Relaxed);
+                                        last_meaningful.store(now, Ordering::Relaxed);
                                         last_keyboard_event = Instant::now();
                                         last_keyboard_ms.store(now, Ordering::Relaxed);
                                         if jiggler_enabled {
