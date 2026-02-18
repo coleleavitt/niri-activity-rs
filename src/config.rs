@@ -236,6 +236,8 @@ struct RawConfig {
     /// compositor events (e.g. Firefox video inhibiting idle). Default: 60.
     #[serde(default = "default_input_active_secs")]
     input_active_secs: u64,
+    #[serde(default = "default_streak_break_tolerance")]
+    streak_break_tolerance_secs: u64,
     #[serde(default)]
     schedule: Schedule,
     #[serde(default)]
@@ -258,6 +260,7 @@ pub struct Config {
     pub mouse_dpi: f64,
     pub mouse_idle_threshold: u64,
     pub input_active_secs: u64,
+    pub streak_break_tolerance_secs: u64,
     pub schedule: Schedule,
     pub goals: Goals,
     pub email: Email,
@@ -288,6 +291,10 @@ fn default_mouse_idle_threshold() -> u64 {
 
 fn default_input_active_secs() -> u64 {
     60
+}
+
+fn default_streak_break_tolerance() -> u64 {
+    120
 }
 
 fn default_jiggler_enabled() -> bool {
@@ -376,6 +383,7 @@ impl From<RawConfig> for Config {
             mouse_dpi: raw.mouse_dpi,
             mouse_idle_threshold: raw.mouse_idle_threshold,
             input_active_secs: raw.input_active_secs,
+            streak_break_tolerance_secs: raw.streak_break_tolerance_secs,
             schedule: raw.schedule,
             goals: raw.goals,
             email: raw.email,
@@ -395,6 +403,7 @@ impl Default for Config {
             mouse_dpi: default_mouse_dpi(),
             mouse_idle_threshold: default_mouse_idle_threshold(),
             input_active_secs: default_input_active_secs(),
+            streak_break_tolerance_secs: default_streak_break_tolerance(),
             schedule: Schedule::default(),
             goals: Goals::default(),
             email: Email::default(),

@@ -815,6 +815,32 @@ fn classify_gap(start_hour: u32, gap_hours: f64) -> Option<GapType> {
     }
 }
 
+fn dominant_app(app_ms: &HashMap<String, i64>) -> String {
+    app_ms
+        .iter()
+        .max_by_key(|(_, ms)| *ms)
+        .map(|(app, _)| app.clone())
+        .unwrap_or_default()
+}
+
+fn flush_streak(streaks: &mut Vec<FocusStreak>, start: &mut Option<String>, app_ms: &mut HashMap<String, i64>, productive_ms: i64, keys: i64) {
+    if productive_ms >= 300_000 {
+        let start_str = start.take().unwrap_or_default();
+        let start_local = parse_timestamp_local(&start_str)
+            .map(|dt| dt.format("%m-%d %H:%M").to_string())
+            .unwrap_or(start_str);
+        streaks.push(FocusStreak {
+            app_id: dominant_app(app_ms),
+            start_time: start_local,
+            duration_ms: productive_ms,
+            keystrokes: keys,
+        });
+    } else {
+        let _ = start.take();
+    }
+    app_ms.clear();
+}
+
 fn query_streaks(conn: &Connection, config: &Config, time_filter: &str) -> Result<StreakSummary, Error> {
     let mut stmt = conn.prepare(&format!(
         "SELECT timestamp, app_id, category, active_ms, keystrokes
@@ -846,108 +872,71 @@ fn query_streaks(conn: &Connection, config: &Config, time_filter: &str) -> Resul
         .collect();
 
     let away_threshold_ms = (config.away_threshold_secs as i64).saturating_mul(1_000);
+    let tolerance_ms = (config.streak_break_tolerance_secs as i64).saturating_mul(1_000);
 
     let mut streaks: Vec<FocusStreak> = Vec::new();
-    let mut current_streak_start: Option<String> = None;
-    let mut current_streak_app = String::new();
-    let mut current_streak_ms: i64 = 0;
-    let mut current_streak_keys: i64 = 0;
-    let mut in_productive_streak = false;
+    let mut streak_start: Option<String> = None;
+    let mut streak_app_ms: HashMap<String, i64> = HashMap::new();
+    let mut streak_productive_ms: i64 = 0;
+    let mut streak_keys: i64 = 0;
+    let mut pending_unproductive_ms: i64 = 0;
+    let mut in_streak = false;
     let mut prev_timestamp: Option<String> = None;
-
-    let finish_streak = |streaks: &mut Vec<FocusStreak>,
-                         start: &mut Option<String>,
-                         app: &str,
-                         ms: i64,
-                         keys: i64| {
-        if ms >= 300_000 {
-            let start_str = start.take().unwrap_or_default();
-            let start_local = parse_timestamp_local(&start_str)
-                .map(|dt| dt.format("%m-%d %H:%M").to_string())
-                .unwrap_or(start_str);
-            streaks.push(FocusStreak {
-                app_id: app.to_string(),
-                start_time: start_local,
-                duration_ms: ms,
-                keystrokes: keys,
-            });
-        } else {
-            let _ = start.take();
-        }
-    };
 
     for ev in &events {
         let cat = Category::from_str(&ev.category).unwrap_or(Category::Neutral);
         let is_productive = cat == Category::Productive;
 
-        // Break any active streak if there is a gap larger than away_threshold between events.
-        let gap_breaks_streak = if let (Some(prev_ts), true) = (&prev_timestamp, in_productive_streak) {
-            if let (Some(prev_dt), Some(cur_dt)) = (
-                parse_timestamp_local(prev_ts),
-                parse_timestamp_local(&ev.timestamp),
-            ) {
-                let gap_ms = (cur_dt - prev_dt).num_milliseconds();
-                gap_ms > away_threshold_ms
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        let wall_gap_ms = prev_timestamp.as_deref()
+            .and_then(|prev| parse_timestamp_local(prev))
+            .and_then(|prev_dt| parse_timestamp_local(&ev.timestamp).map(|cur_dt| (cur_dt - prev_dt).num_milliseconds()))
+            .unwrap_or(0);
 
-        if gap_breaks_streak {
-            finish_streak(
-                &mut streaks,
-                &mut current_streak_start,
-                &current_streak_app,
-                current_streak_ms,
-                current_streak_keys,
-            );
-            in_productive_streak = false;
-            current_streak_ms = 0;
-            current_streak_keys = 0;
+        let hard_break = in_streak && wall_gap_ms > away_threshold_ms;
+
+        if hard_break {
+            flush_streak(&mut streaks, &mut streak_start, &mut streak_app_ms, streak_productive_ms, streak_keys);
+            in_streak = false;
+            streak_productive_ms = 0;
+            streak_keys = 0;
+            pending_unproductive_ms = 0;
         }
 
         if is_productive {
-            if in_productive_streak {
-                current_streak_ms = current_streak_ms.saturating_add(ev.active_ms);
-                current_streak_keys = current_streak_keys.saturating_add(ev.keystrokes);
-                if ev.active_ms > 0 {
-                    current_streak_app.clone_from(&ev.app_id);
+            if in_streak {
+                if pending_unproductive_ms > tolerance_ms {
+                    flush_streak(&mut streaks, &mut streak_start, &mut streak_app_ms, streak_productive_ms, streak_keys);
+                    in_streak = false;
+                    streak_productive_ms = 0;
+                    streak_keys = 0;
+                    pending_unproductive_ms = 0;
+                } else {
+                    pending_unproductive_ms = 0;
+                    streak_productive_ms = streak_productive_ms.saturating_add(ev.active_ms);
+                    streak_keys = streak_keys.saturating_add(ev.keystrokes);
+                    *streak_app_ms.entry(ev.app_id.clone()).or_insert(0) =
+                        streak_app_ms.get(&ev.app_id).copied().unwrap_or(0).saturating_add(ev.active_ms);
                 }
-            } else {
-                in_productive_streak = true;
-                current_streak_start = Some(ev.timestamp.clone());
-                current_streak_app.clone_from(&ev.app_id);
-                current_streak_ms = ev.active_ms;
-                current_streak_keys = ev.keystrokes;
             }
-        } else {
-            if in_productive_streak {
-                finish_streak(
-                    &mut streaks,
-                    &mut current_streak_start,
-                    &current_streak_app,
-                    current_streak_ms,
-                    current_streak_keys,
-                );
+
+            if !in_streak {
+                in_streak = true;
+                streak_start = Some(ev.timestamp.clone());
+                streak_productive_ms = ev.active_ms;
+                streak_keys = ev.keystrokes;
+                pending_unproductive_ms = 0;
+                *streak_app_ms.entry(ev.app_id.clone()).or_insert(0) =
+                    streak_app_ms.get(&ev.app_id).copied().unwrap_or(0).saturating_add(ev.active_ms);
             }
-            in_productive_streak = false;
-            current_streak_ms = 0;
-            current_streak_keys = 0;
+        } else if in_streak {
+            pending_unproductive_ms = pending_unproductive_ms.saturating_add(ev.active_ms);
         }
 
         prev_timestamp = Some(ev.timestamp.clone());
     }
 
-    if in_productive_streak {
-        finish_streak(
-            &mut streaks,
-            &mut current_streak_start,
-            &current_streak_app,
-            current_streak_ms,
-            current_streak_keys,
-        );
+    if in_streak {
+        flush_streak(&mut streaks, &mut streak_start, &mut streak_app_ms, streak_productive_ms, streak_keys);
     }
 
     streaks.sort_by_key(|s| std::cmp::Reverse(s.duration_ms));
