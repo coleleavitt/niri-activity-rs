@@ -18,6 +18,7 @@ use crate::error::Error;
 fn parse_time_range(
     days: u32,
     aligned: bool,
+    today: bool,
     yesterday: bool,
     last_week: bool,
     this_week: bool,
@@ -39,7 +40,9 @@ fn parse_time_range(
         return Err(Error::NiriError("--from and --to must be used together".into()));
     }
     
-    Ok(if yesterday {
+    Ok(if today {
+        report::TimeRange::Days(0)
+    } else if yesterday {
         report::TimeRange::Yesterday
     } else if last_week || week {
         report::TimeRange::LastWeek
@@ -81,6 +84,8 @@ enum Commands {
         #[arg(long)]
         aligned: bool,
         #[arg(long)]
+        today: bool,
+        #[arg(long)]
         yesterday: bool,
         #[arg(long)]
         last_week: bool,
@@ -117,6 +122,8 @@ enum Commands {
         #[arg(long)]
         aligned: bool,
         #[arg(long)]
+        today: bool,
+        #[arg(long)]
         yesterday: bool,
         #[arg(long)]
         last_week: bool,
@@ -146,6 +153,8 @@ enum Commands {
         days: u32,
         #[arg(long)]
         aligned: bool,
+        #[arg(long)]
+        today: bool,
         #[arg(long)]
         yesterday: bool,
         #[arg(long)]
@@ -178,6 +187,8 @@ enum Commands {
         days: u32,
         #[arg(long)]
         aligned: bool,
+        #[arg(long)]
+        today: bool,
         #[arg(long)]
         yesterday: bool,
         #[arg(long)]
@@ -231,29 +242,29 @@ fn main() {
     let result: Result<(), Error> = match cli.command {
         None => tui::run_tui_range(report::TimeRange::Days(7)),
         Some(Commands::Tui {
-            days, aligned, yesterday, last_week, this_week,
+            days, aligned, today, yesterday, last_week, this_week,
             last_month, this_month, week, month, from, to,
         }) => {
-            parse_time_range(days, aligned, yesterday, last_week, this_week, last_month, this_month, week, month, from, to)
+            parse_time_range(days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week, month, from, to)
                 .and_then(tui::run_tui_range)
         }
         Some(Commands::Watch { quiet }) => watcher::watch(quiet),
         Some(Commands::Today) => report::App::open().and_then(|app| report::show_today(&app)),
         Some(Commands::Metrics {
-            days, aligned, yesterday, last_week, this_week,
+            days, aligned, today, yesterday, last_week, this_week,
             last_month, this_month, week, month, from, to,
         }) => {
-            parse_time_range(days, aligned, yesterday, last_week, this_week, last_month, this_month, week, month, from, to)
+            parse_time_range(days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week, month, from, to)
                 .and_then(|range| report::App::open().and_then(|app| report::show_metrics_range(&app, range)))
         }
         Some(Commands::Timeline { days, bucket }) => {
             report::App::open().and_then(|app| report::show_timeline(&app, days, bucket))
         }
         Some(Commands::Report {
-            days, aligned, yesterday, last_week, this_week,
+            days, aligned, today, yesterday, last_week, this_week,
             last_month, this_month, week, month, from, to, compare,
         }) => {
-            parse_time_range(days, aligned, yesterday, last_week, this_week, last_month, this_month, week, month, from, to)
+            parse_time_range(days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week, month, from, to)
                 .and_then(|range| report::App::open().and_then(|app| {
                     if compare {
                         report::show_comparison(&app, range)
@@ -263,10 +274,10 @@ fn main() {
                 }))
         }
         Some(Commands::Export {
-            days, aligned, yesterday, last_week, this_week,
+            days, aligned, today, yesterday, last_week, this_week,
             last_month, this_month, week, month, from, to, format, output,
         }) => {
-            parse_time_range(days, aligned, yesterday, last_week, this_week, last_month, this_month, week, month, from, to)
+            parse_time_range(days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week, month, from, to)
                 .and_then(|range| report::App::open().and_then(|app| match format.as_str() {
                     "xlsx" | "excel" => {
                         let path = output.unwrap_or_else(|| "activity_report.xlsx".to_string());
