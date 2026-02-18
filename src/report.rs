@@ -843,7 +843,7 @@ fn flush_streak(streaks: &mut Vec<FocusStreak>, start: &mut Option<String>, app_
 
 fn query_streaks(conn: &Connection, config: &Config, time_filter: &str) -> Result<StreakSummary, Error> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT timestamp, app_id, category, active_ms, keystrokes
+        "SELECT timestamp, app_id, category, active_ms, keystrokes, mouse_clicks
          FROM events
          WHERE {}
          ORDER BY timestamp",
@@ -856,6 +856,7 @@ fn query_streaks(conn: &Connection, config: &Config, time_filter: &str) -> Resul
         category: String,
         active_ms: i64,
         keystrokes: i64,
+        mouse_clicks: i64,
     }
 
     let events: Vec<EventRow> = stmt
@@ -866,13 +867,15 @@ fn query_streaks(conn: &Connection, config: &Config, time_filter: &str) -> Resul
                 category: row.get(2)?,
                 active_ms: row.get(3)?,
                 keystrokes: row.get(4)?,
+                mouse_clicks: row.get(5)?,
             })
         })?
         .filter_map(|r| r.ok())
         .collect();
 
-    let away_threshold_ms = (config.away_threshold_secs as i64).saturating_mul(1_000);
+    let away_ms = (config.away_threshold_secs as i64).saturating_mul(1_000);
     let tolerance_ms = (config.streak_break_tolerance_secs as i64).saturating_mul(1_000);
+    let idle_timeout_ms = (config.streak_idle_timeout_secs as i64).saturating_mul(1_000);
 
     let mut streaks: Vec<FocusStreak> = Vec::new();
     let mut streak_start: Option<String> = None;
@@ -881,58 +884,76 @@ fn query_streaks(conn: &Connection, config: &Config, time_filter: &str) -> Resul
     let mut streak_keys: i64 = 0;
     let mut pending_unproductive_ms: i64 = 0;
     let mut in_streak = false;
-    let mut prev_timestamp: Option<String> = None;
+    let mut last_input_ts: Option<chrono::DateTime<Local>> = None;
 
     for ev in &events {
         let cat = Category::from_str(&ev.category).unwrap_or(Category::Neutral);
         let is_productive = cat == Category::Productive;
+        let has_input = ev.keystrokes > 0 || ev.mouse_clicks > 0;
+        let cur_dt = parse_timestamp_local(&ev.timestamp);
 
-        let wall_gap_ms = prev_timestamp.as_deref()
-            .and_then(|prev| parse_timestamp_local(prev))
-            .and_then(|prev_dt| parse_timestamp_local(&ev.timestamp).map(|cur_dt| (cur_dt - prev_dt).num_milliseconds()))
-            .unwrap_or(0);
+        if in_streak {
+            let input_idle = match (last_input_ts, cur_dt) {
+                (Some(last), Some(cur)) => (cur - last).num_milliseconds() > idle_timeout_ms,
+                _ => false,
+            };
 
-        let hard_break = in_streak && wall_gap_ms > away_threshold_ms;
+            let wall_gap = match (last_input_ts.or(cur_dt), cur_dt) {
+                (Some(prev), Some(cur)) if last_input_ts.is_some() =>
+                    (cur - prev).num_milliseconds() > away_ms,
+                _ => false,
+            };
 
-        if hard_break {
-            flush_streak(&mut streaks, &mut streak_start, &mut streak_app_ms, streak_productive_ms, streak_keys);
-            in_streak = false;
-            streak_productive_ms = 0;
-            streak_keys = 0;
-            pending_unproductive_ms = 0;
+            if input_idle || wall_gap {
+                flush_streak(
+                    &mut streaks, &mut streak_start, &mut streak_app_ms,
+                    streak_productive_ms, streak_keys,
+                );
+                in_streak = false;
+                streak_productive_ms = 0;
+                streak_keys = 0;
+                pending_unproductive_ms = 0;
+            }
         }
 
         if is_productive {
             if in_streak {
                 if pending_unproductive_ms > tolerance_ms {
-                    flush_streak(&mut streaks, &mut streak_start, &mut streak_app_ms, streak_productive_ms, streak_keys);
+                    flush_streak(
+                        &mut streaks, &mut streak_start, &mut streak_app_ms,
+                        streak_productive_ms, streak_keys,
+                    );
                     in_streak = false;
                     streak_productive_ms = 0;
                     streak_keys = 0;
                     pending_unproductive_ms = 0;
                 } else {
                     pending_unproductive_ms = 0;
-                    streak_productive_ms = streak_productive_ms.saturating_add(ev.active_ms);
-                    streak_keys = streak_keys.saturating_add(ev.keystrokes);
-                    *streak_app_ms.entry(ev.app_id.clone()).or_insert(0) =
-                        streak_app_ms.get(&ev.app_id).copied().unwrap_or(0).saturating_add(ev.active_ms);
                 }
             }
 
-            if !in_streak {
+            if in_streak {
+                streak_productive_ms = streak_productive_ms.saturating_add(ev.active_ms);
+                streak_keys = streak_keys.saturating_add(ev.keystrokes);
+                let entry = streak_app_ms.entry(ev.app_id.clone()).or_insert(0);
+                *entry = entry.saturating_add(ev.active_ms);
+            } else {
                 in_streak = true;
                 streak_start = Some(ev.timestamp.clone());
                 streak_productive_ms = ev.active_ms;
                 streak_keys = ev.keystrokes;
                 pending_unproductive_ms = 0;
-                *streak_app_ms.entry(ev.app_id.clone()).or_insert(0) =
-                    streak_app_ms.get(&ev.app_id).copied().unwrap_or(0).saturating_add(ev.active_ms);
+                streak_app_ms.clear();
+                let entry = streak_app_ms.entry(ev.app_id.clone()).or_insert(0);
+                *entry = entry.saturating_add(ev.active_ms);
             }
         } else if in_streak {
             pending_unproductive_ms = pending_unproductive_ms.saturating_add(ev.active_ms);
         }
 
-        prev_timestamp = Some(ev.timestamp.clone());
+        if has_input {
+            last_input_ts = cur_dt;
+        }
     }
 
     if in_streak {
