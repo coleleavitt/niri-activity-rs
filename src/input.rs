@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -275,10 +275,12 @@ pub fn start_idle_monitor(
     if jiggler_config.enabled {
         let jiggler_process_flag = Arc::clone(&stats.jiggler_process);
         let blacklist = jiggler_config.process_blacklist.clone();
-        thread::spawn(move || loop {
-            let found = scan_jiggler_processes(&blacklist);
-            jiggler_process_flag.store(found, Ordering::Relaxed);
-            thread::sleep(Duration::from_secs(30));
+        thread::spawn(move || {
+            loop {
+                let found = scan_jiggler_processes(&blacklist);
+                jiggler_process_flag.store(found, Ordering::Relaxed);
+                thread::sleep(Duration::from_secs(30));
+            }
         });
     }
 

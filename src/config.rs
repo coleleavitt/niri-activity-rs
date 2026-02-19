@@ -212,11 +212,7 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
         }
     }
 
-    if total_ms > 0 {
-        Some(total_ms)
-    } else {
-        None
-    }
+    if total_ms > 0 { Some(total_ms) } else { None }
 }
 
 #[derive(Debug, Deserialize)]

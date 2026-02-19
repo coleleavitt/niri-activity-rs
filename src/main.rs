@@ -10,8 +10,8 @@ mod theme;
 mod tui;
 mod watcher;
 
-use clap::{Parser, Subcommand};
 use chrono::NaiveDate;
+use clap::{Parser, Subcommand};
 
 use crate::error::Error;
 
@@ -37,9 +37,11 @@ fn parse_time_range(
         return Ok(report::TimeRange::DateRange(start, end));
     }
     if from.is_some() || to.is_some() {
-        return Err(Error::NiriError("--from and --to must be used together".into()));
+        return Err(Error::NiriError(
+            "--from and --to must be used together".into(),
+        ));
     }
-    
+
     Ok(if today {
         report::TimeRange::Days(0)
     } else if yesterday {
@@ -242,113 +244,170 @@ fn main() {
     let result: Result<(), Error> = match cli.command {
         None => tui::run_tui_range(report::TimeRange::Days(7)),
         Some(Commands::Tui {
-            days, aligned, today, yesterday, last_week, this_week,
-            last_month, this_month, week, month, from, to,
-        }) => {
-            parse_time_range(days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week, month, from, to)
-                .and_then(tui::run_tui_range)
-        }
+            days,
+            aligned,
+            today,
+            yesterday,
+            last_week,
+            this_week,
+            last_month,
+            this_month,
+            week,
+            month,
+            from,
+            to,
+        }) => parse_time_range(
+            days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week,
+            month, from, to,
+        )
+        .and_then(tui::run_tui_range),
         Some(Commands::Watch { quiet }) => watcher::watch(quiet),
         Some(Commands::Today) => report::App::open().and_then(|app| report::show_today(&app)),
         Some(Commands::Metrics {
-            days, aligned, today, yesterday, last_week, this_week,
-            last_month, this_month, week, month, from, to,
-        }) => {
-            parse_time_range(days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week, month, from, to)
-                .and_then(|range| report::App::open().and_then(|app| report::show_metrics_range(&app, range)))
-        }
+            days,
+            aligned,
+            today,
+            yesterday,
+            last_week,
+            this_week,
+            last_month,
+            this_month,
+            week,
+            month,
+            from,
+            to,
+        }) => parse_time_range(
+            days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week,
+            month, from, to,
+        )
+        .and_then(|range| {
+            report::App::open().and_then(|app| report::show_metrics_range(&app, range))
+        }),
         Some(Commands::Timeline { days, bucket }) => {
             report::App::open().and_then(|app| report::show_timeline(&app, days, bucket))
         }
         Some(Commands::Report {
-            days, aligned, today, yesterday, last_week, this_week,
-            last_month, this_month, week, month, from, to, compare,
-        }) => {
-            parse_time_range(days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week, month, from, to)
-                .and_then(|range| report::App::open().and_then(|app| {
-                    if compare {
-                        report::show_comparison(&app, range)
-                    } else {
-                        report::generate_report_range(&app, range)
-                    }
-                }))
-        }
-        Some(Commands::Export {
-            days, aligned, today, yesterday, last_week, this_week,
-            last_month, this_month, week, month, from, to, format, output,
-        }) => {
-            parse_time_range(days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week, month, from, to)
-                .and_then(|range| report::App::open().and_then(|app| match format.as_str() {
-                    "xlsx" | "excel" => {
-                        let path = output.unwrap_or_else(|| "activity_report.xlsx".to_string());
-                        report::export_xlsx_range(&app, range, &path)
-                    }
-                    "json" => report::export_json_range(&app, range),
-                    "heatmap" => report::export_heatmap_range(&app, range),
-                    "cron" | "summary" => report::export_cron_summary(&app, range),
-                    _ => report::export_csv_range(&app, range),
-                }))
-        }
-        Some(Commands::Init) => config::init_config(),
-        Some(Commands::FixFalseActive { dry_run }) => {
-            (|| -> Result<(), Error> {
-                let cfg = config::load_config()?;
-                let data_dir = config::get_data_dir()?;
-                let db_path = data_dir.join("activity.db");
-                let conn = rusqlite::Connection::open(&db_path)?;
-                let input_active_ms = cfg.input_active_secs.saturating_mul(1000);
-
-                if dry_run {
-                    let count: i64 = conn.query_row(
-                        "SELECT COUNT(*) FROM events
-                          WHERE keystrokes = 0
-                            AND mouse_clicks = 0
-                            AND active_ms > ?1",
-                        rusqlite::params![input_active_ms as i64],
-                        |row| row.get(0),
-                    )?;
-                    let total_ms: i64 = conn.query_row(
-                        "SELECT COALESCE(SUM(active_ms), 0) FROM events
-                          WHERE keystrokes = 0
-                            AND mouse_clicks = 0
-                            AND active_ms > ?1",
-                        rusqlite::params![input_active_ms as i64],
-                        |row| row.get(0),
-                    )?;
-                    let hours = total_ms / 3_600_000;
-                    let mins = (total_ms % 3_600_000) / 60_000;
-                    println!(
-                        "[dry-run] Would reclassify {} events ({} false-active → passive, {}h {}m total)",
-                        count, count, hours, mins
-                    );
+            days,
+            aligned,
+            today,
+            yesterday,
+            last_week,
+            this_week,
+            last_month,
+            this_month,
+            week,
+            month,
+            from,
+            to,
+            compare,
+        }) => parse_time_range(
+            days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week,
+            month, from, to,
+        )
+        .and_then(|range| {
+            report::App::open().and_then(|app| {
+                if compare {
+                    report::show_comparison(&app, range)
                 } else {
-                    let fixed = db::fix_false_active(&conn, input_active_ms)?;
-                    println!("Fixed {} false-active events (active_ms → passive_ms)", fixed);
+                    report::generate_report_range(&app, range)
                 }
-                Ok(())
-            })()
-        }
-        Some(Commands::Email { weekly, monthly, test, secure }) => {
-            (|| -> Result<(), Error> {
-                if secure {
-                    let config_path = config::get_config_path()?;
-                    email::secure_config_permissions(&config_path)?;
+            })
+        }),
+        Some(Commands::Export {
+            days,
+            aligned,
+            today,
+            yesterday,
+            last_week,
+            this_week,
+            last_month,
+            this_month,
+            week,
+            month,
+            from,
+            to,
+            format,
+            output,
+        }) => parse_time_range(
+            days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week,
+            month, from, to,
+        )
+        .and_then(|range| {
+            report::App::open().and_then(|app| match format.as_str() {
+                "xlsx" | "excel" => {
+                    let path = output.unwrap_or_else(|| "activity_report.xlsx".to_string());
+                    report::export_xlsx_range(&app, range, &path)
                 }
-                if test {
-                    let cfg = config::load_config()?;
-                    email::test_email_config(&cfg)?;
-                } else if weekly {
-                    report::App::open().and_then(|app| email::send_weekly_report(&app))?;
-                } else if monthly {
-                    report::App::open().and_then(|app| email::send_monthly_report(&app))?;
-                } else if !secure {
-                    return Err(Error::NiriError(
-                        "Specify --weekly, --monthly, --test, or --secure".into(),
-                    ));
-                }
-                Ok(())
-            })()
-        }
+                "json" => report::export_json_range(&app, range),
+                "heatmap" => report::export_heatmap_range(&app, range),
+                "cron" | "summary" => report::export_cron_summary(&app, range),
+                _ => report::export_csv_range(&app, range),
+            })
+        }),
+        Some(Commands::Init) => config::init_config(),
+        Some(Commands::FixFalseActive { dry_run }) => (|| -> Result<(), Error> {
+            let cfg = config::load_config()?;
+            let data_dir = config::get_data_dir()?;
+            let db_path = data_dir.join("activity.db");
+            let conn = rusqlite::Connection::open(&db_path)?;
+            let input_active_ms = cfg.input_active_secs.saturating_mul(1000);
+
+            if dry_run {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM events
+                          WHERE keystrokes = 0
+                            AND mouse_clicks = 0
+                            AND active_ms > ?1",
+                    rusqlite::params![input_active_ms as i64],
+                    |row| row.get(0),
+                )?;
+                let total_ms: i64 = conn.query_row(
+                    "SELECT COALESCE(SUM(active_ms), 0) FROM events
+                          WHERE keystrokes = 0
+                            AND mouse_clicks = 0
+                            AND active_ms > ?1",
+                    rusqlite::params![input_active_ms as i64],
+                    |row| row.get(0),
+                )?;
+                let hours = total_ms / 3_600_000;
+                let mins = (total_ms % 3_600_000) / 60_000;
+                println!(
+                    "[dry-run] Would reclassify {} events ({} false-active → passive, {}h {}m total)",
+                    count, count, hours, mins
+                );
+            } else {
+                let fixed = db::fix_false_active(&conn, input_active_ms)?;
+                println!(
+                    "Fixed {} false-active events (active_ms → passive_ms)",
+                    fixed
+                );
+            }
+            Ok(())
+        })(),
+        Some(Commands::Email {
+            weekly,
+            monthly,
+            test,
+            secure,
+        }) => (|| -> Result<(), Error> {
+            if secure {
+                let config_path = config::get_config_path()?;
+                email::secure_config_permissions(&config_path)?;
+            }
+            if test {
+                let cfg = config::load_config()?;
+                email::test_email_config(&cfg)?;
+            } else if weekly {
+                report::App::open().and_then(|app| email::send_weekly_report(&app))?;
+            } else if monthly {
+                report::App::open().and_then(|app| email::send_monthly_report(&app))?;
+            } else if !secure {
+                return Err(Error::NiriError(
+                    "Specify --weekly, --monthly, --test, or --secure".into(),
+                ));
+            }
+            Ok(())
+        })(),
     };
 
     if let Err(e) = result {

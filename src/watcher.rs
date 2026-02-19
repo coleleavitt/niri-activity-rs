@@ -129,7 +129,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     println!("Config: {}", get_config_path()?.display());
     println!("Idle threshold: {}s", config.idle_threshold_secs);
     println!("Away threshold: {}s", config.away_threshold_secs);
-    println!("Mouse idle threshold: {} raw units", config.mouse_idle_threshold);
+    println!(
+        "Mouse idle threshold: {} raw units",
+        config.mouse_idle_threshold
+    );
     println!("Input active threshold: {}s", config.input_active_secs);
     println!("Categories configured: {}", config.categories.len());
 
@@ -149,7 +152,11 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     });
 
     let monitor_start = Instant::now();
-    let input_stats = start_idle_monitor(monitor_start, config.jiggler.clone(), config.mouse_idle_threshold);
+    let input_stats = start_idle_monitor(
+        monitor_start,
+        config.jiggler.clone(),
+        config.mouse_idle_threshold,
+    );
     let logind = start_logind_monitor()?;
     let idle_threshold_ms = config.idle_threshold_secs.saturating_mul(1000);
     let deep_idle_threshold_ms = config.deep_idle_secs.saturating_mul(1000);
@@ -243,9 +250,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         // means the system was suspended (CLOCK_MONOTONIC pauses during suspend).
         let wall_now = Utc::now();
         let wall_elapsed_secs = (wall_now - last_wall_time).num_seconds();
-        let mono_elapsed_secs = now_instant
-            .duration_since(last_loop_instant)
-            .as_secs() as i64;
+        let mono_elapsed_secs = now_instant.duration_since(last_loop_instant).as_secs() as i64;
         let time_jump_secs = wall_elapsed_secs.saturating_sub(mono_elapsed_secs);
 
         if time_jump_secs > SUSPEND_JUMP_THRESHOLD_SECS {
@@ -258,9 +263,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     time_jump_secs,
                 );
             }
-            if (accumulated_active_ms > 0
-                || accumulated_passive_ms > 0
-                || accumulated_idle_ms > 0)
+            if (accumulated_active_ms > 0 || accumulated_passive_ms > 0 || accumulated_idle_ms > 0)
                 && let Some(info) = focused_id.and_then(|id| windows.get(&id))
             {
                 let input = input_stats.snapshot();
@@ -310,9 +313,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     "[SUSPEND]".blue().bold(),
                 );
             }
-            if (accumulated_active_ms > 0
-                || accumulated_passive_ms > 0
-                || accumulated_idle_ms > 0)
+            if (accumulated_active_ms > 0 || accumulated_passive_ms > 0 || accumulated_idle_ms > 0)
                 && let Some(info) = focused_id.and_then(|id| windows.get(&id))
             {
                 let input = input_stats.snapshot();

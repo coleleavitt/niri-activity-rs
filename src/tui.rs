@@ -9,8 +9,8 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::error::Error;
 use crate::fmt::{fmt_distance, fmt_duration, fmt_duration_compact, pct};
 use crate::report::{
-    App, MetricsData, ReportData, TimeRange, TimelineData, TodayData, 
-    query_metrics_range, query_report_range, query_timeline, query_today,
+    App, MetricsData, ReportData, TimeRange, TimelineData, TodayData, query_metrics_range,
+    query_report_range, query_timeline, query_today,
 };
 use crate::theme::{THEME, category_style};
 
@@ -532,8 +532,7 @@ fn render_apps(app: &TuiApp, area: Rect, frame: &mut Frame) {
                 }
             }
             let total = (prod_ms + neutral_ms + unprod_ms).max(1);
-            let prod_chars =
-                (prod_ms as f64 / total as f64 * bar_len as f64).round() as usize;
+            let prod_chars = (prod_ms as f64 / total as f64 * bar_len as f64).round() as usize;
             let neutral_chars =
                 (neutral_ms as f64 / total as f64 * bar_len as f64).round() as usize;
             let unprod_chars = bar_len.saturating_sub(prod_chars + neutral_chars);

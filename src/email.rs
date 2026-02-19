@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use chrono::Local;
-use lettre::message::{header::ContentType, Attachment, MultiPart, SinglePart};
+use lettre::message::{Attachment, MultiPart, SinglePart, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 
