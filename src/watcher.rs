@@ -462,8 +462,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 accumulated_passive_ms = 0;
                 accumulated_idle_ms = 0;
                 last_flush = now_instant;
-                input_baseline_ms = input_stats.last_activity_ms();
-                session_start_mono_ms = now_ms;
+                // DO NOT reset input_baseline_ms or session_start_mono_ms here.
+                // The idle timer must keep measuring from the last real input,
+                // otherwise idle_duration_ms resets to ~0 and we immediately exit Away
+                // on the next loop iteration — causing a 30-min Away→Active cycle.
             }
 
             if current_state == ActivityState::Away && new_state != ActivityState::Away {
@@ -500,7 +502,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             }
             last_idle_check = now_instant;
 
-            if current_state != ActivityState::Away
+            if current_state != ActivityState::Away && current_state != ActivityState::Idle
                 && now_instant.duration_since(last_flush) >= FLUSH_INTERVAL
             {
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
