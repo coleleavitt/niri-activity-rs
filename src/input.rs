@@ -411,15 +411,10 @@ pub fn start_idle_monitor(
                                         .saturating_mul(mouse_idle_threshold as i64);
                                     let above_threshold = net_sq >= threshold_sq;
 
-                                    if window_expired {
+                                    if window_expired || above_threshold {
                                         if above_threshold {
                                             last_activity.store(now, Ordering::Relaxed);
                                         }
-                                        motion_dx = 0;
-                                        motion_dy = 0;
-                                        motion_window_start_ms = now;
-                                    } else if above_threshold {
-                                        last_activity.store(now, Ordering::Relaxed);
                                         motion_dx = 0;
                                         motion_dy = 0;
                                         motion_window_start_ms = now;

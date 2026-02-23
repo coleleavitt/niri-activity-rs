@@ -18,7 +18,7 @@ signal-hook = "0.4.3"
 backoff = "0.4"
 inotify = { version = "0.11", default-features = false }
 owo-colors = "4.2.3"
-ratatui = "0.30.0"
+ratatui = { version = "0.30.0", features = ["crossterm"] }
 crossterm = "0.28"
 regex = "1.12.3"
 logind-zbus = "5.3"

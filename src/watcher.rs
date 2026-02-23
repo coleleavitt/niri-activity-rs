@@ -382,15 +382,24 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         let time_jump_secs = wall_elapsed_secs.saturating_sub(mono_elapsed_secs);
 
 
-        if time_jump_secs > SUSPEND_JUMP_THRESHOLD_SECS {
+        // Suspend/resume detection: wall-clock jump OR D-Bus PrepareForSleep(false).
+        // `take_suspend_resumed()` has a side-effect (clears the flag), so call it
+        // every iteration regardless of whether the wall-clock path fires.
+        let wall_clock_resume = time_jump_secs > SUSPEND_JUMP_THRESHOLD_SECS;
+        let dbus_resume_signalled = logind.take_suspend_resumed();
+        let dbus_resume = dbus_resume_signalled && !wall_clock_resume;
+
+        if wall_clock_resume || dbus_resume {
             if !quiet {
-                eprintln!(
-                    "{} System resume detected ({}s wall clock, {}s monotonic, {}s jump)",
-                    "[SUSPEND]".blue().bold(),
-                    wall_elapsed_secs,
-                    mono_elapsed_secs,
-                    time_jump_secs,
-                );
+                let label = if wall_clock_resume {
+                    format!(
+                        "System resume detected ({}s wall clock, {}s monotonic, {}s jump)",
+                        wall_elapsed_secs, mono_elapsed_secs, time_jump_secs,
+                    )
+                } else {
+                    "System resume detected via D-Bus signal".to_string()
+                };
+                eprintln!("{} {}", "[SUSPEND]".blue().bold(), label);
             }
             let has_data = accumulated_active_ms > 0
                 || accumulated_passive_ms > 0
@@ -425,54 +434,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             last_idle_check = now_instant;
             last_flush = now_instant;
         }
+
         last_wall_time = wall_now;
         last_loop_instant = now_instant;
-
-
-        // D-Bus PrepareForSleep(false) complements wall-clock detection.
-        // If the wall-clock jump already handled the resume above (time_jump_secs >
-        // threshold), this flag was set too — but no harm in clearing it. If the
-        // wall-clock method missed it (very short suspend), this catches it.
-        if logind.take_suspend_resumed() && time_jump_secs <= SUSPEND_JUMP_THRESHOLD_SECS {
-            if !quiet {
-                eprintln!(
-                    "{} System resume detected via D-Bus signal",
-                    "[SUSPEND]".blue().bold(),
-                );
-            }
-            let has_data = accumulated_active_ms > 0
-                || accumulated_passive_ms > 0
-                || accumulated_idle_ms > 0;
-            let info = if has_data {
-                focused_id.and_then(|id| windows.get(&id))
-            } else {
-                None
-            };
-            let input = input_stats.snapshot();
-            let jiggler = input_stats.jiggler_detected();
-            flush_session(
-                &flush_ctx,
-                info,
-                &mut SessionAccum {
-                    focus_start: &mut focus_start,
-                    active_ms: &mut accumulated_active_ms,
-                    passive_ms: &mut accumulated_passive_ms,
-                    idle_ms: &mut accumulated_idle_ms,
-                    input_baseline_ms: &mut input_baseline_ms,
-                    session_start_mono_ms: &mut session_start_mono_ms,
-                },
-                &input,
-                jiggler,
-                FlushReset::Full {
-                    new_focus_start: Utc::now(),
-                    new_baseline_ms: input_stats.last_activity_ms(),
-                    new_session_mono_ms: millis_u64(monitor_start.elapsed()),
-                },
-            )?;
-            current_state = ActivityState::Active;
-            last_idle_check = now_instant;
-            last_flush = now_instant;
-        }
 
         let locked_now = logind.is_locked();
 
@@ -497,6 +461,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     FlushReset::NoReset,
                 )?;
             }
+            accumulated_active_ms = 0;
+            accumulated_passive_ms = 0;
+            accumulated_idle_ms = 0;
             is_locked = true;
             current_state = ActivityState::Locked;
             if !quiet {

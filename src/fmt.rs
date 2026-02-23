@@ -55,8 +55,10 @@ pub fn pct(part: i64, total: i64) -> String {
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
+    } else if max < 3 {
+        s.chars().take(max).collect()
     } else {
-        let end: String = s.chars().take(max.saturating_sub(3)).collect();
+        let end: String = s.chars().take(max - 3).collect();
         format!("{}...", end)
     }
 }

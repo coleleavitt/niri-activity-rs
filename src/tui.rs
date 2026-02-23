@@ -117,18 +117,18 @@ fn run_loop(app: &mut TuiApp, mut terminal: DefaultTerminal) -> Result<(), Error
     loop {
         terminal
             .draw(|frame| render(app, frame))
-            .map_err(|e| Error::NiriError(format!("draw error: {}", e)))?;
-
+            .map_err(|e| Error::Io(e))?;
         if app.quit {
             return Ok(());
         }
-
         let timeout = Duration::from_millis(250);
-        if event::poll(timeout)
-            .map_err(|e| Error::NiriError(format!("poll error: {}", e)))?
-            && let Ok(crossterm::event::Event::Key(key)) = event::read()
+        if event::poll(timeout)?
         {
-            handle_key(app, key);
+            match event::read() {
+                Ok(crossterm::event::Event::Key(key)) => handle_key(app, key),
+                Ok(_) => {}
+                Err(e) => return Err(Error::Io(e)),
+            }
         }
     }
 }

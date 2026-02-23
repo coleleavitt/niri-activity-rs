@@ -164,11 +164,8 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
             "BEGIN;
              ALTER TABLE events ADD COLUMN passive_ms INTEGER NOT NULL DEFAULT 0;
              ALTER TABLE events ADD COLUMN jiggler_detected INTEGER NOT NULL DEFAULT 0;
+             INSERT INTO migrations (name, applied_at) VALUES ('004_add_passive_and_jiggler', datetime('now'));
              COMMIT;",
-        )?;
-        conn.execute(
-            "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
-            params!["004_add_passive_and_jiggler", Utc::now().to_rfc3339()],
         )?;
         eprintln!("Migration 004: added passive_ms and jiggler_detected columns");
     }

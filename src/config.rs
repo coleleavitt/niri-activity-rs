@@ -447,6 +447,9 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     if !pattern.contains('*') {
         return pattern == value;
     }
+    if pattern == "*" {
+        return true;
+    }
     match (pattern.starts_with('*'), pattern.ends_with('*')) {
         (true, true) => {
             let inner = &pattern[1..pattern.len() - 1];

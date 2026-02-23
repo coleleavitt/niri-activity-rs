@@ -417,7 +417,8 @@ pub fn query_today(app: &App) -> Result<TodayData, Error> {
                 row.get::<_, i64>(2)?,
             ))
         })?
-        .filter_map(|r| r.ok())
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .map(|(app_id, category_raw, total_ms)| TodayRow {
             app_id,
             category: Category::from_str(&category_raw).unwrap_or(Category::Neutral),
@@ -483,7 +484,7 @@ pub fn query_metrics_range(app: &App, range: TimeRange) -> Result<MetricsData, E
     let mut stmt = app.conn.prepare(
         "SELECT category, SUM(active_ms) as active, COALESCE(SUM(passive_ms),0) as passive, SUM(idle_ms) as idle
          FROM events
-         WHERE timestamp >= ?1 AND timestamp <= ?2
+         WHERE timestamp >= ?1 AND timestamp < ?2
          GROUP BY category",
     )?;
     let mut m = MetricsData {
@@ -589,7 +590,9 @@ pub fn show_metrics_range(app: &App, range: TimeRange) -> Result<(), Error> {
 }
 
 pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<TimelineData, Error> {
-    assert!(bucket_min > 0, "bucket size must be positive");
+    if bucket_min == 0 {
+        return Err(Error::NiriError("bucket size must be positive".into()));
+    }
     let date = Local::now().date_naive() - chrono::Duration::days(days_back as i64);
     let day_start_utc = local_day_start_utc(date)?;
     let day_end_utc = local_day_end_utc(date)?;
@@ -623,8 +626,7 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
                 keystrokes: row.get(6)?,
             })
         })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     struct BucketAcc {
         productive_ms: i64,
@@ -852,7 +854,7 @@ fn query_streaks(
     let mut stmt = conn.prepare(
         "SELECT timestamp, app_id, category, active_ms, keystrokes, mouse_clicks
          FROM events
-         WHERE timestamp >= ?1 AND timestamp <= ?2
+         WHERE timestamp >= ?1 AND timestamp < ?2
          ORDER BY timestamp",
     )?;
 
@@ -876,8 +878,7 @@ fn query_streaks(
                 mouse_clicks: row.get(5)?,
             })
         })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let away_ms = (config.away_threshold_secs as i64).saturating_mul(1_000);
     let tolerance_ms = (config.streak_break_tolerance_secs as i64).saturating_mul(1_000);
@@ -1011,7 +1012,7 @@ fn query_gaps(conn: &Connection, since_utc: &str, until_utc: &str) -> Result<Awa
                 timestamp,
                 LAG(timestamp) OVER (ORDER BY timestamp) as prev_ts
             FROM events
-            WHERE timestamp >= ?1 AND timestamp <= ?2
+            WHERE timestamp >= ?1 AND timestamp < ?2
         ),
         gaps AS (
             SELECT 
@@ -1160,7 +1161,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
                 COALESCE(SUM(mouse_clicks),0), COALESCE(SUM(scroll_events),0),
                 COALESCE(SUM(mouse_distance),0), COUNT(*),
                 COALESCE(SUM(CASE WHEN jiggler_detected = 1 THEN 1 ELSE 0 END),0)
-         FROM events WHERE timestamp >= ?1 AND timestamp <= ?2",
+         FROM events WHERE timestamp >= ?1 AND timestamp < ?2",
         params![since_utc, until_utc],
         |row| {
             Ok((
@@ -1180,7 +1181,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
 
     let mut cat_stmt = app.conn.prepare(
         "SELECT category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(idle_ms)
-         FROM events WHERE timestamp >= ?1 AND timestamp <= ?2
+         FROM events WHERE timestamp >= ?1 AND timestamp < ?2
          GROUP BY category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC",
     )?;
 
@@ -1193,7 +1194,8 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
                 row.get::<_, i64>(3)?,
             ))
         })?
-        .filter_map(|r| r.ok())
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .map(
             |(cat_raw, cat_total, cat_active, cat_idle)| CategoryBreakdown {
                 category: Category::from_str(&cat_raw).unwrap_or(Category::Neutral),
@@ -1206,7 +1208,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
 
     let mut app_stmt = app.conn.prepare(
         "SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(keystrokes), SUM(mouse_clicks)
-         FROM events WHERE timestamp >= ?1 AND timestamp <= ?2
+         FROM events WHERE timestamp >= ?1 AND timestamp < ?2
          GROUP BY app_id, category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC",
     )?;
 
@@ -1221,7 +1223,8 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
                 row.get::<_, i64>(5)?,
             ))
         })?
-        .filter_map(|r| r.ok())
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .map(
             |(app_id, cat_raw, app_total, app_active, keys, clicks)| AppBreakdown {
                 app_id,
@@ -1238,7 +1241,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
 
     let mut raw_stmt = app.conn.prepare(
         "SELECT timestamp, active_ms, COALESCE(passive_ms,0), idle_ms, keystrokes
-         FROM events WHERE timestamp >= ?1 AND timestamp <= ?2",
+         FROM events WHERE timestamp >= ?1 AND timestamp < ?2",
     )?;
 
     struct RawRow {
@@ -1259,8 +1262,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
                 keystrokes: row.get(4)?,
             })
         })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut daily_map: std::collections::BTreeMap<String, (i64, i64, i64, i64)> =
         std::collections::BTreeMap::new();
@@ -2288,7 +2290,7 @@ pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
 
     let mut stmt = app.conn.prepare(
         "SELECT timestamp, category, active_ms + COALESCE(passive_ms,0) + idle_ms as total_ms, keystrokes
-         FROM events WHERE timestamp >= ?1 AND timestamp <= ?2",
+         FROM events WHERE timestamp >= ?1 AND timestamp < ?2",
     )?;
 
     let mut heatmap: std::collections::BTreeMap<(String, u32), HeatmapCell> =
