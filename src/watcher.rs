@@ -98,7 +98,6 @@ impl From<&Window> for WindowInfo {
     }
 }
 
-
 /// Immutable context for flush operations, constructed once per watch session.
 struct FlushContext<'a> {
     conn: &'a Connection,
@@ -211,8 +210,6 @@ fn flush_session(
 
     Ok(result)
 }
-
-
 
 pub fn connect_to_niri() -> Result<Socket, Error> {
     let backoff = ExponentialBackoff {
@@ -338,7 +335,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     println!("Press Ctrl+C to stop gracefully\n");
 
     loop {
-
         if shutdown.load(Ordering::SeqCst) {
             eprintln!("\nShutdown signal received, flushing current session...");
             if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
@@ -381,7 +377,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 .unwrap_or(i64::MAX);
         let time_jump_secs = wall_elapsed_secs.saturating_sub(mono_elapsed_secs);
 
-
         // Suspend/resume detection: wall-clock jump OR D-Bus PrepareForSleep(false).
         // `take_suspend_resumed()` has a side-effect (clears the flag), so call it
         // every iteration regardless of whether the wall-clock path fires.
@@ -401,9 +396,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 };
                 eprintln!("{} {}", "[SUSPEND]".blue().bold(), label);
             }
-            let has_data = accumulated_active_ms > 0
-                || accumulated_passive_ms > 0
-                || accumulated_idle_ms > 0;
+            let has_data =
+                accumulated_active_ms > 0 || accumulated_passive_ms > 0 || accumulated_idle_ms > 0;
             let info = if has_data {
                 focused_id.and_then(|id| windows.get(&id))
             } else {
@@ -439,7 +433,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         last_loop_instant = now_instant;
 
         let locked_now = logind.is_locked();
-
 
         if locked_now && !is_locked {
             if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
@@ -512,7 +505,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 ActivityState::Active
             };
 
-
             if new_state == ActivityState::Away && current_state != ActivityState::Away {
                 let input = input_stats.snapshot();
                 let jiggler = input_stats.jiggler_detected();
@@ -583,8 +575,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             }
             last_idle_check = now_instant;
 
-
-            if current_state != ActivityState::Away && current_state != ActivityState::Idle
+            if current_state != ActivityState::Away
+                && current_state != ActivityState::Idle
                 && now_instant.duration_since(last_flush) >= FLUSH_INTERVAL
             {
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
@@ -608,8 +600,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         },
                     )?;
                     if !quiet {
-                        let total =
-                            flushed.active_ms + flushed.passive_ms + flushed.idle_ms;
+                        let total = flushed.active_ms + flushed.passive_ms + flushed.idle_ms;
                         eprintln!(
                             "{} {} ({})",
                             "[flush]".dimmed(),
@@ -674,7 +665,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 windows.remove(&id);
             }
 
-
             Event::WindowFocusChanged { id: new_focus_id } => {
                 if is_locked {
                     focused_id = new_focus_id;
@@ -692,7 +682,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 let jiggler = input_stats.jiggler_detected();
 
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
-
                     let flushed = flush_session(
                         &flush_ctx,
                         Some(info),
@@ -709,8 +698,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         FlushReset::NoReset,
                     )?;
 
-                    let total =
-                        flushed.active_ms + flushed.passive_ms + flushed.idle_ms;
+                    let total = flushed.active_ms + flushed.passive_ms + flushed.idle_ms;
 
                     let category = config.classify(&info.app_id, &info.title);
                     if category == Category::Neutral
@@ -726,8 +714,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
 
                     if !quiet && total >= 500 {
                         let idle_pct = if total > 0 {
-                            ((flushed.passive_ms + flushed.idle_ms) as f64 / total as f64
-                                * 100.0) as u32
+                            ((flushed.passive_ms + flushed.idle_ms) as f64 / total as f64 * 100.0)
+                                as u32
                         } else {
                             0
                         };

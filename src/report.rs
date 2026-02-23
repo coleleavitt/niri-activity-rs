@@ -850,7 +850,7 @@ fn query_streaks(
     config: &Config,
     since_utc: &str,
     until_utc: &str,
-    ) -> Result<StreakSummary, Error> {
+) -> Result<StreakSummary, Error> {
     let mut stmt = conn.prepare(
         "SELECT timestamp, app_id, category, active_ms, keystrokes, mouse_clicks
          FROM events

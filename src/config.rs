@@ -467,7 +467,9 @@ fn glob_match(pattern: &str, value: &str) -> bool {
             if let Some(pos) = pattern.find('*') {
                 let prefix = &pattern[..pos];
                 let suffix = &pattern[pos + 1..];
-                prefix.len() + suffix.len() <= value.len() && value.starts_with(prefix) && value.ends_with(suffix)
+                prefix.len() + suffix.len() <= value.len()
+                    && value.starts_with(prefix)
+                    && value.ends_with(suffix)
             } else {
                 pattern == value
             }
@@ -573,7 +575,11 @@ impl Schedule {
             .collect()
     }
 
-    fn is_workday_with_holidays(&self, date: chrono::NaiveDate, holiday_set: &std::collections::HashSet<chrono::NaiveDate>) -> bool {
+    fn is_workday_with_holidays(
+        &self,
+        date: chrono::NaiveDate,
+        holiday_set: &std::collections::HashSet<chrono::NaiveDate>,
+    ) -> bool {
         if holiday_set.contains(&date) {
             return false;
         }
@@ -607,6 +613,23 @@ pub fn get_config_path() -> Result<PathBuf, Error> {
 }
 
 pub fn load_config() -> Result<Config, Error> {
+    // Auto-load env file (KEY=VALUE lines) from config dir for SMTP credentials etc.
+    let env_path = get_config_path()?.with_file_name("env");
+    if env_path.exists() {
+        if let Ok(contents) = fs::read_to_string(&env_path) {
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, value)) = line.split_once('=') {
+                    // SAFETY: called at startup before any threads are spawned.
+                    unsafe { std::env::set_var(key.trim(), value.trim()) };
+                }
+            }
+        }
+    }
+
     let config_path = get_config_path()?;
     if config_path.exists() {
         let content = fs::read_to_string(&config_path)?;

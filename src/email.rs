@@ -241,7 +241,11 @@ pub fn test_email_config(config: &Config) -> Result<(), Error> {
 
     println!(
         "Test email sent successfully to {}",
-        email_config.to_addresses.first().map(|s| s.as_str()).unwrap_or("<none>")
+        email_config
+            .to_addresses
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("<none>")
     );
 
     Ok(())

@@ -186,11 +186,9 @@ fn main() {
         }
         Some(Commands::Watch { quiet }) => watcher::watch(quiet),
         Some(Commands::Today) => report::App::open().and_then(|app| report::show_today(&app)),
-        Some(Commands::Metrics { days, time }) => {
-            parse_time_range(days, &time).and_then(|range| {
-                report::App::open().and_then(|app| report::show_metrics_range(&app, range))
-            })
-        }
+        Some(Commands::Metrics { days, time }) => parse_time_range(days, &time).and_then(|range| {
+            report::App::open().and_then(|app| report::show_metrics_range(&app, range))
+        }),
         Some(Commands::Timeline { days, bucket }) => {
             report::App::open().and_then(|app| report::show_timeline(&app, days, bucket))
         }

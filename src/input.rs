@@ -434,9 +434,7 @@ pub fn start_idle_monitor(
                                     scroll_events.fetch_add(1, Ordering::Relaxed);
                                     last_activity.store(now, Ordering::Relaxed);
                                     last_mouse_event = Instant::now();
-                                } else if code == REL_WHEEL_HI_RES
-                                    || code == REL_HWHEEL_HI_RES
-                                {
+                                } else if code == REL_WHEEL_HI_RES || code == REL_HWHEEL_HI_RES {
                                     // Still update activity timestamp for idle detection,
                                     // but don't increment scroll_events counter.
                                     last_activity.store(now, Ordering::Relaxed);
