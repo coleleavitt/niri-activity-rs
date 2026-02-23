@@ -2,7 +2,7 @@ use ratatui::style::{Color, Modifier, Style};
 
 pub const PRODUCTIVE: Color = Color::Green;
 pub const UNPRODUCTIVE: Color = Color::Red;
-pub const NEUTRAL: Color = Color::Yellow;
+pub const NEUTRAL: Color = Color::Rgb(255, 200, 50);
 pub const ACCENT: Color = Color::Cyan;
 pub const MUTED: Color = Color::DarkGray;
 

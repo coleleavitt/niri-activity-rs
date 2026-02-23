@@ -64,8 +64,7 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
     let applied: Vec<String> = {
         let mut stmt = conn.prepare("SELECT name FROM migrations")?;
         stmt.query_map([], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?
     };
 
     if !applied.contains(&"001_fix_historical_categories".to_string()) {
@@ -99,8 +98,7 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
                     row.get::<_, String>(2)?,
                 ))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut updated = 0i64;
         for (id, app_id, title) in &rows {
@@ -135,8 +133,7 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
                     row.get::<_, String>(3)?,
                 ))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut updated = 0i64;
         for (id, app_id, title, old_category) in &rows {
@@ -164,8 +161,10 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
 
     if !applied.contains(&"004_add_passive_and_jiggler".to_string()) {
         conn.execute_batch(
-            "ALTER TABLE events ADD COLUMN passive_ms INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE events ADD COLUMN jiggler_detected INTEGER NOT NULL DEFAULT 0;",
+            "BEGIN;
+             ALTER TABLE events ADD COLUMN passive_ms INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE events ADD COLUMN jiggler_detected INTEGER NOT NULL DEFAULT 0;
+             COMMIT;",
         )?;
         conn.execute(
             "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
@@ -188,8 +187,7 @@ pub fn reclassify_all(conn: &Connection, config: &Config) -> Result<(), Error> {
                 row.get::<_, String>(3)?,
             ))
         })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut updated = 0i64;
     for (id, app_id, title, old_category) in &rows {

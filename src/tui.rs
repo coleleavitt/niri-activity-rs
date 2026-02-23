@@ -124,7 +124,8 @@ fn run_loop(app: &mut TuiApp, mut terminal: DefaultTerminal) -> Result<(), Error
         }
 
         let timeout = Duration::from_millis(250);
-        if event::poll(timeout).unwrap_or(false)
+        if event::poll(timeout)
+            .map_err(|e| Error::NiriError(format!("poll error: {}", e)))?
             && let Ok(crossterm::event::Event::Key(key)) = event::read()
         {
             handle_key(app, key);
@@ -163,7 +164,7 @@ fn render_title_bar(app: &TuiApp, area: Rect, frame: &mut Frame) {
     let title_span = Span::styled(" niri-activity-rs", THEME.title);
     frame.render_widget(title_span, title);
 
-    let tab_titles: Vec<String> = TABS.iter().map(|t| t.label().to_string()).collect();
+    let tab_titles: Vec<&str> = TABS.iter().map(|t| t.label()).collect();
     let tabs = Tabs::new(tab_titles)
         .style(THEME.tab_inactive)
         .highlight_style(THEME.tab_active)
@@ -411,7 +412,7 @@ fn render_timeline(app: &TuiApp, area: Rect, frame: &mut Frame) {
         .map(|b| {
             let total = b.productive_ms + b.neutral_ms + b.unproductive_ms;
             if total == 0 {
-                return Row::new(vec![Cell::from("")]);
+                return Row::new(vec![Cell::from(""); 6]);
             }
 
             let idle_total = b.idle_ms;

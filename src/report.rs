@@ -15,6 +15,9 @@ use crate::fmt::{
     fmt_duration_compact, fmt_hms, pct, section_header, truncate,
 };
 
+/// Sentinel value for unbounded upper time range in parameterized queries.
+const UNTIL_SENTINEL: &str = "9999-12-31T23:59:59+00:00";
+
 pub struct App {
     pub config: Config,
     pub conn: Connection,
@@ -475,24 +478,14 @@ pub fn query_metrics(app: &App, days: u32) -> Result<MetricsData, Error> {
 
 pub fn query_metrics_range(app: &App, range: TimeRange) -> Result<MetricsData, Error> {
     let bounds = range.resolve()?;
-    let time_filter = if let Some(ref until) = bounds.until_utc {
-        format!(
-            "timestamp >= '{}' AND timestamp <= '{}'",
-            bounds.since_utc, until
-        )
-    } else {
-        format!("timestamp >= '{}'", bounds.since_utc)
-    };
+    let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
     let days = (bounds.end_date - bounds.start_date).num_days() as u32 + 1;
-
-    let mut stmt = app.conn.prepare(&format!(
+    let mut stmt = app.conn.prepare(
         "SELECT category, SUM(active_ms) as active, COALESCE(SUM(passive_ms),0) as passive, SUM(idle_ms) as idle
-         FROM events 
-         WHERE {} 
+         FROM events
+         WHERE timestamp >= ?1 AND timestamp <= ?2
          GROUP BY category",
-        time_filter
-    ))?;
-
+    )?;
     let mut m = MetricsData {
         days,
         total_ms: 0,
@@ -504,7 +497,7 @@ pub fn query_metrics_range(app: &App, range: TimeRange) -> Result<MetricsData, E
         productive_idle_ms: 0,
     };
 
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![&bounds.since_utc, until_utc], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
@@ -768,34 +761,34 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
 }
 
 fn group_apps(flat: Vec<AppBreakdown>, limit: usize) -> Vec<AppGroup> {
-    let mut map: Vec<(String, AppGroup)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut groups: Vec<AppGroup> = Vec::new();
 
     for entry in flat {
-        if let Some((_, group)) = map.iter_mut().find(|(id, _)| *id == entry.app_id) {
+        if let Some(&idx) = index.get(&entry.app_id) {
+            let group = &mut groups[idx];
             group.total_ms = group.total_ms.saturating_add(entry.total_ms);
             group.active_ms = group.active_ms.saturating_add(entry.active_ms);
             group.keys = group.keys.saturating_add(entry.keys);
             group.clicks = group.clicks.saturating_add(entry.clicks);
             group.children.push(entry);
         } else {
-            let id = entry.app_id.clone();
-            map.push((
-                id,
-                AppGroup {
-                    app_id: entry.app_id.clone(),
-                    total_ms: entry.total_ms,
-                    active_ms: entry.active_ms,
-                    keys: entry.keys,
-                    clicks: entry.clicks,
-                    children: vec![entry],
-                },
-            ));
+            let idx = groups.len();
+            index.insert(entry.app_id.clone(), idx);
+            groups.push(AppGroup {
+                app_id: entry.app_id.clone(),
+                total_ms: entry.total_ms,
+                active_ms: entry.active_ms,
+                keys: entry.keys,
+                clicks: entry.clicks,
+                children: vec![entry],
+            });
         }
     }
 
-    map.sort_by_key(|(_, g)| std::cmp::Reverse(g.total_ms));
-    map.truncate(limit);
-    map.into_iter().map(|(_, g)| g).collect()
+    groups.sort_by_key(|g| std::cmp::Reverse(g.total_ms));
+    groups.truncate(limit);
+    groups
 }
 
 fn classify_gap(start_hour: u32, gap_hours: f64) -> Option<GapType> {
@@ -853,15 +846,15 @@ fn flush_streak(
 fn query_streaks(
     conn: &Connection,
     config: &Config,
-    time_filter: &str,
-) -> Result<StreakSummary, Error> {
-    let mut stmt = conn.prepare(&format!(
+    since_utc: &str,
+    until_utc: &str,
+    ) -> Result<StreakSummary, Error> {
+    let mut stmt = conn.prepare(
         "SELECT timestamp, app_id, category, active_ms, keystrokes, mouse_clicks
          FROM events
-         WHERE {}
+         WHERE timestamp >= ?1 AND timestamp <= ?2
          ORDER BY timestamp",
-        time_filter
-    ))?;
+    )?;
 
     struct EventRow {
         timestamp: String,
@@ -873,7 +866,7 @@ fn query_streaks(
     }
 
     let events: Vec<EventRow> = stmt
-        .query_map([], |row| {
+        .query_map(params![since_utc, until_utc], |row| {
             Ok(EventRow {
                 timestamp: row.get(0)?,
                 app_id: row.get(1)?,
@@ -1011,14 +1004,14 @@ fn query_streaks(
     })
 }
 
-fn query_gaps(conn: &Connection, since_utc: &str) -> Result<AwayData, Error> {
+fn query_gaps(conn: &Connection, since_utc: &str, until_utc: &str) -> Result<AwayData, Error> {
     let mut stmt = conn.prepare(
         "WITH ordered AS (
             SELECT 
                 timestamp,
                 LAG(timestamp) OVER (ORDER BY timestamp) as prev_ts
             FROM events
-            WHERE timestamp >= ?1
+            WHERE timestamp >= ?1 AND timestamp <= ?2
         ),
         gaps AS (
             SELECT 
@@ -1043,7 +1036,7 @@ fn query_gaps(conn: &Connection, since_utc: &str) -> Result<AwayData, Error> {
     let mut short_break_total_ms: i64 = 0;
     let mut short_break_count: i64 = 0;
 
-    let rows = stmt.query_map(params![since_utc], |row| {
+    let rows = stmt.query_map(params![since_utc, until_utc], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -1146,11 +1139,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
     let since_str = bounds.since_str.clone();
     let now_str = bounds.now_str.clone();
 
-    let time_filter = if let Some(ref until) = bounds.until_utc {
-        format!("timestamp >= '{}' AND timestamp <= '{}'", since_utc, until)
-    } else {
-        format!("timestamp >= '{}'", since_utc)
-    };
+    let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
 
     let (
         total_ms,
@@ -1164,18 +1153,15 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         total_events,
         jiggler_count,
     ): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = app.conn.query_row(
-        &format!(
-            "SELECT COALESCE(SUM(active_ms + COALESCE(passive_ms,0) + idle_ms),0),
-                    COALESCE(SUM(active_ms),0),
-                    COALESCE(SUM(passive_ms),0),
-                    COALESCE(SUM(idle_ms),0), COALESCE(SUM(keystrokes),0),
-                    COALESCE(SUM(mouse_clicks),0), COALESCE(SUM(scroll_events),0),
-                    COALESCE(SUM(mouse_distance),0), COUNT(*),
-                    COALESCE(SUM(CASE WHEN jiggler_detected = 1 THEN 1 ELSE 0 END),0)
-             FROM events WHERE {}",
-            time_filter
-        ),
-        [],
+        "SELECT COALESCE(SUM(active_ms + COALESCE(passive_ms,0) + idle_ms),0),
+                COALESCE(SUM(active_ms),0),
+                COALESCE(SUM(passive_ms),0),
+                COALESCE(SUM(idle_ms),0), COALESCE(SUM(keystrokes),0),
+                COALESCE(SUM(mouse_clicks),0), COALESCE(SUM(scroll_events),0),
+                COALESCE(SUM(mouse_distance),0), COUNT(*),
+                COALESCE(SUM(CASE WHEN jiggler_detected = 1 THEN 1 ELSE 0 END),0)
+         FROM events WHERE timestamp >= ?1 AND timestamp <= ?2",
+        params![since_utc, until_utc],
         |row| {
             Ok((
                 row.get(0)?,
@@ -1192,15 +1178,14 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         },
     )?;
 
-    let mut cat_stmt = app.conn.prepare(&format!(
+    let mut cat_stmt = app.conn.prepare(
         "SELECT category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(idle_ms)
-         FROM events WHERE {}
+         FROM events WHERE timestamp >= ?1 AND timestamp <= ?2
          GROUP BY category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC",
-        time_filter
-    ))?;
+    )?;
 
     let categories: Vec<CategoryBreakdown> = cat_stmt
-        .query_map([], |row| {
+        .query_map(params![since_utc, until_utc], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
@@ -1219,15 +1204,14 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         )
         .collect();
 
-    let mut app_stmt = app.conn.prepare(&format!(
+    let mut app_stmt = app.conn.prepare(
         "SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(keystrokes), SUM(mouse_clicks)
-         FROM events WHERE {}
+         FROM events WHERE timestamp >= ?1 AND timestamp <= ?2
          GROUP BY app_id, category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC",
-        time_filter
-    ))?;
+    )?;
 
     let flat_apps: Vec<AppBreakdown> = app_stmt
-        .query_map([], |row| {
+        .query_map(params![since_utc, until_utc], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1252,11 +1236,10 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
 
     let top_apps = group_apps(flat_apps, 15);
 
-    let mut raw_stmt = app.conn.prepare(&format!(
+    let mut raw_stmt = app.conn.prepare(
         "SELECT timestamp, active_ms, COALESCE(passive_ms,0), idle_ms, keystrokes
-         FROM events WHERE {}",
-        time_filter
-    ))?;
+         FROM events WHERE timestamp >= ?1 AND timestamp <= ?2",
+    )?;
 
     struct RawRow {
         timestamp: String,
@@ -1267,7 +1250,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
     }
 
     let raw_rows: Vec<RawRow> = raw_stmt
-        .query_map([], |row| {
+        .query_map(params![since_utc, until_utc], |row| {
             Ok(RawRow {
                 timestamp: row.get(0)?,
                 active_ms: row.get(1)?,
@@ -1396,8 +1379,8 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         None
     };
 
-    let away = query_gaps(&app.conn, &since_utc).ok();
-    let streaks = query_streaks(&app.conn, &app.config, &time_filter).ok();
+    let away = query_gaps(&app.conn, since_utc, until_utc).ok();
+    let streaks = query_streaks(&app.conn, &app.config, since_utc, until_utc).ok();
 
     Ok(ReportData {
         since_str,
@@ -2301,25 +2284,17 @@ pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
 
 pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
     let bounds = range.resolve()?;
-    let time_filter = if let Some(ref until) = bounds.until_utc {
-        format!(
-            "timestamp >= '{}' AND timestamp <= '{}'",
-            bounds.since_utc, until
-        )
-    } else {
-        format!("timestamp >= '{}'", bounds.since_utc)
-    };
+    let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
 
-    let mut stmt = app.conn.prepare(&format!(
+    let mut stmt = app.conn.prepare(
         "SELECT timestamp, category, active_ms + COALESCE(passive_ms,0) + idle_ms as total_ms, keystrokes
-         FROM events WHERE {}",
-        time_filter
-    ))?;
+         FROM events WHERE timestamp >= ?1 AND timestamp <= ?2",
+    )?;
 
     let mut heatmap: std::collections::BTreeMap<(String, u32), HeatmapCell> =
         std::collections::BTreeMap::new();
 
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![&bounds.since_utc, until_utc], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,

@@ -432,12 +432,18 @@ pub fn start_idle_monitor(
                                         mouse_tracker.record(now);
                                         last_mouse_tracker_ms = now;
                                     }
-                                } else if code == REL_WHEEL
-                                    || code == REL_HWHEEL
-                                    || code == REL_WHEEL_HI_RES
+                                } else if code == REL_WHEEL || code == REL_HWHEEL {
+                                    // Only count low-res wheel events; high-res
+                                    // (REL_WHEEL_HI_RES / REL_HWHEEL_HI_RES) duplicate
+                                    // the same physical scroll and would double-count.
+                                    scroll_events.fetch_add(1, Ordering::Relaxed);
+                                    last_activity.store(now, Ordering::Relaxed);
+                                    last_mouse_event = Instant::now();
+                                } else if code == REL_WHEEL_HI_RES
                                     || code == REL_HWHEEL_HI_RES
                                 {
-                                    scroll_events.fetch_add(1, Ordering::Relaxed);
+                                    // Still update activity timestamp for idle detection,
+                                    // but don't increment scroll_events counter.
                                     last_activity.store(now, Ordering::Relaxed);
                                     last_mouse_event = Instant::now();
                                 }

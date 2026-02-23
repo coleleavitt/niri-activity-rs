@@ -32,14 +32,17 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
         bounds.start_date.format("%Y%m%d"),
         bounds.end_date.format("%Y%m%d")
     );
-    let temp_path = format!("/tmp/niri_activity_{}.xlsx", timestamp);
+    let temp_file = tempfile::Builder::new()
+        .prefix("niri_activity_")
+        .suffix(".xlsx")
+        .tempfile()
+        .map_err(|e| Error::NiriError(format!("Failed to create temp file: {}", e)))?;
+    let temp_path = temp_file.path().to_path_buf();
 
-    report::export_xlsx_range(app, range, &temp_path)?;
-
+    report::export_xlsx_range(app, range, &temp_path.to_string_lossy())?;
     let xlsx_bytes = fs::read(&temp_path)
         .map_err(|e| Error::NiriError(format!("Failed to read generated XLSX: {}", e)))?;
-
-    let _ = fs::remove_file(&temp_path);
+    drop(temp_file); // Explicitly remove the temp file
 
     let subject = if email_config.report_name.is_empty() {
         format!(
@@ -238,7 +241,7 @@ pub fn test_email_config(config: &Config) -> Result<(), Error> {
 
     println!(
         "Test email sent successfully to {}",
-        email_config.to_addresses.first().unwrap_or(&"".to_string())
+        email_config.to_addresses.first().map(|s| s.as_str()).unwrap_or("<none>")
     );
 
     Ok(())

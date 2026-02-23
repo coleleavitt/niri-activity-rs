@@ -3,6 +3,9 @@ use owo_colors::OwoColorize;
 use crate::config::Category;
 
 pub fn fmt_duration_compact(ms: i64) -> String {
+    if ms < 0 {
+        return "0s".to_string();
+    }
     let total_secs = ms / 1000;
     if total_secs < 60 {
         format!("{}s", total_secs)
@@ -16,6 +19,9 @@ pub fn fmt_duration_compact(ms: i64) -> String {
 }
 
 pub fn fmt_duration(ms: i64) -> String {
+    if ms < 0 {
+        return "0s".to_string();
+    }
     let hours = ms / 3_600_000;
     let mins = (ms % 3_600_000) / 60_000;
     if hours == 0 && mins == 0 {
@@ -28,6 +34,9 @@ pub fn fmt_duration(ms: i64) -> String {
 
 /// Format milliseconds as `h:mm:ss` for ActivTrak-compatible CSV export.
 pub fn fmt_hms(ms: i64) -> String {
+    if ms < 0 {
+        return "0:00:00".to_string();
+    }
     let total_secs = ms / 1000;
     let h = total_secs / 3600;
     let m = (total_secs % 3600) / 60;
@@ -55,6 +64,9 @@ pub fn truncate(s: &str, max: usize) -> String {
 /// Convert raw mouse sensor counts to physical distance.
 /// `counts / mouse_dpi` = inches (evdev REL_X/REL_Y are mickeys).
 pub fn fmt_distance(counts: i64, mouse_dpi: f64) -> String {
+    if mouse_dpi <= 0.0 {
+        return "0ft".to_string();
+    }
     let feet = counts as f64 / mouse_dpi / 12.0;
     if feet >= 5280.0 {
         format!("{:.1}mi", feet / 5280.0)
@@ -95,7 +107,14 @@ pub fn cat_bar_fractional(category: Category, frac_blocks: f64, width: usize) ->
 pub fn colored_bar(prod_frac: f64, neutral_frac: f64, _unprod_frac: f64, width: usize) -> String {
     let prod_chars = (prod_frac * width as f64).round() as usize;
     let neutral_chars = (neutral_frac * width as f64).round() as usize;
-    let unprod_chars = width.saturating_sub(prod_chars + neutral_chars);
+    let total_used = prod_chars.saturating_add(neutral_chars);
+    let (prod_chars, neutral_chars) = if total_used > width {
+        let excess = total_used.saturating_sub(width);
+        (prod_chars, neutral_chars.saturating_sub(excess))
+    } else {
+        (prod_chars, neutral_chars)
+    };
+    let unprod_chars = width.saturating_sub(prod_chars.saturating_add(neutral_chars));
     format!(
         "{}{}{}",
         "█".repeat(prod_chars).green(),

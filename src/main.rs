@@ -15,46 +15,72 @@ use clap::{Parser, Subcommand};
 
 use crate::error::Error;
 
-fn parse_time_range(
-    days: u32,
+/// Shared time-range arguments flattened into subcommands that need them.
+#[derive(Debug, Clone, clap::Args)]
+struct TimeRangeArgs {
+    #[arg(long)]
     aligned: bool,
+    #[arg(long)]
     today: bool,
+    #[arg(long)]
     yesterday: bool,
+    #[arg(long)]
     last_week: bool,
+    #[arg(long)]
     this_week: bool,
+    #[arg(long)]
     last_month: bool,
+    #[arg(long)]
     this_month: bool,
+    #[arg(long)]
     week: bool,
+    #[arg(long)]
     month: bool,
+    /// Start date (YYYY-MM-DD), use with --to
+    #[arg(long)]
     from: Option<String>,
+    /// End date (YYYY-MM-DD), use with --from
+    #[arg(long)]
     to: Option<String>,
-) -> Result<report::TimeRange, Error> {
-    if let (Some(from_str), Some(to_str)) = (&from, &to) {
+}
+
+/// Output format for the export subcommand.
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum ExportFormat {
+    Csv,
+    Xlsx,
+    Json,
+    Heatmap,
+    Cron,
+}
+
+fn parse_time_range(days: u32, time: &TimeRangeArgs) -> Result<report::TimeRange, Error> {
+    if let (Some(from_str), Some(to_str)) = (&time.from, &time.to) {
         let start = NaiveDate::parse_from_str(from_str, "%Y-%m-%d")
             .map_err(|e| Error::NiriError(format!("invalid --from date: {}", e)))?;
         let end = NaiveDate::parse_from_str(to_str, "%Y-%m-%d")
             .map_err(|e| Error::NiriError(format!("invalid --to date: {}", e)))?;
         return Ok(report::TimeRange::DateRange(start, end));
     }
-    if from.is_some() || to.is_some() {
+    if time.from.is_some() || time.to.is_some() {
         return Err(Error::NiriError(
             "--from and --to must be used together".into(),
         ));
     }
 
-    Ok(if today {
+    Ok(if time.today {
         report::TimeRange::Days(0)
-    } else if yesterday {
+    } else if time.yesterday {
         report::TimeRange::Yesterday
-    } else if last_week || week {
+    } else if time.last_week || time.week {
         report::TimeRange::LastWeek
-    } else if this_week {
+    } else if time.this_week {
         report::TimeRange::ThisWeek
-    } else if last_month || month {
+    } else if time.last_month || time.month {
         report::TimeRange::LastMonth
-    } else if this_month {
+    } else if time.this_month {
         report::TimeRange::ThisMonth
-    } else if aligned {
+    } else if time.aligned {
         report::TimeRange::DaysAligned(days)
     } else {
         report::TimeRange::Days(days)
@@ -83,30 +109,8 @@ enum Commands {
     Metrics {
         #[arg(short, long, default_value = "1")]
         days: u32,
-        #[arg(long)]
-        aligned: bool,
-        #[arg(long)]
-        today: bool,
-        #[arg(long)]
-        yesterday: bool,
-        #[arg(long)]
-        last_week: bool,
-        #[arg(long)]
-        this_week: bool,
-        #[arg(long)]
-        last_month: bool,
-        #[arg(long)]
-        this_month: bool,
-        #[arg(long)]
-        week: bool,
-        #[arg(long)]
-        month: bool,
-        /// Start date (YYYY-MM-DD), use with --to
-        #[arg(long)]
-        from: Option<String>,
-        /// End date (YYYY-MM-DD), use with --from
-        #[arg(long)]
-        to: Option<String>,
+        #[command(flatten)]
+        time: TimeRangeArgs,
     },
     /// Show activity timeline in 15-min buckets
     Timeline {
@@ -121,30 +125,8 @@ enum Commands {
     Report {
         #[arg(short, long, default_value = "1")]
         days: u32,
-        #[arg(long)]
-        aligned: bool,
-        #[arg(long)]
-        today: bool,
-        #[arg(long)]
-        yesterday: bool,
-        #[arg(long)]
-        last_week: bool,
-        #[arg(long)]
-        this_week: bool,
-        #[arg(long)]
-        last_month: bool,
-        #[arg(long)]
-        this_month: bool,
-        #[arg(long)]
-        week: bool,
-        #[arg(long)]
-        month: bool,
-        /// Start date (YYYY-MM-DD), use with --to
-        #[arg(long)]
-        from: Option<String>,
-        /// End date (YYYY-MM-DD), use with --from
-        #[arg(long)]
-        to: Option<String>,
+        #[command(flatten)]
+        time: TimeRangeArgs,
         /// Compare current period with previous period of same length
         #[arg(long)]
         compare: bool,
@@ -153,33 +135,11 @@ enum Commands {
     Export {
         #[arg(short, long, default_value = "30")]
         days: u32,
-        #[arg(long)]
-        aligned: bool,
-        #[arg(long)]
-        today: bool,
-        #[arg(long)]
-        yesterday: bool,
-        #[arg(long)]
-        last_week: bool,
-        #[arg(long)]
-        this_week: bool,
-        #[arg(long)]
-        last_month: bool,
-        #[arg(long)]
-        this_month: bool,
-        #[arg(long)]
-        week: bool,
-        #[arg(long)]
-        month: bool,
-        /// Start date (YYYY-MM-DD), use with --to
-        #[arg(long)]
-        from: Option<String>,
-        /// End date (YYYY-MM-DD), use with --from
-        #[arg(long)]
-        to: Option<String>,
+        #[command(flatten)]
+        time: TimeRangeArgs,
         /// Output format (csv, xlsx, json, heatmap, or cron)
         #[arg(short, long, default_value = "csv")]
-        format: String,
+        format: ExportFormat,
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -187,30 +147,8 @@ enum Commands {
     Tui {
         #[arg(short, long, default_value = "7")]
         days: u32,
-        #[arg(long)]
-        aligned: bool,
-        #[arg(long)]
-        today: bool,
-        #[arg(long)]
-        yesterday: bool,
-        #[arg(long)]
-        last_week: bool,
-        #[arg(long)]
-        this_week: bool,
-        #[arg(long)]
-        last_month: bool,
-        #[arg(long)]
-        this_month: bool,
-        #[arg(long)]
-        week: bool,
-        #[arg(long)]
-        month: bool,
-        /// Start date (YYYY-MM-DD), use with --to
-        #[arg(long)]
-        from: Option<String>,
-        /// End date (YYYY-MM-DD), use with --from
-        #[arg(long)]
-        to: Option<String>,
+        #[command(flatten)]
+        time: TimeRangeArgs,
     },
     /// Initialize config file with examples
     Init,
@@ -243,68 +181,24 @@ fn main() {
 
     let result: Result<(), Error> = match cli.command {
         None => tui::run_tui_range(report::TimeRange::Days(7)),
-        Some(Commands::Tui {
-            days,
-            aligned,
-            today,
-            yesterday,
-            last_week,
-            this_week,
-            last_month,
-            this_month,
-            week,
-            month,
-            from,
-            to,
-        }) => parse_time_range(
-            days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week,
-            month, from, to,
-        )
-        .and_then(tui::run_tui_range),
+        Some(Commands::Tui { days, time }) => {
+            parse_time_range(days, &time).and_then(tui::run_tui_range)
+        }
         Some(Commands::Watch { quiet }) => watcher::watch(quiet),
         Some(Commands::Today) => report::App::open().and_then(|app| report::show_today(&app)),
-        Some(Commands::Metrics {
-            days,
-            aligned,
-            today,
-            yesterday,
-            last_week,
-            this_week,
-            last_month,
-            this_month,
-            week,
-            month,
-            from,
-            to,
-        }) => parse_time_range(
-            days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week,
-            month, from, to,
-        )
-        .and_then(|range| {
-            report::App::open().and_then(|app| report::show_metrics_range(&app, range))
-        }),
+        Some(Commands::Metrics { days, time }) => {
+            parse_time_range(days, &time).and_then(|range| {
+                report::App::open().and_then(|app| report::show_metrics_range(&app, range))
+            })
+        }
         Some(Commands::Timeline { days, bucket }) => {
             report::App::open().and_then(|app| report::show_timeline(&app, days, bucket))
         }
         Some(Commands::Report {
             days,
-            aligned,
-            today,
-            yesterday,
-            last_week,
-            this_week,
-            last_month,
-            this_month,
-            week,
-            month,
-            from,
-            to,
+            time,
             compare,
-        }) => parse_time_range(
-            days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week,
-            month, from, to,
-        )
-        .and_then(|range| {
+        }) => parse_time_range(days, &time).and_then(|range| {
             report::App::open().and_then(|app| {
                 if compare {
                     report::show_comparison(&app, range)
@@ -315,33 +209,19 @@ fn main() {
         }),
         Some(Commands::Export {
             days,
-            aligned,
-            today,
-            yesterday,
-            last_week,
-            this_week,
-            last_month,
-            this_month,
-            week,
-            month,
-            from,
-            to,
+            time,
             format,
             output,
-        }) => parse_time_range(
-            days, aligned, today, yesterday, last_week, this_week, last_month, this_month, week,
-            month, from, to,
-        )
-        .and_then(|range| {
-            report::App::open().and_then(|app| match format.as_str() {
-                "xlsx" | "excel" => {
+        }) => parse_time_range(days, &time).and_then(|range| {
+            report::App::open().and_then(|app| match format {
+                ExportFormat::Xlsx => {
                     let path = output.unwrap_or_else(|| "activity_report.xlsx".to_string());
                     report::export_xlsx_range(&app, range, &path)
                 }
-                "json" => report::export_json_range(&app, range),
-                "heatmap" => report::export_heatmap_range(&app, range),
-                "cron" | "summary" => report::export_cron_summary(&app, range),
-                _ => report::export_csv_range(&app, range),
+                ExportFormat::Json => report::export_json_range(&app, range),
+                ExportFormat::Heatmap => report::export_heatmap_range(&app, range),
+                ExportFormat::Cron => report::export_cron_summary(&app, range),
+                ExportFormat::Csv => report::export_csv_range(&app, range),
             })
         }),
         Some(Commands::Init) => config::init_config(),

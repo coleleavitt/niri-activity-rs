@@ -464,7 +464,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
             if let Some(pos) = pattern.find('*') {
                 let prefix = &pattern[..pos];
                 let suffix = &pattern[pos + 1..];
-                value.starts_with(prefix) && value.ends_with(suffix)
+                prefix.len() + suffix.len() <= value.len() && value.starts_with(prefix) && value.ends_with(suffix)
             } else {
                 pattern == value
             }
@@ -551,10 +551,11 @@ impl Schedule {
         start_date: chrono::NaiveDate,
         end_date: chrono::NaiveDate,
     ) -> i64 {
+        let holiday_set = self.holiday_set();
         let mut count = 0i64;
         let mut date = start_date;
         while date <= end_date {
-            if self.is_workday(date) {
+            if self.is_workday_with_holidays(date, &holiday_set) {
                 count += 1;
             }
             date += chrono::Duration::days(1);
@@ -562,26 +563,27 @@ impl Schedule {
         count
     }
 
-    pub fn is_workday(&self, date: chrono::NaiveDate) -> bool {
-        use std::collections::HashSet;
-
-        let holiday_set: HashSet<chrono::NaiveDate> = self
-            .holidays
+    fn holiday_set(&self) -> std::collections::HashSet<chrono::NaiveDate> {
+        self.holidays
             .iter()
             .filter_map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-            .collect();
+            .collect()
+    }
 
+    fn is_workday_with_holidays(&self, date: chrono::NaiveDate, holiday_set: &std::collections::HashSet<chrono::NaiveDate>) -> bool {
         if holiday_set.contains(&date) {
             return false;
         }
-
         let weekday = date.weekday().to_string().to_lowercase();
         let weekday_short = &weekday[..3];
-
         self.days.iter().any(|d| {
             let d_lower = d.to_lowercase();
             d_lower == weekday || d_lower == weekday_short
         })
+    }
+    pub fn is_workday(&self, date: chrono::NaiveDate) -> bool {
+        let holiday_set = self.holiday_set();
+        self.is_workday_with_holidays(date, &holiday_set)
     }
 }
 

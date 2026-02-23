@@ -24,13 +24,13 @@ pub struct LogindMonitor {
 impl LogindMonitor {
     /// Read the current lock state. Non-blocking (atomic load).
     pub fn is_locked(&self) -> bool {
-        self.is_locked.load(Ordering::Relaxed)
+        self.is_locked.load(Ordering::Acquire)
     }
 
     /// Check and clear the suspend-resumed flag. Returns `true` exactly once
     /// after each resume from suspend, then resets to `false`.
     pub fn take_suspend_resumed(&self) -> bool {
-        self.suspend_resumed.swap(false, Ordering::Relaxed)
+        self.suspend_resumed.swap(false, Ordering::Acquire)
     }
 }
 
@@ -45,7 +45,9 @@ fn find_user_session_path(
         .list_sessions()
         .map_err(|e| Error::Logind(format!("failed to list sessions: {e}")))?;
 
-    assert!(!sessions.is_empty(), "logind returned zero sessions");
+    if sessions.is_empty() {
+        return Err(Error::Logind("logind returned zero sessions".into()));
+    }
 
     for session_info in &sessions {
         if session_info.uid() >= 1000 {

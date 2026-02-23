@@ -5,7 +5,9 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("niri ipc: {0}")]
-    NiriIpc(#[from] std::io::Error),
+    NiriIpc(String),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     #[error("niri error: {0}")]
     NiriError(String),
     #[error("database: {0}")]
