@@ -179,6 +179,11 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
+    // Load env file (SMTP creds etc.) before any threads spawn.
+    if let Err(e) = config::load_env_file() {
+        eprintln!("Warning: failed to load env file: {e}");
+    }
+
     let result: Result<(), Error> = match cli.command {
         None => tui::run_tui_range(report::TimeRange::Days(7)),
         Some(Commands::Tui { days, time }) => {

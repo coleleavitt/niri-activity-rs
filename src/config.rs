@@ -612,8 +612,10 @@ pub fn get_config_path() -> Result<PathBuf, Error> {
     Ok(config_dir.join("config.toml"))
 }
 
-pub fn load_config() -> Result<Config, Error> {
-    // Auto-load env file (KEY=VALUE lines) from config dir for SMTP credentials etc.
+/// Load env file (KEY=VALUE lines) from config dir into process environment.
+/// Must be called before any threads are spawned (set_var is unsafe in
+/// multi-threaded contexts). Call this once from main() at startup.
+pub(crate) fn load_env_file() -> Result<(), Error> {
     let env_path = get_config_path()?.with_file_name("env");
     if env_path.exists() {
         if let Ok(contents) = fs::read_to_string(&env_path) {
@@ -623,13 +625,15 @@ pub fn load_config() -> Result<Config, Error> {
                     continue;
                 }
                 if let Some((key, value)) = line.split_once('=') {
-                    // SAFETY: called at startup before any threads are spawned.
+                    // SAFETY: called from main() before any threads are spawned.
                     unsafe { std::env::set_var(key.trim(), value.trim()) };
                 }
             }
         }
     }
-
+    Ok(())
+}
+pub fn load_config() -> Result<Config, Error> {
     let config_path = get_config_path()?;
     if config_path.exists() {
         let content = fs::read_to_string(&config_path)?;
