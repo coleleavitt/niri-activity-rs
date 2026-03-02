@@ -223,7 +223,6 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
 
     let workdays = app.config.schedule.count_workdays(since_local, today_local);
     let days_header = format!("Days ({})", workdays);
-
     // ── Column headers (Daily Summary) ──────────────────────────────────
     let headers = [
         "Date",
@@ -299,6 +298,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         }
 
         let is_workday = app.config.schedule.is_workday(date);
+
         daily_metrics.push((date, m, is_workday));
         date += chrono::Duration::days(1);
     }
@@ -408,9 +408,10 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         row = row.saturating_add(1);
     }
 
-    // ── Totals row ──────────────────────────────────────────────────────
+    // ── Totals row ──────────────────────────────────────────────────────────────
     let mut daily_total = Metrics::default();
     let mut workday_total = Metrics::default();
+
     for (_, m, is_workday) in &daily_metrics {
         daily_total.total_ms = daily_total.total_ms.saturating_add(m.total_ms);
         daily_total.productive_ms = daily_total.productive_ms.saturating_add(m.productive_ms);
@@ -436,6 +437,24 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
                 .productive_active_ms
                 .saturating_add(m.productive_active_ms);
         }
+    }
+
+    // Calculate average of daily ratios for comparison
+    // Also calculate sum of truncated values to show truncation error
+    let mut sum_truncated_total_secs: i64 = 0;
+    let mut sum_truncated_prod_secs: i64 = 0;
+    let mut sum_truncated_unprod_secs: i64 = 0;
+    let mut sum_truncated_neutral_secs: i64 = 0;
+    let mut sum_truncated_prod_active_secs: i64 = 0;
+    let mut sum_truncated_prod_passive_secs: i64 = 0;
+
+    for (_, m, _) in &daily_metrics {
+        sum_truncated_total_secs += m.total_ms / 1000;
+        sum_truncated_prod_secs += m.productive_ms / 1000;
+        sum_truncated_unprod_secs += m.unproductive_ms / 1000;
+        sum_truncated_neutral_secs += m.neutral_ms / 1000;
+        sum_truncated_prod_active_secs += m.productive_active_ms / 1000;
+        sum_truncated_prod_passive_secs += m.productive_passive_ms / 1000;
     }
 
     let total_prod_ratio = if daily_total.total_ms > 0 {
@@ -464,22 +483,37 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         .write_string_with_format(row, 0, "TOTAL", &total_fmt)
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_string_with_format(row, 1, &fmt_hms(daily_total.total_ms), &total_fmt)
+        .write_string_with_format(
+            row,
+            1,
+            &fmt_hms(sum_truncated_total_secs * 1000),
+            &total_fmt,
+        )
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_string_with_format(row, 2, &fmt_hms(daily_total.productive_ms), &total_fmt)
+        .write_string_with_format(row, 2, &fmt_hms(sum_truncated_prod_secs * 1000), &total_fmt)
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_string_with_format(row, 3, &fmt_hms(daily_total.unproductive_ms), &total_fmt)
+        .write_string_with_format(
+            row,
+            3,
+            &fmt_hms(sum_truncated_unprod_secs * 1000),
+            &total_fmt,
+        )
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_string_with_format(row, 4, &fmt_hms(daily_total.neutral_ms), &total_fmt)
+        .write_string_with_format(
+            row,
+            4,
+            &fmt_hms(sum_truncated_neutral_secs * 1000),
+            &total_fmt,
+        )
         .map_err(xlsx_err)?;
     daily_sheet
         .write_string_with_format(
             row,
             5,
-            &fmt_hms(daily_total.productive_active_ms),
+            &fmt_hms(sum_truncated_prod_active_secs * 1000),
             &total_fmt,
         )
         .map_err(xlsx_err)?;
@@ -487,7 +521,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         .write_string_with_format(
             row,
             6,
-            &fmt_hms(daily_total.productive_passive_ms),
+            &fmt_hms(sum_truncated_prod_passive_secs * 1000),
             &total_fmt,
         )
         .map_err(xlsx_err)?;
