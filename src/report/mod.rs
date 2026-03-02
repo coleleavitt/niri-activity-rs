@@ -11,10 +11,10 @@ use std::str::FromStr;
 
 use chrono::{Datelike, Local, LocalResult, NaiveDate, Timelike, Utc};
 use owo_colors::OwoColorize;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 
-use crate::config::{get_data_dir, load_config, Category, Config};
+use crate::config::{Category, Config, get_data_dir, load_config};
 use crate::db::{reclassify_all, run_migrations};
 use crate::error::Error;
 use crate::fmt::{
