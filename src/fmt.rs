@@ -27,6 +27,8 @@ pub fn fmt_duration(ms: i64) -> String {
     if hours == 0 && mins == 0 {
         let secs = (ms % 60_000) / 1000;
         format!("{}s", secs)
+    } else if hours == 0 {
+        format!("{}m", mins)
     } else {
         format!("{}h {}m", hours, mins)
     }

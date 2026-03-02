@@ -51,7 +51,7 @@ pub fn init_db(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
+pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Error> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS migrations (
             id INTEGER PRIMARY KEY,
@@ -68,18 +68,20 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
     };
 
     if !applied.contains(&"001_fix_historical_categories".to_string()) {
+        let tx = conn.transaction()?;
         let mut updated = 0i64;
         for (app_id, category) in &config.categories {
-            let count = conn.execute(
+            let count = tx.execute(
                 "UPDATE events SET category = ?1 WHERE app_id = ?2 AND category != ?1",
                 params![category.to_string(), app_id],
             )?;
             updated += count as i64;
         }
-        conn.execute(
+        tx.execute(
             "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
             params!["001_fix_historical_categories", Utc::now().to_rfc3339()],
         )?;
+        tx.commit()?;
         if updated > 0 {
             eprintln!(
                 "Migration 001: fixed {} events with stale categories",
@@ -89,7 +91,8 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
     }
 
     if !applied.contains(&"002_apply_title_rules".to_string()) && !config.title_rules.is_empty() {
-        let mut stmt = conn.prepare("SELECT id, app_id, title FROM events")?;
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare("SELECT id, app_id, title FROM events")?;
         let rows: Vec<(i64, String, String)> = stmt
             .query_map([], |row| {
                 Ok((
@@ -99,21 +102,23 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
 
         let mut updated = 0i64;
         for (id, app_id, title) in &rows {
             let correct = config.classify(app_id, title);
-            let count = conn.execute(
+            let count = tx.execute(
                 "UPDATE events SET category = ?1 WHERE id = ?2 AND category != ?1",
                 params![correct.to_string(), id],
             )?;
             updated += count as i64;
         }
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
             params!["002_apply_title_rules", Utc::now().to_rfc3339()],
         )?;
+        tx.commit()?;
         if updated > 0 {
             eprintln!(
                 "Migration 002: reclassified {} events with title rules",
@@ -123,7 +128,8 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
     }
 
     if !applied.contains(&"003_app_scoped_title_rules".to_string()) {
-        let mut stmt = conn.prepare("SELECT id, app_id, title, category FROM events")?;
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare("SELECT id, app_id, title, category FROM events")?;
         let rows: Vec<(i64, String, String, String)> = stmt
             .query_map([], |row| {
                 Ok((
@@ -134,12 +140,13 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
 
         let mut updated = 0i64;
         for (id, app_id, title, old_category) in &rows {
             let correct = config.classify(app_id, title);
             if correct.to_string() != *old_category {
-                conn.execute(
+                tx.execute(
                     "UPDATE events SET category = ?1 WHERE id = ?2",
                     params![correct.to_string(), id],
                 )?;
@@ -147,10 +154,11 @@ pub fn run_migrations(conn: &Connection, config: &Config) -> Result<(), Error> {
             }
         }
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
             params!["003_app_scoped_title_rules", Utc::now().to_rfc3339()],
         )?;
+        tx.commit()?;
         if updated > 0 {
             eprintln!(
                 "Migration 003: reclassified {} events with app-scoped title rules",

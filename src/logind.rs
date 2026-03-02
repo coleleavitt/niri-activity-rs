@@ -30,7 +30,7 @@ impl LogindMonitor {
     /// Check and clear the suspend-resumed flag. Returns `true` exactly once
     /// after each resume from suspend, then resets to `false`.
     pub fn take_suspend_resumed(&self) -> bool {
-        self.suspend_resumed.swap(false, Ordering::Acquire)
+        self.suspend_resumed.swap(false, Ordering::AcqRel)
     }
 }
 

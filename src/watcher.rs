@@ -256,9 +256,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     println!("Input active threshold: {}s", config.input_active_secs);
     println!("Categories configured: {}", config.categories.len());
 
-    let conn = Connection::open(&db_path)?;
+    let mut conn = Connection::open(&db_path)?;
     init_db(&conn)?;
-    run_migrations(&conn, &config)?;
+    run_migrations(&mut conn, &config)?;
     reclassify_all(&conn, &config)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -635,8 +635,27 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
 
         match event {
             Event::WindowsChanged { windows: win_list } => {
+                // Flush any existing session before clearing windows
+                let input = input_stats.snapshot();
+                let jiggler = input_stats.jiggler_detected();
+                if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
+                    let _ = flush_session(
+                        &flush_ctx,
+                        Some(info),
+                        &mut SessionAccum {
+                            focus_start: &mut focus_start,
+                            active_ms: &mut accumulated_active_ms,
+                            passive_ms: &mut accumulated_passive_ms,
+                            idle_ms: &mut accumulated_idle_ms,
+                            input_baseline_ms: &mut input_baseline_ms,
+                            session_start_mono_ms: &mut session_start_mono_ms,
+                        },
+                        &input,
+                        jiggler,
+                        FlushReset::NoReset,
+                    );
+                }
                 windows.clear();
-                let _ = input_stats.snapshot();
                 for w in &win_list {
                     windows.insert(w.id, WindowInfo::from(w));
                     if w.is_focused {

@@ -51,8 +51,8 @@ impl App {
     pub fn open() -> Result<App, Error> {
         let config = load_config()?;
         let db_path = get_data_dir()?.join("activity.db");
-        let conn = Connection::open(&db_path)?;
-        run_migrations(&conn, &config)?;
+        let mut conn = Connection::open(&db_path)?;
+        run_migrations(&mut conn, &config)?;
         reclassify_all(&conn, &config)?;
         Ok(App { config, conn })
     }
@@ -1088,8 +1088,17 @@ fn query_gaps(
         if should_merge {
             // Merge with previous sleep gap
             if let Some(prev) = merged_gaps.last_mut() {
-                prev.gap_end = gap.gap_end;
-                prev.duration_ms = prev.duration_ms.saturating_add(gap.duration_ms);
+                prev.gap_end = gap.gap_end.clone();
+                // Recalculate duration from merged start to new end
+                if let (Some(start), Some(end)) = (
+                    parse_timestamp_local(&prev.gap_start),
+                    parse_timestamp_local(&gap.gap_end),
+                ) {
+                    prev.duration_ms = end.signed_duration_since(start).num_milliseconds();
+                } else {
+                    // Fallback: just add durations (less accurate but safe)
+                    prev.duration_ms = prev.duration_ms.saturating_add(gap.duration_ms);
+                }
             }
         } else {
             merged_gaps.push(gap);

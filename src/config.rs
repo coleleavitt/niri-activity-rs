@@ -831,7 +831,7 @@ regex = true
 pattern = \"GitHub|Stack Overflow|docs\\.rs|LinkedIn\"
 category = \"productive\"
 regex = true
-category = \"productive\"
+
 
 # Work schedule — only affects report breakdown (tracking is always on)
 [schedule]

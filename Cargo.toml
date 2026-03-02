@@ -23,7 +23,7 @@ crossterm = "0.28"
 regex = "1.12.3"
 logind-zbus = "5.3"
 zbus = { version = "5", default-features = false, features = ["blocking-api"] }
-rust_xlsxwriter = { git = "https://github.com/coleleavitt/rust_xlsxwriter.git" }
+rust_xlsxwriter = { git = "https://github.com/coleleavitt/rust_xlsxwriter.git", rev = "1970a524c01b54b5cf7d194d8e970f540f3457ad" }
 lettre = "0.11"
 tempfile = "3"
 

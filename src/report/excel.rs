@@ -450,12 +450,12 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     };
 
     let avg_total_ms = if workdays > 0 {
-        daily_total.total_ms / workdays
+        workday_total.total_ms / workdays
     } else {
         0
     };
     let avg_productive_ms = if workdays > 0 {
-        daily_total.productive_ms / workdays
+        workday_total.productive_ms / workdays
     } else {
         0
     };
