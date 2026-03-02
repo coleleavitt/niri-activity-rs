@@ -91,6 +91,45 @@ pub struct Schedule {
     pub holidays: Vec<String>,
 }
 
+/// Sleep / gap classification configuration.
+/// Controls how activity gaps are classified as Sleep vs LongBreak vs ShortBreak.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SleepConfig {
+    /// Earliest hour (24h) that can start a sleep period (default: 18 = 6pm).
+    #[serde(default = "default_sleep_earliest_hour")]
+    pub earliest_hour: u32,
+
+    /// Latest hour (24h) that can start a sleep period (default: 8 = 8am).
+    #[serde(default = "default_sleep_latest_hour")]
+    pub latest_hour: u32,
+
+    /// Minimum gap hours to classify as sleep (default: 3.0 - industry standard).
+    #[serde(default = "default_sleep_min_hours")]
+    pub min_hours: f64,
+
+    /// Minimum gap hours to classify as long break (default: 2.0).
+    #[serde(default = "default_long_break_min_hours")]
+    pub long_break_min_hours: f64,
+
+    /// Minimum gap hours to report at all (default: 0.5).
+    #[serde(default = "default_gap_min_hours")]
+    pub gap_min_hours: f64,
+
+    /// Maximum gap hours to report (default: 24.0).
+    #[serde(default = "default_gap_max_hours")]
+    pub gap_max_hours: f64,
+
+    /// Merge sleep gaps separated by activity shorter than this (minutes).
+    /// 0 = disabled. Default: 30.
+    #[serde(default = "default_sleep_merge_window_min")]
+    pub merge_window_min: u32,
+
+    /// Any gap longer than this that spans midnight is always sleep (hours).
+    /// Default: 6.0. Set to 0 to disable.
+    #[serde(default = "default_overnight_auto_hours")]
+    pub overnight_auto_hours: f64,
+}
+
 fn default_holidays() -> Vec<String> {
     vec![
         "2025-01-01".into(), // New Year's Day
@@ -245,6 +284,8 @@ struct RawConfig {
     #[serde(default)]
     jiggler: JigglerConfig,
     #[serde(default)]
+    sleep: SleepConfig,
+    #[serde(default)]
     categories: HashMap<String, Category>,
     #[serde(default)]
     title_rules: Vec<RawTitleRule>,
@@ -264,6 +305,7 @@ pub struct Config {
     pub goals: Goals,
     pub email: Email,
     pub jiggler: JigglerConfig,
+    pub sleep: SleepConfig,
     pub categories: HashMap<String, Category>,
     pub title_rules: Vec<TitleRule>,
 }
@@ -298,6 +340,39 @@ fn default_streak_break_tolerance() -> u64 {
 
 fn default_streak_idle_timeout() -> u64 {
     300
+}
+
+// Sleep classification defaults
+fn default_sleep_earliest_hour() -> u32 {
+    18 // 6pm
+}
+
+fn default_sleep_latest_hour() -> u32 {
+    8 // 8am
+}
+
+fn default_sleep_min_hours() -> f64 {
+    3.0 // Industry standard (COROS, Oura)
+}
+
+fn default_long_break_min_hours() -> f64 {
+    2.0
+}
+
+fn default_gap_min_hours() -> f64 {
+    0.5 // 30 minutes
+}
+
+fn default_gap_max_hours() -> f64 {
+    24.0
+}
+
+fn default_sleep_merge_window_min() -> u32 {
+    30 // Merge sleep gaps separated by <30 min activity
+}
+
+fn default_overnight_auto_hours() -> f64 {
+    6.0 // Any 6h+ gap spanning midnight = sleep
 }
 
 fn default_jiggler_enabled() -> bool {
@@ -393,6 +468,7 @@ impl From<RawConfig> for Config {
             email: raw.email,
             jiggler: raw.jiggler,
             categories: raw.categories,
+            sleep: raw.sleep,
             title_rules,
         }
     }
@@ -414,6 +490,7 @@ impl Default for Config {
             email: Email::default(),
             jiggler: JigglerConfig::default(),
             categories: HashMap::new(),
+            sleep: SleepConfig::default(),
             title_rules: Vec::new(),
         }
     }
@@ -439,6 +516,21 @@ impl Default for Schedule {
             end: default_schedule_end(),
             days: default_schedule_days(),
             holidays: default_holidays(),
+        }
+    }
+}
+
+impl Default for SleepConfig {
+    fn default() -> Self {
+        Self {
+            earliest_hour: default_sleep_earliest_hour(),
+            latest_hour: default_sleep_latest_hour(),
+            min_hours: default_sleep_min_hours(),
+            long_break_min_hours: default_long_break_min_hours(),
+            gap_min_hours: default_gap_min_hours(),
+            gap_max_hours: default_gap_max_hours(),
+            merge_window_min: default_sleep_merge_window_min(),
+            overnight_auto_hours: default_overnight_auto_hours(),
         }
     }
 }

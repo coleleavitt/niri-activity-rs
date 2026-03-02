@@ -793,20 +793,40 @@ fn group_apps(flat: Vec<AppBreakdown>, limit: usize) -> Vec<AppGroup> {
     groups
 }
 
-fn classify_gap(start_hour: u32, gap_hours: f64) -> Option<GapType> {
-    // Sleep: started 8pm-6am AND lasted 4+ hours
-    // Long Break: 2+ hours (not sleep)
-    // Short Break: 30min-2h
-    // Gaps < 30min or > 24h are ignored
-    if !(0.5..=24.0).contains(&gap_hours) {
+fn classify_gap(
+    start_hour: u32,
+    end_hour: u32,
+    gap_hours: f64,
+    sleep: &crate::config::SleepConfig,
+) -> Option<GapType> {
+    // Filter by configured min/max gap
+    if !(sleep.gap_min_hours..=sleep.gap_max_hours).contains(&gap_hours) {
         return None;
     }
 
-    let is_night_start = !(6..20).contains(&start_hour);
+    // Rule 1: Overnight auto-detect - any gap ≥ overnight_auto_hours spanning midnight = sleep
+    let spans_midnight = start_hour > end_hour;
+    if sleep.overnight_auto_hours > 0.0 && gap_hours >= sleep.overnight_auto_hours && spans_midnight
+    {
+        return Some(GapType::Sleep);
+    }
 
-    if is_night_start && gap_hours >= 4.0 {
-        Some(GapType::Sleep)
-    } else if gap_hours >= 2.0 {
+    // Rule 2: Night window check - gap starting in sleep window + min_hours = sleep
+    // Handle wraparound: earliest_hour (18) > latest_hour (8) means 18:00-08:00
+    let in_night_window = if sleep.earliest_hour > sleep.latest_hour {
+        // Window wraps midnight: 18:00 -> 08:00
+        start_hour >= sleep.earliest_hour || start_hour < sleep.latest_hour
+    } else {
+        // Normal window (shouldn't happen with defaults, but support it)
+        start_hour >= sleep.earliest_hour && start_hour < sleep.latest_hour
+    };
+
+    if in_night_window && gap_hours >= sleep.min_hours {
+        return Some(GapType::Sleep);
+    }
+
+    // Rule 3: Duration-based fallback
+    if gap_hours >= sleep.long_break_min_hours {
         Some(GapType::LongBreak)
     } else {
         Some(GapType::ShortBreak)
@@ -1005,7 +1025,12 @@ fn query_streaks(
     })
 }
 
-fn query_gaps(conn: &Connection, since_utc: &str, until_utc: &str) -> Result<AwayData, Error> {
+fn query_gaps(
+    conn: &Connection,
+    since_utc: &str,
+    until_utc: &str,
+    sleep: &crate::config::SleepConfig,
+) -> Result<AwayData, Error> {
     let mut stmt = conn.prepare(
         "WITH ordered AS (
             SELECT 
@@ -1019,16 +1044,96 @@ fn query_gaps(conn: &Connection, since_utc: &str, until_utc: &str) -> Result<Awa
                 prev_ts as gap_start,
                 timestamp as gap_end,
                 CAST(strftime('%H', prev_ts, 'localtime') AS INT) as start_hour,
+                CAST(strftime('%H', timestamp, 'localtime') AS INT) as end_hour,
                 (julianday(timestamp) - julianday(prev_ts)) * 24.0 as gap_hours
             FROM ordered
             WHERE prev_ts IS NOT NULL
         )
-        SELECT gap_start, gap_end, start_hour, gap_hours
+        SELECT gap_start, gap_end, start_hour, end_hour, gap_hours
         FROM gaps
-        WHERE gap_hours BETWEEN 0.5 AND 24.0
         ORDER BY gap_start",
     )?;
 
+    // Intermediate structure for gap merging
+    struct RawGap {
+        gap_start: String,
+        gap_end: String,
+        gap_type: GapType,
+        duration_ms: i64,
+    }
+
+    let mut raw_gaps: Vec<RawGap> = Vec::new();
+
+    let rows = stmt.query_map(params![since_utc, until_utc], |row| {
+        Ok((
+            row.get::<_, String>(0)?, // gap_start
+            row.get::<_, String>(1)?, // gap_end
+            row.get::<_, u32>(2)?,    // start_hour
+            row.get::<_, u32>(3)?,    // end_hour
+            row.get::<_, f64>(4)?,    // gap_hours
+        ))
+    })?;
+
+    // First pass: classify all gaps
+    for row in rows {
+        let (gap_start, gap_end, start_hour, end_hour, gap_hours) = row?;
+
+        // Filter by configured gap range
+        if !(sleep.gap_min_hours..=sleep.gap_max_hours).contains(&gap_hours) {
+            continue;
+        }
+
+        let Some(gap_type) = classify_gap(start_hour, end_hour, gap_hours, sleep) else {
+            continue;
+        };
+
+        let duration_ms = (gap_hours * 3_600_000.0) as i64;
+
+        raw_gaps.push(RawGap {
+            gap_start,
+            gap_end,
+            gap_type,
+            duration_ms,
+        });
+    }
+
+    // Second pass: merge consecutive sleep gaps separated by short activity
+    // If merge_window_min > 0 and two Sleep gaps are close, combine them
+    let merge_window_ms = i64::from(sleep.merge_window_min).saturating_mul(60_000);
+    let mut merged_gaps: Vec<RawGap> = Vec::new();
+
+    for gap in raw_gaps {
+        let should_merge = merge_window_ms > 0
+            && gap.gap_type == GapType::Sleep
+            && merged_gaps.last().is_some_and(|prev| {
+                if prev.gap_type != GapType::Sleep {
+                    return false;
+                }
+                // Check if time between prev.gap_end and gap.gap_start is < merge_window
+                let Some(prev_end) = parse_timestamp_local(&prev.gap_end) else {
+                    return false;
+                };
+                let Some(curr_start) = parse_timestamp_local(&gap.gap_start) else {
+                    return false;
+                };
+                let between_ms = curr_start
+                    .signed_duration_since(prev_end)
+                    .num_milliseconds();
+                between_ms >= 0 && between_ms < merge_window_ms
+            });
+
+        if should_merge {
+            // Merge with previous sleep gap
+            if let Some(prev) = merged_gaps.last_mut() {
+                prev.gap_end = gap.gap_end;
+                prev.duration_ms = prev.duration_ms.saturating_add(gap.duration_ms);
+            }
+        } else {
+            merged_gaps.push(gap);
+        }
+    }
+
+    // Third pass: build entries and summaries
     let mut entries: Vec<GapEntry> = Vec::new();
     let mut sleep_total_ms: i64 = 0;
     let mut sleep_count: i64 = 0;
@@ -1037,54 +1142,36 @@ fn query_gaps(conn: &Connection, since_utc: &str, until_utc: &str) -> Result<Awa
     let mut short_break_total_ms: i64 = 0;
     let mut short_break_count: i64 = 0;
 
-    let rows = stmt.query_map(params![since_utc, until_utc], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, u32>(2)?,
-            row.get::<_, f64>(3)?,
-        ))
-    })?;
-
-    for row in rows {
-        let (gap_start, gap_end, start_hour, gap_hours) = row?;
-
-        let Some(gap_type) = classify_gap(start_hour, gap_hours) else {
-            continue;
-        };
-
-        let duration_ms = (gap_hours * 3_600_000.0) as i64;
-
-        match gap_type {
+    for gap in merged_gaps {
+        match gap.gap_type {
             GapType::Sleep => {
-                sleep_total_ms = sleep_total_ms.saturating_add(duration_ms);
+                sleep_total_ms = sleep_total_ms.saturating_add(gap.duration_ms);
                 sleep_count += 1;
             }
             GapType::LongBreak => {
-                long_break_total_ms = long_break_total_ms.saturating_add(duration_ms);
+                long_break_total_ms = long_break_total_ms.saturating_add(gap.duration_ms);
                 long_break_count += 1;
             }
             GapType::ShortBreak => {
-                short_break_total_ms = short_break_total_ms.saturating_add(duration_ms);
+                short_break_total_ms = short_break_total_ms.saturating_add(gap.duration_ms);
                 short_break_count += 1;
             }
         }
 
-        let start_local = parse_timestamp_local(&gap_start)
+        let start_local = parse_timestamp_local(&gap.gap_start)
             .map(|dt| dt.format("%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| gap_start.clone());
-        let end_local = parse_timestamp_local(&gap_end)
+            .unwrap_or_else(|| gap.gap_start.clone());
+        let end_local = parse_timestamp_local(&gap.gap_end)
             .map(|dt| dt.format("%H:%M").to_string())
-            .unwrap_or_else(|| gap_end.clone());
+            .unwrap_or_else(|| gap.gap_end.clone());
 
         entries.push(GapEntry {
-            gap_type,
+            gap_type: gap.gap_type,
             start_time: start_local,
             end_time: end_local,
-            duration_ms,
+            duration_ms: gap.duration_ms,
         });
     }
-
     let mut summaries = Vec::new();
 
     if sleep_count > 0 {
@@ -1381,7 +1468,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         None
     };
 
-    let away = query_gaps(&app.conn, since_utc, until_utc).ok();
+    let away = query_gaps(&app.conn, since_utc, until_utc, &app.config.sleep).ok();
     let streaks = query_streaks(&app.conn, &app.config, since_utc, until_utc).ok();
 
     Ok(ReportData {
