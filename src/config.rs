@@ -175,7 +175,7 @@ pub struct Goals {
     pub weekly: String,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Deserialize, Default)]
 pub struct Email {
     #[serde(default)]
     pub enabled: bool,
@@ -206,6 +206,24 @@ impl Email {
 
     pub fn smtp_password(&self) -> String {
         std::env::var("NIRI_SMTP_PASSWORD").unwrap_or_else(|_| self.smtp_password.clone())
+    }
+}
+
+// Manual Debug impl to redact sensitive SMTP credentials
+impl fmt::Debug for Email {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Email")
+            .field("enabled", &self.enabled)
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("smtp_user", &"[REDACTED]")
+            .field("smtp_password", &"[REDACTED]")
+            .field("from_address", &self.from_address)
+            .field("to_addresses", &self.to_addresses)
+            .field("cc_addresses", &self.cc_addresses)
+            .field("subject_prefix", &self.subject_prefix)
+            .field("report_name", &self.report_name)
+            .finish()
     }
 }
 
@@ -764,7 +782,7 @@ input_active_secs = 60
 [jiggler]
 enabled = true
 window_secs = 600          # 10-min observation window
-min_events = 5             # need this many events to evaluate
+min_events = 10            # need this many events to evaluate
 variance_threshold_ms = 100 # max-min interval < this = artificial
 process_blacklist = [
     "xdotool", "ydotool", "caffeine", "keep-presence",
@@ -774,45 +792,45 @@ process_blacklist = [
 # Map app_id to category: productive, unproductive, neutral
 [categories]
 # IDEs / Development
-\"jetbrains-rustrover\" = \"productive\"
-\"jetbrains-idea\" = \"productive\"
-\"jetbrains-pycharm\" = \"productive\"
-\"code\" = \"productive\"
-\"zed\" = \"productive\"
-\"neovim\" = \"productive\"
-\"vim\" = \"productive\"
+jetbrains-rustrover = "productive"
+jetbrains-idea = "productive"
+jetbrains-pycharm = "productive"
+code = "productive"
+zed = "productive"
+neovim = "productive"
+vim = "productive"
 
 # Terminal
-\"Alacritty\" = \"productive\"
-\"kitty\" = \"productive\"
-\"foot\" = \"productive\"
-\"wezterm\" = \"productive\"
+Alacritty = "productive"
+kitty = "productive"
+foot = "productive"
+wezterm = "productive"
 
 # Browser (productive by default — override specific sites with [[title_rules]] below)
-\"zen\" = \"productive\"
-\"firefox\" = \"productive\"
-\"chromium\" = \"productive\"
+zen = "productive"
+firefox = "productive"
+chromium = "productive"
 
 # Notes / Docs
-\"obsidian\" = \"productive\"
-\"logseq\" = \"productive\"
-\"notion\" = \"productive\"
+obsidian = "productive"
+logseq = "productive"
+notion = "productive"
 
 # Email
-\"thunderbird\" = \"productive\"
+thunderbird = "productive"
 
 # Communication
-\"slack\" = \"neutral\"
-\"discord\" = \"unproductive\"
-\"vesktop\" = \"unproductive\"
-\"teams\" = \"productive\"
-\"zoom\" = \"neutral\"
+slack = "neutral"
+discord = "unproductive"
+vesktop = "unproductive"
+teams = "productive"
+zoom = "neutral"
 
 # Entertainment
-\"spotify\" = \"unproductive\"
-\"steam\" = \"unproductive\"
-\"vlc\" = \"unproductive\"
-\"mpv\" = \"unproductive\"
+spotify = "unproductive"
+steam = "unproductive"
+vlc = "unproductive"
+mpv = "unproductive"
 
 # Title rules — override category based on window title (case-insensitive).
 # Default: substring match. Add regex = true for regex patterns.
@@ -821,14 +839,14 @@ process_blacklist = [
 
 # Browser-only: one regex rule replaces many substring rules
 [[title_rules]]
-pattern = \"YouTube|Instagram|Spotify|Discord|Reddit|TikTok|Twitter|Twitch|Netflix\"
+pattern = "YouTube|Instagram|Spotify|Discord|Reddit|TikTok|Twitter|Twitch|Netflix"
 category = \"unproductive\"
-app = [\"zen\", \"firefox\", \"chromium\", \"chromium-browser\", \"spotify\"]
+app = ["zen", "firefox", "chromium", "chromium-browser", "spotify"]
 regex = true
 
 # Global productive patterns
 [[title_rules]]
-pattern = \"GitHub|Stack Overflow|docs\\.rs|LinkedIn\"
+pattern = "GitHub|Stack Overflow|docs\.rs|LinkedIn"
 category = \"productive\"
 regex = true
 

@@ -44,10 +44,12 @@ pub struct InputStats {
 
 impl InputStats {
     pub fn snapshot(&self) -> InputSnapshot {
-        let keystrokes = self.keystrokes.swap(0, Ordering::Relaxed);
-        let mouse_clicks = self.mouse_clicks.swap(0, Ordering::Relaxed);
-        let scroll_events = self.scroll_events.swap(0, Ordering::Relaxed);
-        let mouse_distance = self.mouse_distance.swap(0, Ordering::Relaxed);
+        // AcqRel ensures visibility: Release semantics for the store (resetting to 0),
+        // Acquire semantics for the load (reading the accumulated value)
+        let keystrokes = self.keystrokes.swap(0, Ordering::AcqRel);
+        let mouse_clicks = self.mouse_clicks.swap(0, Ordering::AcqRel);
+        let scroll_events = self.scroll_events.swap(0, Ordering::AcqRel);
+        let mouse_distance = self.mouse_distance.swap(0, Ordering::AcqRel);
         InputSnapshot {
             keystrokes,
             mouse_clicks,
@@ -57,26 +59,26 @@ impl InputStats {
     }
 
     pub fn last_activity_ms(&self) -> u64 {
-        self.last_activity_ms.load(Ordering::Relaxed)
+        self.last_activity_ms.load(Ordering::Acquire)
     }
 
     #[allow(dead_code)]
     pub fn last_meaningful_input_ms(&self) -> u64 {
-        self.last_meaningful_input_ms.load(Ordering::Relaxed)
+        self.last_meaningful_input_ms.load(Ordering::Acquire)
     }
 
     pub fn jiggler_detected(&self) -> bool {
-        self.jiggler_pattern.load(Ordering::Relaxed) || self.jiggler_process.load(Ordering::Relaxed)
+        self.jiggler_pattern.load(Ordering::Acquire) || self.jiggler_process.load(Ordering::Acquire)
     }
 
     #[allow(dead_code)]
     pub fn jiggler_pattern_detected(&self) -> bool {
-        self.jiggler_pattern.load(Ordering::Relaxed)
+        self.jiggler_pattern.load(Ordering::Acquire)
     }
 
     #[allow(dead_code)]
     pub fn jiggler_process_detected(&self) -> bool {
-        self.jiggler_process.load(Ordering::Relaxed)
+        self.jiggler_process.load(Ordering::Acquire)
     }
 }
 
@@ -278,7 +280,7 @@ pub fn start_idle_monitor(
         thread::spawn(move || {
             loop {
                 let found = scan_jiggler_processes(&blacklist);
-                jiggler_process_flag.store(found, Ordering::Relaxed);
+                jiggler_process_flag.store(found, Ordering::Release);
                 thread::sleep(Duration::from_secs(30));
             }
         });
@@ -370,19 +372,19 @@ pub fn start_idle_monitor(
                                 if ev.value() == 1 {
                                     let code = ev.code();
                                     if BTN_MOUSE_RANGE.contains(&code) {
-                                        mouse_clicks.fetch_add(1, Ordering::Relaxed);
-                                        last_activity.store(now, Ordering::Relaxed);
-                                        last_meaningful.store(now, Ordering::Relaxed);
+                                        mouse_clicks.fetch_add(1, Ordering::Release);
+                                        last_activity.store(now, Ordering::Release);
+                                        last_meaningful.store(now, Ordering::Release);
                                         last_mouse_event = Instant::now();
                                         if jiggler_enabled {
                                             mouse_tracker.record(now);
                                         }
                                     } else {
-                                        keystrokes.fetch_add(1, Ordering::Relaxed);
-                                        last_activity.store(now, Ordering::Relaxed);
-                                        last_meaningful.store(now, Ordering::Relaxed);
+                                        keystrokes.fetch_add(1, Ordering::Release);
+                                        last_activity.store(now, Ordering::Release);
+                                        last_meaningful.store(now, Ordering::Release);
                                         last_keyboard_event = Instant::now();
-                                        last_keyboard_ms.store(now, Ordering::Relaxed);
+                                        last_keyboard_ms.store(now, Ordering::Release);
                                         if jiggler_enabled {
                                             kb_tracker.record(now);
                                         }
@@ -394,7 +396,7 @@ pub fn start_idle_monitor(
                                 if code == REL_X || code == REL_Y {
                                     let delta = ev.value();
                                     mouse_distance
-                                        .fetch_add(delta.unsigned_abs() as u64, Ordering::Relaxed);
+                                        .fetch_add(delta.unsigned_abs() as u64, Ordering::Release);
 
                                     if code == REL_X {
                                         motion_dx = motion_dx.saturating_add(delta as i64);
@@ -413,7 +415,7 @@ pub fn start_idle_monitor(
 
                                     if window_expired || above_threshold {
                                         if above_threshold {
-                                            last_activity.store(now, Ordering::Relaxed);
+                                            last_activity.store(now, Ordering::Release);
                                         }
                                         motion_dx = 0;
                                         motion_dy = 0;
@@ -431,13 +433,13 @@ pub fn start_idle_monitor(
                                     // Only count low-res wheel events; high-res
                                     // (REL_WHEEL_HI_RES / REL_HWHEEL_HI_RES) duplicate
                                     // the same physical scroll and would double-count.
-                                    scroll_events.fetch_add(1, Ordering::Relaxed);
-                                    last_activity.store(now, Ordering::Relaxed);
+                                    scroll_events.fetch_add(1, Ordering::Release);
+                                    last_activity.store(now, Ordering::Release);
                                     last_mouse_event = Instant::now();
                                 } else if code == REL_WHEEL_HI_RES || code == REL_HWHEEL_HI_RES {
                                     // Still update activity timestamp for idle detection,
                                     // but don't increment scroll_events counter.
-                                    last_activity.store(now, Ordering::Relaxed);
+                                    last_activity.store(now, Ordering::Release);
                                     last_mouse_event = Instant::now();
                                 }
                             }
@@ -448,7 +450,7 @@ pub fn start_idle_monitor(
                                     || code == ABS_MT_POSITION_X
                                     || code == ABS_MT_POSITION_Y
                                 {
-                                    last_activity.store(now, Ordering::Relaxed);
+                                    last_activity.store(now, Ordering::Release);
                                     last_mouse_event = Instant::now();
                                 }
                             }
@@ -461,13 +463,13 @@ pub fn start_idle_monitor(
                 && loop_now.duration_since(last_jiggler_check) >= JIGGLER_CHECK_INTERVAL
             {
                 let now_ms = start.elapsed().as_millis() as u64;
-                let kb_ms = last_keyboard_ms.load(Ordering::Relaxed);
+                let kb_ms = last_keyboard_ms.load(Ordering::Acquire);
                 let kb_age_ms = now_ms.saturating_sub(kb_ms);
                 let window_ms = jiggler_config.window_secs.saturating_mul(1000);
 
                 let mouse_artificial = mouse_tracker.is_artificial() && kb_age_ms >= window_ms;
                 let artificial = kb_tracker.is_artificial() || mouse_artificial;
-                jiggler_pattern_flag.store(artificial, Ordering::Relaxed);
+                jiggler_pattern_flag.store(artificial, Ordering::Release);
                 last_jiggler_check = loop_now;
             }
 

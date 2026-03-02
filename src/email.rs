@@ -135,11 +135,22 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
 fn build_mailer(config: &Email) -> Result<SmtpTransport, Error> {
     let creds = Credentials::new(config.smtp_user(), config.smtp_password());
 
-    let mailer = SmtpTransport::starttls_relay(&config.smtp_host)
-        .map_err(|e| Error::NiriError(format!("Failed to create SMTP relay: {}", e)))?
-        .port(config.smtp_port)
-        .credentials(creds)
-        .build();
+    // Use implicit TLS for port 465 (more secure), STARTTLS for 587 (standard)
+    let mailer = if config.smtp_port == 465 {
+        SmtpTransport::relay(&config.smtp_host)
+            .map_err(|e| Error::NiriError(format!("Failed to create SMTP relay (TLS): {}", e)))?
+            .port(config.smtp_port)
+            .credentials(creds)
+            .build()
+    } else {
+        SmtpTransport::starttls_relay(&config.smtp_host)
+            .map_err(|e| {
+                Error::NiriError(format!("Failed to create SMTP relay (STARTTLS): {}", e))
+            })?
+            .port(config.smtp_port)
+            .credentials(creds)
+            .build()
+    };
 
     Ok(mailer)
 }

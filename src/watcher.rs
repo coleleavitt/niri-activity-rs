@@ -623,6 +623,26 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 if shutdown.load(Ordering::SeqCst) {
                     continue;
                 }
+                // Flush current session before returning error (data loss prevention)
+                if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
+                    let input = input_stats.snapshot();
+                    let jiggler = input_stats.jiggler_detected();
+                    let _ = flush_session(
+                        &flush_ctx,
+                        Some(info),
+                        &mut SessionAccum {
+                            focus_start: &mut focus_start,
+                            active_ms: &mut accumulated_active_ms,
+                            passive_ms: &mut accumulated_passive_ms,
+                            idle_ms: &mut accumulated_idle_ms,
+                            input_baseline_ms: &mut input_baseline_ms,
+                            session_start_mono_ms: &mut session_start_mono_ms,
+                        },
+                        &input,
+                        jiggler,
+                        FlushReset::NoReset,
+                    );
+                }
                 return Err(Error::NiriError("event stream disconnected".into()));
             }
         };
@@ -681,6 +701,32 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             }
 
             Event::WindowClosed { id } => {
+                // Flush session if the closed window was focused (data loss prevention)
+                if focused_id == Some(id) {
+                    let input = input_stats.snapshot();
+                    let jiggler = input_stats.jiggler_detected();
+                    if let Some(info) = windows.get(&id) {
+                        let _ = flush_session(
+                            &flush_ctx,
+                            Some(info),
+                            &mut SessionAccum {
+                                focus_start: &mut focus_start,
+                                active_ms: &mut accumulated_active_ms,
+                                passive_ms: &mut accumulated_passive_ms,
+                                idle_ms: &mut accumulated_idle_ms,
+                                input_baseline_ms: &mut input_baseline_ms,
+                                session_start_mono_ms: &mut session_start_mono_ms,
+                            },
+                            &input,
+                            jiggler,
+                            FlushReset::NoReset,
+                        );
+                    }
+                    focused_id = None;
+                    accumulated_active_ms = 0;
+                    accumulated_passive_ms = 0;
+                    accumulated_idle_ms = 0;
+                }
                 windows.remove(&id);
             }
 

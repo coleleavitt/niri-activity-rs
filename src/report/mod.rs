@@ -320,21 +320,21 @@ pub fn query_metrics_range(app: &App, range: TimeRange) -> Result<MetricsData, E
 
     for row in rows {
         let (category_raw, active_ms, passive_ms, idle_ms) = row?;
-        let total = active_ms + passive_ms + idle_ms;
-        m.total_ms += total;
+        let total = active_ms.saturating_add(passive_ms).saturating_add(idle_ms);
+        m.total_ms = m.total_ms.saturating_add(total);
 
         match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
             Category::Productive => {
-                m.productive_ms += total;
-                m.productive_active_ms += active_ms;
-                m.productive_passive_ms += passive_ms;
-                m.productive_idle_ms += idle_ms;
+                m.productive_ms = m.productive_ms.saturating_add(total);
+                m.productive_active_ms = m.productive_active_ms.saturating_add(active_ms);
+                m.productive_passive_ms = m.productive_passive_ms.saturating_add(passive_ms);
+                m.productive_idle_ms = m.productive_idle_ms.saturating_add(idle_ms);
             }
             Category::Unproductive => {
-                m.unproductive_ms += total;
+                m.unproductive_ms = m.unproductive_ms.saturating_add(total);
             }
             Category::Neutral => {
-                m.neutral_ms += total;
+                m.neutral_ms = m.neutral_ms.saturating_add(total);
             }
         }
     }
