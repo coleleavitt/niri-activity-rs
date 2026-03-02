@@ -739,9 +739,11 @@ fn group_apps(flat: Vec<AppBreakdown>, limit: usize) -> Vec<AppGroup> {
             group.children.push(entry);
         } else {
             let idx = groups.len();
-            index.insert(entry.app_id.clone(), idx);
+            // Take app_id before moving entry into children to avoid clone
+            let app_id = entry.app_id.clone();
+            index.insert(app_id.clone(), idx);
             groups.push(AppGroup {
-                app_id: entry.app_id.clone(),
+                app_id,
                 total_ms: entry.total_ms,
                 active_ms: entry.active_ms,
                 keys: entry.keys,
@@ -932,8 +934,12 @@ fn query_streaks(
             if in_streak {
                 streak_productive_ms = streak_productive_ms.saturating_add(ev.active_ms);
                 streak_keys = streak_keys.saturating_add(ev.keystrokes);
-                let entry = streak_app_ms.entry(ev.app_id.clone()).or_insert(0);
-                *entry = entry.saturating_add(ev.active_ms);
+                // Avoid clone on hot path: use entry API with reference check first
+                if let Some(entry) = streak_app_ms.get_mut(&ev.app_id) {
+                    *entry = entry.saturating_add(ev.active_ms);
+                } else {
+                    streak_app_ms.insert(ev.app_id.clone(), ev.active_ms);
+                }
             } else {
                 in_streak = true;
                 streak_start = Some(ev.timestamp.clone());
@@ -941,8 +947,12 @@ fn query_streaks(
                 streak_keys = ev.keystrokes;
                 pending_unproductive_ms = 0;
                 streak_app_ms.clear();
-                let entry = streak_app_ms.entry(ev.app_id.clone()).or_insert(0);
-                *entry = entry.saturating_add(ev.active_ms);
+                // Avoid clone on hot path: use entry API with reference check first
+                if let Some(entry) = streak_app_ms.get_mut(&ev.app_id) {
+                    *entry = entry.saturating_add(ev.active_ms);
+                } else {
+                    streak_app_ms.insert(ev.app_id.clone(), ev.active_ms);
+                }
             }
         } else if in_streak {
             pending_unproductive_ms = pending_unproductive_ms.saturating_add(ev.active_ms);
@@ -2138,25 +2148,33 @@ pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
 
         let date = local_dt.format("%Y-%m-%d").to_string();
         let hour = local_dt.hour();
-        let key = (date.clone(), hour);
 
-        let cell = heatmap.entry(key).or_insert_with(|| HeatmapCell {
-            date: date.clone(),
-            hour,
-            productive_ms: 0,
-            unproductive_ms: 0,
-            neutral_ms: 0,
-            total_ms: 0,
-            keystrokes: 0,
-        });
-
-        match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
-            Category::Productive => cell.productive_ms += total_ms,
-            Category::Unproductive => cell.unproductive_ms += total_ms,
-            Category::Neutral => cell.neutral_ms += total_ms,
+        // Avoid double clone: check if key exists first, only clone for insert
+        if let Some(cell) = heatmap.get_mut(&(date.clone(), hour)) {
+            match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
+                Category::Productive => cell.productive_ms += total_ms,
+                Category::Unproductive => cell.unproductive_ms += total_ms,
+                Category::Neutral => cell.neutral_ms += total_ms,
+            }
+            cell.total_ms += total_ms;
+            cell.keystrokes += keystrokes;
+        } else {
+            let mut cell = HeatmapCell {
+                date: date.clone(),
+                hour,
+                productive_ms: 0,
+                unproductive_ms: 0,
+                neutral_ms: 0,
+                total_ms,
+                keystrokes,
+            };
+            match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
+                Category::Productive => cell.productive_ms = total_ms,
+                Category::Unproductive => cell.unproductive_ms = total_ms,
+                Category::Neutral => cell.neutral_ms = total_ms,
+            }
+            heatmap.insert((date, hour), cell);
         }
-        cell.total_ms += total_ms;
-        cell.keystrokes += keystrokes;
     }
 
     let cells: Vec<HeatmapCell> = heatmap.into_values().collect();

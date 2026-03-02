@@ -362,101 +362,122 @@ pub fn start_idle_monitor(
                 last_mouse_event = loop_now;
             }
 
-            for device in &mut devices {
-                if let Ok(events) = device.fetch_events() {
-                    for ev in events {
-                        let now = start.elapsed().as_millis() as u64;
+            // Track which devices failed so we can remove them (dead device optimization)
+            let mut failed_indices: Vec<usize> = Vec::new();
 
-                        match ev.event_type() {
-                            evdev::EventType::KEY => {
-                                if ev.value() == 1 {
-                                    let code = ev.code();
-                                    if BTN_MOUSE_RANGE.contains(&code) {
-                                        mouse_clicks.fetch_add(1, Ordering::Release);
-                                        last_activity.store(now, Ordering::Release);
-                                        last_meaningful.store(now, Ordering::Release);
-                                        last_mouse_event = Instant::now();
-                                        if jiggler_enabled {
-                                            mouse_tracker.record(now);
-                                        }
-                                    } else {
-                                        keystrokes.fetch_add(1, Ordering::Release);
-                                        last_activity.store(now, Ordering::Release);
-                                        last_meaningful.store(now, Ordering::Release);
-                                        last_keyboard_event = Instant::now();
-                                        last_keyboard_ms.store(now, Ordering::Release);
-                                        if jiggler_enabled {
-                                            kb_tracker.record(now);
-                                        }
-                                    }
-                                }
-                            }
-                            evdev::EventType::RELATIVE => {
-                                let code = ev.code();
-                                if code == REL_X || code == REL_Y {
-                                    let delta = ev.value();
-                                    mouse_distance
-                                        .fetch_add(delta.unsigned_abs() as u64, Ordering::Release);
+            for (idx, device) in devices.iter_mut().enumerate() {
+                match device.fetch_events() {
+                    Ok(events) => {
+                        for ev in events {
+                            let now = start.elapsed().as_millis() as u64;
 
-                                    if code == REL_X {
-                                        motion_dx = motion_dx.saturating_add(delta as i64);
-                                    } else {
-                                        motion_dy = motion_dy.saturating_add(delta as i64);
-                                    }
-
-                                    let window_expired = now.saturating_sub(motion_window_start_ms)
-                                        > MOTION_WINDOW_MS;
-
-                                    let net_sq = (motion_dx.saturating_mul(motion_dx))
-                                        .saturating_add(motion_dy.saturating_mul(motion_dy));
-                                    let threshold_sq = (mouse_idle_threshold as i64)
-                                        .saturating_mul(mouse_idle_threshold as i64);
-                                    let above_threshold = net_sq >= threshold_sq;
-
-                                    if window_expired || above_threshold {
-                                        if above_threshold {
+                            match ev.event_type() {
+                                evdev::EventType::KEY => {
+                                    if ev.value() == 1 {
+                                        let code = ev.code();
+                                        if BTN_MOUSE_RANGE.contains(&code) {
+                                            mouse_clicks.fetch_add(1, Ordering::Release);
                                             last_activity.store(now, Ordering::Release);
+                                            last_meaningful.store(now, Ordering::Release);
+                                            last_mouse_event = Instant::now();
+                                            if jiggler_enabled {
+                                                mouse_tracker.record(now);
+                                            }
+                                        } else {
+                                            keystrokes.fetch_add(1, Ordering::Release);
+                                            last_activity.store(now, Ordering::Release);
+                                            last_meaningful.store(now, Ordering::Release);
+                                            last_keyboard_event = Instant::now();
+                                            last_keyboard_ms.store(now, Ordering::Release);
+                                            if jiggler_enabled {
+                                                kb_tracker.record(now);
+                                            }
                                         }
-                                        motion_dx = 0;
-                                        motion_dy = 0;
-                                        motion_window_start_ms = now;
                                     }
+                                }
+                                evdev::EventType::RELATIVE => {
+                                    let code = ev.code();
+                                    if code == REL_X || code == REL_Y {
+                                        let delta = ev.value();
+                                        mouse_distance.fetch_add(
+                                            delta.unsigned_abs() as u64,
+                                            Ordering::Release,
+                                        );
 
-                                    last_mouse_event = Instant::now();
-                                    if jiggler_enabled
-                                        && now.saturating_sub(last_mouse_tracker_ms) >= 1000
+                                        if code == REL_X {
+                                            motion_dx = motion_dx.saturating_add(delta as i64);
+                                        } else {
+                                            motion_dy = motion_dy.saturating_add(delta as i64);
+                                        }
+
+                                        let window_expired = now
+                                            .saturating_sub(motion_window_start_ms)
+                                            > MOTION_WINDOW_MS;
+
+                                        let net_sq = (motion_dx.saturating_mul(motion_dx))
+                                            .saturating_add(motion_dy.saturating_mul(motion_dy));
+                                        let threshold_sq = (mouse_idle_threshold as i64)
+                                            .saturating_mul(mouse_idle_threshold as i64);
+                                        let above_threshold = net_sq >= threshold_sq;
+
+                                        if window_expired || above_threshold {
+                                            if above_threshold {
+                                                last_activity.store(now, Ordering::Release);
+                                            }
+                                            motion_dx = 0;
+                                            motion_dy = 0;
+                                            motion_window_start_ms = now;
+                                        }
+
+                                        last_mouse_event = Instant::now();
+                                        if jiggler_enabled
+                                            && now.saturating_sub(last_mouse_tracker_ms) >= 1000
+                                        {
+                                            mouse_tracker.record(now);
+                                            last_mouse_tracker_ms = now;
+                                        }
+                                    } else if code == REL_WHEEL || code == REL_HWHEEL {
+                                        // Only count low-res wheel events; high-res
+                                        // (REL_WHEEL_HI_RES / REL_HWHEEL_HI_RES) duplicate
+                                        // the same physical scroll and would double-count.
+                                        scroll_events.fetch_add(1, Ordering::Release);
+                                        last_activity.store(now, Ordering::Release);
+                                        last_mouse_event = Instant::now();
+                                    } else if code == REL_WHEEL_HI_RES || code == REL_HWHEEL_HI_RES
                                     {
-                                        mouse_tracker.record(now);
-                                        last_mouse_tracker_ms = now;
+                                        // Still update activity timestamp for idle detection,
+                                        // but don't increment scroll_events counter.
+                                        last_activity.store(now, Ordering::Release);
+                                        last_mouse_event = Instant::now();
                                     }
-                                } else if code == REL_WHEEL || code == REL_HWHEEL {
-                                    // Only count low-res wheel events; high-res
-                                    // (REL_WHEEL_HI_RES / REL_HWHEEL_HI_RES) duplicate
-                                    // the same physical scroll and would double-count.
-                                    scroll_events.fetch_add(1, Ordering::Release);
-                                    last_activity.store(now, Ordering::Release);
-                                    last_mouse_event = Instant::now();
-                                } else if code == REL_WHEEL_HI_RES || code == REL_HWHEEL_HI_RES {
-                                    // Still update activity timestamp for idle detection,
-                                    // but don't increment scroll_events counter.
-                                    last_activity.store(now, Ordering::Release);
-                                    last_mouse_event = Instant::now();
                                 }
-                            }
-                            evdev::EventType::ABSOLUTE => {
-                                let code = ev.code();
-                                if code == ABS_X
-                                    || code == ABS_Y
-                                    || code == ABS_MT_POSITION_X
-                                    || code == ABS_MT_POSITION_Y
-                                {
-                                    last_activity.store(now, Ordering::Release);
-                                    last_mouse_event = Instant::now();
+                                evdev::EventType::ABSOLUTE => {
+                                    let code = ev.code();
+                                    if code == ABS_X
+                                        || code == ABS_Y
+                                        || code == ABS_MT_POSITION_X
+                                        || code == ABS_MT_POSITION_Y
+                                    {
+                                        last_activity.store(now, Ordering::Release);
+                                        last_mouse_event = Instant::now();
+                                    }
                                 }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
+                    Err(_) => {
+                        // Device disconnected or error - mark for removal
+                        failed_indices.push(idx);
+                    }
+                }
+            }
+
+            // Remove failed devices in reverse order to preserve indices
+            if !failed_indices.is_empty() {
+                for idx in failed_indices.into_iter().rev() {
+                    eprintln!("Removing dead input device at index {}", idx);
+                    devices.swap_remove(idx);
                 }
             }
             if jiggler_enabled

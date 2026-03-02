@@ -19,6 +19,8 @@ use crate::error::Error;
 pub struct LogindMonitor {
     is_locked: Arc<AtomicBool>,
     suspend_resumed: Arc<AtomicBool>,
+    /// Tracks if any listener thread has died unexpectedly
+    thread_error: Arc<AtomicBool>,
 }
 
 impl LogindMonitor {
@@ -31,6 +33,11 @@ impl LogindMonitor {
     /// after each resume from suspend, then resets to `false`.
     pub fn take_suspend_resumed(&self) -> bool {
         self.suspend_resumed.swap(false, Ordering::AcqRel)
+    }
+
+    /// Check if any listener thread has died. If true, logind monitoring may be degraded.
+    pub fn has_thread_error(&self) -> bool {
+        self.thread_error.load(Ordering::Acquire)
     }
 }
 
@@ -87,6 +94,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
 
     let is_locked = Arc::new(AtomicBool::new(initial_locked));
     let suspend_resumed = Arc::new(AtomicBool::new(false));
+    let thread_error = Arc::new(AtomicBool::new(false));
 
     if initial_locked {
         eprintln!("[logind] Session already locked at startup");
@@ -101,6 +109,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
     // Thread 1: Lock signal → is_locked = true
     {
         let is_locked = Arc::clone(&is_locked);
+        let thread_error = Arc::clone(&thread_error);
         let connection = Connection::system().map_err(|e| {
             Error::Logind(format!(
                 "failed to connect to system bus (lock thread): {e}"
@@ -118,6 +127,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("[logind] Lock listener failed to build proxy: {e}");
+                        thread_error.store(true, Ordering::Release);
                         return;
                     }
                 };
@@ -128,9 +138,13 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                             is_locked.store(true, Ordering::SeqCst);
                             eprintln!("[logind] Lock signal received");
                         }
+                        // Signal iterator ended - thread dying
+                        eprintln!("[logind] Lock signal iterator ended unexpectedly");
+                        thread_error.store(true, Ordering::Release);
                     }
                     Err(e) => {
                         eprintln!("[logind] Failed to subscribe to Lock signal: {e}");
+                        thread_error.store(true, Ordering::Release);
                     }
                 }
             })
@@ -140,6 +154,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
     // Thread 2: Unlock signal → is_locked = false
     {
         let is_locked = Arc::clone(&is_locked);
+        let thread_error = Arc::clone(&thread_error);
         let connection = Connection::system().map_err(|e| {
             Error::Logind(format!(
                 "failed to connect to system bus (unlock thread): {e}"
@@ -157,6 +172,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("[logind] Unlock listener failed to build proxy: {e}");
+                        thread_error.store(true, Ordering::Release);
                         return;
                     }
                 };
@@ -167,9 +183,13 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                             is_locked.store(false, Ordering::SeqCst);
                             eprintln!("[logind] Unlock signal received");
                         }
+                        // Signal iterator ended - thread dying
+                        eprintln!("[logind] Unlock signal iterator ended unexpectedly");
+                        thread_error.store(true, Ordering::Release);
                     }
                     Err(e) => {
                         eprintln!("[logind] Failed to subscribe to Unlock signal: {e}");
+                        thread_error.store(true, Ordering::Release);
                     }
                 }
             })
@@ -179,6 +199,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
     // Thread 3: PrepareForSleep signal → set suspend_resumed on resume (start=false)
     {
         let suspend_resumed = Arc::clone(&suspend_resumed);
+        let thread_error = Arc::clone(&thread_error);
         let connection = Connection::system().map_err(|e| {
             Error::Logind(format!(
                 "failed to connect to system bus (sleep thread): {e}"
@@ -192,6 +213,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                     Ok(m) => m,
                     Err(e) => {
                         eprintln!("[logind] Sleep listener failed to build proxy: {e}");
+                        thread_error.store(true, Ordering::Release);
                         return;
                     }
                 };
@@ -213,9 +235,13 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                                 }
                             }
                         }
+                        // Signal iterator ended - thread dying
+                        eprintln!("[logind] Sleep signal iterator ended unexpectedly");
+                        thread_error.store(true, Ordering::Release);
                     }
                     Err(e) => {
                         eprintln!("[logind] Failed to subscribe to PrepareForSleep signal: {e}");
+                        thread_error.store(true, Ordering::Release);
                     }
                 }
             })
@@ -225,5 +251,6 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
     Ok(LogindMonitor {
         is_locked,
         suspend_resumed,
+        thread_error,
     })
 }
