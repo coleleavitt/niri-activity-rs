@@ -639,7 +639,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 let input = input_stats.snapshot();
                 let jiggler = input_stats.jiggler_detected();
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
-                    let _ = flush_session(
+                    flush_session(
                         &flush_ctx,
                         Some(info),
                         &mut SessionAccum {
@@ -653,7 +653,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         &input,
                         jiggler,
                         FlushReset::NoReset,
-                    );
+                    )?;
                 }
                 windows.clear();
                 for w in &win_list {
