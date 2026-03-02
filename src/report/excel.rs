@@ -1,13 +1,20 @@
 //! Enhanced Excel export with conditional formatting, sparklines, and multi-sheet output.
 
+#[cfg(feature = "excel-extra-sheets")]
 use std::collections::HashMap;
 use std::str::FromStr;
 
+#[cfg(feature = "excel-extra-sheets")]
 use chrono::{Datelike, Local, LocalResult, NaiveDate, Utc};
+#[cfg(not(feature = "excel-extra-sheets"))]
+use chrono::{Local, LocalResult, NaiveDate, Utc};
 use rusqlite::params;
+#[cfg(feature = "excel-extra-sheets")]
 use rust_xlsxwriter::{
     Color, ConditionalFormat3ColorScale, Format, Sparkline, SparklineType, Workbook,
 };
+#[cfg(not(feature = "excel-extra-sheets"))]
+use rust_xlsxwriter::{Color, ConditionalFormat3ColorScale, Format, Workbook};
 
 use crate::config::Category;
 use crate::error::Error;
@@ -63,6 +70,7 @@ fn fmt_delta_pct(delta: f64) -> String {
     format!("{sign}{:.1}%", delta.abs() * 100.0)
 }
 
+#[cfg(feature = "excel-extra-sheets")]
 /// Row from a top-apps query.
 struct TopApp {
     app_id: String,
@@ -70,6 +78,7 @@ struct TopApp {
     total_ms: i64,
 }
 
+#[cfg(feature = "excel-extra-sheets")]
 /// Query the top N apps by total time in a UTC window.
 fn query_top_apps(
     conn: &rusqlite::Connection,
@@ -107,6 +116,7 @@ fn query_top_apps(
     Ok(apps)
 }
 
+#[cfg(feature = "excel-extra-sheets")]
 // ---------------------------------------------------------------------------
 // Weekly aggregation helper
 // ---------------------------------------------------------------------------
@@ -123,6 +133,7 @@ struct WeekBucket {
     day_count: u32,
 }
 
+#[cfg(feature = "excel-extra-sheets")]
 fn aggregate_weeks(daily: &[(NaiveDate, Metrics, bool)]) -> Vec<WeekBucket> {
     let mut map: HashMap<(i32, u32), WeekBucket> = HashMap::new();
 
@@ -180,6 +191,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
 
     // ── Shared formats ──────────────────────────────────────────────────
     let header_fmt = Format::new().set_bold();
+    #[cfg(feature = "excel-extra-sheets")]
     let pct_fmt = Format::new().set_num_format("0.0%");
     let total_fmt = Format::new()
         .set_bold()
@@ -531,170 +543,173 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     }
     daily_sheet.autofit();
 
-    // ====================================================================
-    // Feature 6: Weekly Summary sheet
-    // ====================================================================
-    let weeks = aggregate_weeks(&daily_metrics);
+    #[cfg(feature = "excel-extra-sheets")]
+    {
+        // ================================================================
+        // Weekly Summary sheet
+        // ================================================================
+        let weeks = aggregate_weeks(&daily_metrics);
 
-    let weekly_sheet = workbook.add_worksheet();
-    weekly_sheet.set_name("Weekly Summary").map_err(xlsx_err)?;
+        let weekly_sheet = workbook.add_worksheet();
+        weekly_sheet.set_name("Weekly Summary").map_err(xlsx_err)?;
 
-    let week_headers = [
-        "Week",
-        "Start Date",
-        "End Date",
-        "Total Time",
-        "Productive",
-        "Unproductive",
-        "Prod Ratio",
-        "Avg Daily",
-        "Trend",
-    ];
-    for (col, h) in week_headers.iter().enumerate() {
-        weekly_sheet
-            .write_string_with_format(0, col as u16, *h, &header_fmt)
-            .map_err(xlsx_err)?;
-    }
+        let week_headers = [
+            "Week",
+            "Start Date",
+            "End Date",
+            "Total Time",
+            "Productive",
+            "Unproductive",
+            "Prod Ratio",
+            "Avg Daily",
+            "Trend",
+        ];
+        for (col, h) in week_headers.iter().enumerate() {
+            weekly_sheet
+                .write_string_with_format(0, col as u16, *h, &header_fmt)
+                .map_err(xlsx_err)?;
+        }
 
-    for (widx, w) in weeks.iter().enumerate() {
-        let wrow = (widx as u32).saturating_add(1);
-        let week_label = format!("{}-W{:02}", w.iso_year, w.iso_week);
-        let prod_ratio = if w.total_ms > 0 {
-            w.productive_ms as f64 / w.total_ms as f64
-        } else {
-            0.0
-        };
-        let avg_daily = if w.day_count > 0 {
-            w.total_ms / w.day_count as i64
-        } else {
-            0
-        };
+        for (widx, w) in weeks.iter().enumerate() {
+            let wrow = (widx as u32).saturating_add(1);
+            let week_label = format!("{}-W{:02}", w.iso_year, w.iso_week);
+            let prod_ratio = if w.total_ms > 0 {
+                w.productive_ms as f64 / w.total_ms as f64
+            } else {
+                0.0
+            };
+            let avg_daily = if w.day_count > 0 {
+                w.total_ms / w.day_count as i64
+            } else {
+                0
+            };
 
-        weekly_sheet
-            .write_string(wrow, 0, &week_label)
-            .map_err(xlsx_err)?;
-        weekly_sheet
-            .write_string(wrow, 1, &w.start_date.to_string())
-            .map_err(xlsx_err)?;
-        weekly_sheet
-            .write_string(wrow, 2, &w.end_date.to_string())
-            .map_err(xlsx_err)?;
-        weekly_sheet
-            .write_string(wrow, 3, &fmt_hms(w.total_ms))
-            .map_err(xlsx_err)?;
-        weekly_sheet
-            .write_string(wrow, 4, &fmt_hms(w.productive_ms))
-            .map_err(xlsx_err)?;
-        weekly_sheet
-            .write_string(wrow, 5, &fmt_hms(w.unproductive_ms))
-            .map_err(xlsx_err)?;
-        weekly_sheet
-            .write_number_with_format(wrow, 6, prod_ratio, &pct_fmt)
-            .map_err(xlsx_err)?;
-        weekly_sheet
-            .write_string(wrow, 7, &fmt_hms(avg_daily))
-            .map_err(xlsx_err)?;
-    }
+            weekly_sheet
+                .write_string(wrow, 0, &week_label)
+                .map_err(xlsx_err)?;
+            weekly_sheet
+                .write_string(wrow, 1, &w.start_date.to_string())
+                .map_err(xlsx_err)?;
+            weekly_sheet
+                .write_string(wrow, 2, &w.end_date.to_string())
+                .map_err(xlsx_err)?;
+            weekly_sheet
+                .write_string(wrow, 3, &fmt_hms(w.total_ms))
+                .map_err(xlsx_err)?;
+            weekly_sheet
+                .write_string(wrow, 4, &fmt_hms(w.productive_ms))
+                .map_err(xlsx_err)?;
+            weekly_sheet
+                .write_string(wrow, 5, &fmt_hms(w.unproductive_ms))
+                .map_err(xlsx_err)?;
+            weekly_sheet
+                .write_number_with_format(wrow, 6, prod_ratio, &pct_fmt)
+                .map_err(xlsx_err)?;
+            weekly_sheet
+                .write_string(wrow, 7, &fmt_hms(avg_daily))
+                .map_err(xlsx_err)?;
+        }
 
-    // Feature 9: Sparkline for weekly productivity trend (Prod Ratio col)
-    if weeks.len() >= 2 {
-        let spark_last_row = weeks.len() as u32; // 1-based data rows
-        let sparkline = Sparkline::new()
-            .set_range(("Weekly Summary", 1, 6, spark_last_row, 6))
-            .set_type(SparklineType::Column)
-            .show_high_point(true)
-            .show_low_point(true);
+        // Feature 9: Sparkline for weekly productivity trend (Prod Ratio col)
+        if weeks.len() >= 2 {
+            let spark_last_row = weeks.len() as u32; // 1-based data rows
+            let sparkline = Sparkline::new()
+                .set_range(("Weekly Summary", 1, 6, spark_last_row, 6))
+                .set_type(SparklineType::Column)
+                .show_high_point(true)
+                .show_low_point(true);
 
-        // Place sparkline in col 8 ("Trend") of row 1
-        weekly_sheet
-            .add_sparkline(1, 8, &sparkline)
-            .map_err(xlsx_err)?;
-    }
+            // Place sparkline in col 8 ("Trend") of row 1
+            weekly_sheet
+                .add_sparkline(1, 8, &sparkline)
+                .map_err(xlsx_err)?;
+        }
 
-    // Conditional format on weekly prod ratio
-    if !weeks.is_empty() {
-        let week_last_row = weeks.len() as u32;
-        let cond_w = ConditionalFormat3ColorScale::new()
-            .set_minimum_color(Color::RGB(0xF8696B)) // red
-            .set_midpoint_color(Color::RGB(0xFFEB84)) // yellow
-            .set_maximum_color(Color::RGB(0x63BE7B)); // green
-        weekly_sheet
-            .add_conditional_format(1, 6, week_last_row, 6, &cond_w)
-            .map_err(xlsx_err)?;
-    }
+        // Conditional format on weekly prod ratio
+        if !weeks.is_empty() {
+            let week_last_row = weeks.len() as u32;
+            let cond_w = ConditionalFormat3ColorScale::new()
+                .set_minimum_color(Color::RGB(0xF8696B)) // red
+                .set_midpoint_color(Color::RGB(0xFFEB84)) // yellow
+                .set_maximum_color(Color::RGB(0x63BE7B)); // green
+            weekly_sheet
+                .add_conditional_format(1, 6, week_last_row, 6, &cond_w)
+                .map_err(xlsx_err)?;
+        }
 
-    weekly_sheet.set_freeze_panes(1, 0).map_err(xlsx_err)?;
-    weekly_sheet.autofit();
+        weekly_sheet.set_freeze_panes(1, 0).map_err(xlsx_err)?;
+        weekly_sheet.autofit();
 
-    // ====================================================================
-    // Feature 7: App Breakdown sheet
-    // ====================================================================
-    let until_utc = bounds
-        .until_utc
-        .as_deref()
-        .unwrap_or("9999-12-31T23:59:59+00:00");
+        // ====================================================================
+        // Feature 7: App Breakdown sheet
+        // ====================================================================
+        let until_utc = bounds
+            .until_utc
+            .as_deref()
+            .unwrap_or("9999-12-31T23:59:59+00:00");
 
-    let top_apps = query_top_apps(&app.conn, &bounds.since_utc, until_utc, 20)?;
+        let top_apps = query_top_apps(&app.conn, &bounds.since_utc, until_utc, 20)?;
 
-    let app_sheet = workbook.add_worksheet();
-    app_sheet.set_name("App Breakdown").map_err(xlsx_err)?;
+        let app_sheet = workbook.add_worksheet();
+        app_sheet.set_name("App Breakdown").map_err(xlsx_err)?;
 
-    let app_headers = [
-        "Rank",
-        "App Name",
-        "Category",
-        "Total Time",
-        "% of Total",
-        "Trend",
-    ];
-    for (col, h) in app_headers.iter().enumerate() {
-        app_sheet
-            .write_string_with_format(0, col as u16, *h, &header_fmt)
-            .map_err(xlsx_err)?;
-    }
+        let app_headers = [
+            "Rank",
+            "App Name",
+            "Category",
+            "Total Time",
+            "% of Total",
+            "Trend",
+        ];
+        for (col, h) in app_headers.iter().enumerate() {
+            app_sheet
+                .write_string_with_format(0, col as u16, *h, &header_fmt)
+                .map_err(xlsx_err)?;
+        }
 
-    let grand_total_ms: i64 = top_apps.iter().map(|a| a.total_ms).sum();
+        let grand_total_ms: i64 = top_apps.iter().map(|a| a.total_ms).sum();
 
-    for (aidx, app_row) in top_apps.iter().enumerate() {
-        let arow = (aidx as u32).saturating_add(1);
-        let pct_of_total = if grand_total_ms > 0 {
-            app_row.total_ms as f64 / grand_total_ms as f64
-        } else {
-            0.0
-        };
+        for (aidx, app_row) in top_apps.iter().enumerate() {
+            let arow = (aidx as u32).saturating_add(1);
+            let pct_of_total = if grand_total_ms > 0 {
+                app_row.total_ms as f64 / grand_total_ms as f64
+            } else {
+                0.0
+            };
 
-        app_sheet
-            .write_number(arow, 0, (aidx + 1) as f64)
-            .map_err(xlsx_err)?;
-        app_sheet
-            .write_string(arow, 1, &app_row.app_id)
-            .map_err(xlsx_err)?;
-        app_sheet
-            .write_string(arow, 2, &app_row.category.to_string())
-            .map_err(xlsx_err)?;
-        app_sheet
-            .write_string(arow, 3, &fmt_hms(app_row.total_ms))
-            .map_err(xlsx_err)?;
-        app_sheet
-            .write_number_with_format(arow, 4, pct_of_total, &pct_fmt)
-            .map_err(xlsx_err)?;
-    }
+            app_sheet
+                .write_number(arow, 0, (aidx + 1) as f64)
+                .map_err(xlsx_err)?;
+            app_sheet
+                .write_string(arow, 1, &app_row.app_id)
+                .map_err(xlsx_err)?;
+            app_sheet
+                .write_string(arow, 2, &app_row.category.to_string())
+                .map_err(xlsx_err)?;
+            app_sheet
+                .write_string(arow, 3, &fmt_hms(app_row.total_ms))
+                .map_err(xlsx_err)?;
+            app_sheet
+                .write_number_with_format(arow, 4, pct_of_total, &pct_fmt)
+                .map_err(xlsx_err)?;
+        }
 
-    // Feature 9: Sparkline for app breakdown (% of Total column)
-    if top_apps.len() >= 2 {
-        let app_last_row = top_apps.len() as u32;
-        let app_sparkline = Sparkline::new()
-            .set_range(("App Breakdown", 1, 4, app_last_row, 4))
-            .set_type(SparklineType::Column)
-            .show_high_point(true);
+        // Feature 9: Sparkline for app breakdown (% of Total column)
+        if top_apps.len() >= 2 {
+            let app_last_row = top_apps.len() as u32;
+            let app_sparkline = Sparkline::new()
+                .set_range(("App Breakdown", 1, 4, app_last_row, 4))
+                .set_type(SparklineType::Column)
+                .show_high_point(true);
 
-        app_sheet
-            .add_sparkline(1, 5, &app_sparkline)
-            .map_err(xlsx_err)?;
-    }
+            app_sheet
+                .add_sparkline(1, 5, &app_sparkline)
+                .map_err(xlsx_err)?;
+        }
 
-    app_sheet.set_freeze_panes(1, 0).map_err(xlsx_err)?;
-    app_sheet.autofit();
+        app_sheet.set_freeze_panes(1, 0).map_err(xlsx_err)?;
+        app_sheet.autofit();
+    } // end of excel-extra-sheets feature block
 
     // ── Save ────────────────────────────────────────────────────────────
     workbook.save(path).map_err(xlsx_err)?;

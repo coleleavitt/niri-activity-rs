@@ -26,3 +26,7 @@ zbus = { version = "5", default-features = false, features = ["blocking-api"] }
 rust_xlsxwriter = { git = "https://github.com/coleleavitt/rust_xlsxwriter.git" }
 lettre = "0.11"
 tempfile = "3"
+
+[features]
+default = []
+excel-extra-sheets = []  # Enables Weekly Summary and App Breakdown sheets in Excel export
