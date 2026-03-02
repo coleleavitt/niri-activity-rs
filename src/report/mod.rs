@@ -739,7 +739,6 @@ fn group_apps(flat: Vec<AppBreakdown>, limit: usize) -> Vec<AppGroup> {
             group.children.push(entry);
         } else {
             let idx = groups.len();
-            // Take app_id before moving entry into children to avoid clone
             let app_id = entry.app_id.clone();
             index.insert(app_id.clone(), idx);
             groups.push(AppGroup {
@@ -947,12 +946,7 @@ fn query_streaks(
                 streak_keys = ev.keystrokes;
                 pending_unproductive_ms = 0;
                 streak_app_ms.clear();
-                // Avoid clone on hot path: use entry API with reference check first
-                if let Some(entry) = streak_app_ms.get_mut(&ev.app_id) {
-                    *entry = entry.saturating_add(ev.active_ms);
-                } else {
-                    streak_app_ms.insert(ev.app_id.clone(), ev.active_ms);
-                }
+                streak_app_ms.insert(ev.app_id.clone(), ev.active_ms);
             }
         } else if in_streak {
             pending_unproductive_ms = pending_unproductive_ms.saturating_add(ev.active_ms);

@@ -840,14 +840,14 @@ mpv = "unproductive"
 # Browser-only: one regex rule replaces many substring rules
 [[title_rules]]
 pattern = "YouTube|Instagram|Spotify|Discord|Reddit|TikTok|Twitter|Twitch|Netflix"
-category = \"unproductive\"
+category = "unproductive"
 app = ["zen", "firefox", "chromium", "chromium-browser", "spotify"]
 regex = true
 
 # Global productive patterns
 [[title_rules]]
 pattern = "GitHub|Stack Overflow|docs\.rs|LinkedIn"
-category = \"productive\"
+category = "productive"
 regex = true
 
 

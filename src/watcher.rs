@@ -323,6 +323,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let mut last_loop_instant = Instant::now();
     let mut input_baseline_ms: u64 = input_stats.last_activity_ms();
     let mut session_start_mono_ms: u64 = millis_u64(monitor_start.elapsed());
+    let mut logind_warned = false;
 
     let flush_ctx = FlushContext {
         conn: &conn,
@@ -433,6 +434,14 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         last_loop_instant = now_instant;
 
         let locked_now = logind.is_locked();
+
+        // Check for logind listener thread death (warn once)
+        if !logind_warned && logind.has_thread_error() {
+            eprintln!(
+                "[watcher] Warning: logind listener thread died, lock/suspend detection may be degraded"
+            );
+            logind_warned = true;
+        }
 
         if locked_now && !is_locked {
             if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
@@ -706,7 +715,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     let input = input_stats.snapshot();
                     let jiggler = input_stats.jiggler_detected();
                     if let Some(info) = windows.get(&id) {
-                        let _ = flush_session(
+                        flush_session(
                             &flush_ctx,
                             Some(info),
                             &mut SessionAccum {
@@ -720,7 +729,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             &input,
                             jiggler,
                             FlushReset::NoReset,
-                        );
+                        )?;
                     }
                     focused_id = None;
                     accumulated_active_ms = 0;
