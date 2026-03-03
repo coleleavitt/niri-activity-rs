@@ -261,9 +261,24 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
             let num: f64 = current_num.parse().ok()?;
             current_num.clear();
             match c {
-                'h' => total_ms += (num * 3600.0 * 1000.0) as i64,
-                'm' => total_ms += (num * 60.0 * 1000.0) as i64,
-                's' => total_ms += (num * 1000.0) as i64,
+                'h' => {
+                    let ms = num * 3600.0 * 1000.0;
+                    if ms.is_finite() && ms >= 0.0 && ms <= i64::MAX as f64 {
+                        total_ms += ms as i64;
+                    }
+                }
+                'm' => {
+                    let ms = num * 60.0 * 1000.0;
+                    if ms.is_finite() && ms >= 0.0 && ms <= i64::MAX as f64 {
+                        total_ms += ms as i64;
+                    }
+                }
+                's' => {
+                    let ms = num * 1000.0;
+                    if ms.is_finite() && ms >= 0.0 && ms <= i64::MAX as f64 {
+                        total_ms += ms as i64;
+                    }
+                }
                 _ => {}
             }
         }
@@ -735,7 +750,10 @@ pub(crate) fn load_env_file() -> Result<(), Error> {
                     continue;
                 }
                 if let Some((key, value)) = line.split_once('=') {
-                    // SAFETY: called from main() before any threads are spawned.
+                    // SAFETY: This is called from main() immediately after Cli::parse(),
+                    // before watch() spawns any threads (signal_hook, input monitor, logind).
+                    // std::env::set_var is only unsafe in multi-threaded contexts.
+                    // Do NOT move this call to after watcher::watch() or any thread spawn.
                     unsafe { std::env::set_var(key.trim(), value.trim()) };
                 }
             }

@@ -35,6 +35,11 @@ impl Tab {
     }
 
     fn index(self) -> usize {
+        // Compile-time assertion: TABS length must match variant count
+        const _: () = assert!(
+            TABS.len() == 4,
+            "TABS array length must match Tab variant count"
+        );
         TABS.iter().position(|&t| t == self).unwrap_or(0)
     }
 }

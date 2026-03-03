@@ -38,7 +38,7 @@ fn reclassify_false_active(
     if *active_ms > 0
         && input.keystrokes == 0
         && input.mouse_clicks == 0
-        && *active_ms as u64 >= input_active_ms
+        && u64::try_from(*active_ms).is_ok_and(|ms| ms >= input_active_ms)
     {
         if !quiet {
             eprintln!(
@@ -636,7 +636,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
                     let input = input_stats.snapshot();
                     let jiggler = input_stats.jiggler_detected();
-                    let _ = flush_session(
+                    if let Err(e) = flush_session(
                         &flush_ctx,
                         Some(info),
                         &mut SessionAccum {
@@ -650,7 +650,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         &input,
                         jiggler,
                         FlushReset::NoReset,
-                    );
+                    ) {
+                        eprintln!("[watcher] flush on disconnect failed: {}", e);
+                    }
                 }
                 return Err(Error::NiriError("event stream disconnected".into()));
             }

@@ -695,8 +695,12 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         None
     };
 
-    let away = query_gaps(&app.conn, since_utc, until_utc, &app.config.sleep).ok();
-    let streaks = query_streaks(&app.conn, &app.config, since_utc, until_utc).ok();
+    let away = query_gaps(&app.conn, since_utc, until_utc, &app.config.sleep)
+        .map_err(|e| eprintln!("[report] query_gaps failed: {e}"))
+        .ok();
+    let streaks = query_streaks(&app.conn, &app.config, since_utc, until_utc)
+        .map_err(|e| eprintln!("[report] query_streaks failed: {e}"))
+        .ok();
 
     Ok(ReportData {
         since_str,

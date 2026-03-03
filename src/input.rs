@@ -369,7 +369,8 @@ pub fn start_idle_monitor(
                 match device.fetch_events() {
                     Ok(events) => {
                         for ev in events {
-                            let now = start.elapsed().as_millis() as u64;
+                            let now =
+                                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
                             match ev.event_type() {
                                 evdev::EventType::KEY => {
@@ -483,7 +484,7 @@ pub fn start_idle_monitor(
             if jiggler_enabled
                 && loop_now.duration_since(last_jiggler_check) >= JIGGLER_CHECK_INTERVAL
             {
-                let now_ms = start.elapsed().as_millis() as u64;
+                let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let kb_ms = last_keyboard_ms.load(Ordering::Acquire);
                 let kb_age_ms = now_ms.saturating_sub(kb_ms);
                 let window_ms = jiggler_config.window_secs.saturating_mul(1000);

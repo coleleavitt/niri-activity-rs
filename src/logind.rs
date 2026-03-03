@@ -90,7 +90,10 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
         .map_err(|e| Error::Logind(format!("failed to build session proxy: {e}")))?;
 
     // Read initial LockedHint so we don't miss a lock that happened before we started
-    let initial_locked = session.locked_hint().unwrap_or(false);
+    let initial_locked = session.locked_hint().unwrap_or_else(|e| {
+        eprintln!("[logind] Warning: failed to read initial LockedHint: {e}, assuming unlocked");
+        false
+    });
 
     let is_locked = Arc::new(AtomicBool::new(initial_locked));
     let suspend_resumed = Arc::new(AtomicBool::new(false));

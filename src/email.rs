@@ -116,17 +116,26 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
         .send(&email)
         .map_err(|e| Error::NiriError(format!("Failed to send email: {}", e)))?;
 
-    let total_recipients = email_config.to_addresses.len() + email_config.cc_addresses.len();
-    for recipient in &email_config.to_addresses {
-        println!("Sent report to {}", recipient);
-    }
-    for cc in &email_config.cc_addresses {
-        println!("Sent report to {} (CC)", cc);
-    }
+    let to_count = email_config.to_addresses.len();
+    let cc_count = email_config.cc_addresses.len();
+    let total_recipients = to_count + cc_count;
 
     println!(
-        "Successfully sent {} report ({} to {}) to {} recipient(s)",
-        period_name, bounds.start_date, bounds.end_date, total_recipients
+        "Successfully sent {} report ({} to {}) to {} recipient(s){}{}",
+        period_name,
+        bounds.start_date,
+        bounds.end_date,
+        total_recipients,
+        if to_count > 0 {
+            format!(" [TO: {}]", email_config.to_addresses.join(", "))
+        } else {
+            String::new()
+        },
+        if cc_count > 0 {
+            format!(" [CC: {}]", email_config.cc_addresses.join(", "))
+        } else {
+            String::new()
+        },
     );
 
     Ok(())
