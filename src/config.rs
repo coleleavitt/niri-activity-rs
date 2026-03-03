@@ -264,19 +264,19 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
                 'h' => {
                     let ms = num * 3600.0 * 1000.0;
                     if ms.is_finite() && ms >= 0.0 && ms <= i64::MAX as f64 {
-                        total_ms += ms as i64;
+                        total_ms = total_ms.checked_add(ms as i64)?;
                     }
                 }
                 'm' => {
                     let ms = num * 60.0 * 1000.0;
                     if ms.is_finite() && ms >= 0.0 && ms <= i64::MAX as f64 {
-                        total_ms += ms as i64;
+                        total_ms = total_ms.checked_add(ms as i64)?;
                     }
                 }
                 's' => {
                     let ms = num * 1000.0;
                     if ms.is_finite() && ms >= 0.0 && ms <= i64::MAX as f64 {
-                        total_ms += ms as i64;
+                        total_ms = total_ms.checked_add(ms as i64)?;
                     }
                 }
                 _ => {}
