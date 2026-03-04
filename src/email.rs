@@ -26,7 +26,6 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
     }
 
     let bounds = range.resolve()?;
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
     let filename = format!(
         "activity_report_{}_{}.xlsx",
         bounds.start_date.format("%Y%m%d"),
@@ -279,25 +278,6 @@ pub fn test_email_config(config: &Config) -> Result<(), Error> {
             .unwrap_or("<none>")
     );
 
-    Ok(())
-}
-
-pub fn check_config_permissions(config_path: &Path) -> Result<(), Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::metadata(config_path)
-            .map_err(|e| Error::NiriError(format!("Cannot read config metadata: {}", e)))?;
-        let mode = metadata.permissions().mode();
-        if mode & 0o077 != 0 {
-            eprintln!(
-                "Warning: Config file {} has overly permissive permissions ({:o}).",
-                config_path.display(),
-                mode & 0o777
-            );
-            eprintln!("Consider running: chmod 600 {}", config_path.display());
-        }
-    }
     Ok(())
 }
 

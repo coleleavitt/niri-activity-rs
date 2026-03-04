@@ -751,20 +751,20 @@ pub fn get_config_path() -> Result<PathBuf, Error> {
 /// multi-threaded contexts). Call this once from main() at startup.
 pub(crate) fn load_env_file() -> Result<(), Error> {
     let env_path = get_config_path()?.with_file_name("env");
-    if env_path.exists() {
-        if let Ok(contents) = fs::read_to_string(&env_path) {
-            for line in contents.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((key, value)) = line.split_once('=') {
-                    // SAFETY: This is called from main() immediately after Cli::parse(),
-                    // before watch() spawns any threads (signal_hook, input monitor, logind).
-                    // std::env::set_var is only unsafe in multi-threaded contexts.
-                    // Do NOT move this call to after watcher::watch() or any thread spawn.
-                    unsafe { std::env::set_var(key.trim(), value.trim()) };
-                }
+    if env_path.exists()
+        && let Ok(contents) = fs::read_to_string(&env_path)
+    {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                // SAFETY: This is called from main() immediately after Cli::parse(),
+                // before watch() spawns any threads (signal_hook, input monitor, logind).
+                // std::env::set_var is only unsafe in multi-threaded contexts.
+                // Do NOT move this call to after watcher::watch() or any thread spawn.
+                unsafe { std::env::set_var(key.trim(), value.trim()) };
             }
         }
     }

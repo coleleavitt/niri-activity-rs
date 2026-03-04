@@ -338,37 +338,37 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
 
         // Date (col 0)
         daily_sheet
-            .write_string_with_format(row, 0, &date.to_string(), str_fmt)
+            .write_string_with_format(row, 0, date.to_string(), str_fmt)
             .map_err(xlsx_err)?;
 
         // Screen Time (col 1)
         daily_sheet
-            .write_string_with_format(row, 1, &fmt_hms(m.total_ms), str_fmt)
+            .write_string_with_format(row, 1, fmt_hms(m.total_ms), str_fmt)
             .map_err(xlsx_err)?;
 
         // Productive (col 2)
         daily_sheet
-            .write_string_with_format(row, 2, &fmt_hms(m.productive_ms), str_fmt)
+            .write_string_with_format(row, 2, fmt_hms(m.productive_ms), str_fmt)
             .map_err(xlsx_err)?;
 
         // Unproductive (col 3)
         daily_sheet
-            .write_string_with_format(row, 3, &fmt_hms(m.unproductive_ms), str_fmt)
+            .write_string_with_format(row, 3, fmt_hms(m.unproductive_ms), str_fmt)
             .map_err(xlsx_err)?;
 
         // Undefined (col 4)
         daily_sheet
-            .write_string_with_format(row, 4, &fmt_hms(m.neutral_ms), str_fmt)
+            .write_string_with_format(row, 4, fmt_hms(m.neutral_ms), str_fmt)
             .map_err(xlsx_err)?;
 
         // Prod Active (col 5)
         daily_sheet
-            .write_string_with_format(row, 5, &fmt_hms(m.productive_active_ms), str_fmt)
+            .write_string_with_format(row, 5, fmt_hms(m.productive_active_ms), str_fmt)
             .map_err(xlsx_err)?;
 
         // Prod Passive (col 6)
         daily_sheet
-            .write_string_with_format(row, 6, &fmt_hms(m.productive_passive_ms), str_fmt)
+            .write_string_with_format(row, 6, fmt_hms(m.productive_passive_ms), str_fmt)
             .map_err(xlsx_err)?;
 
         // Productive Ratio (col 7)
@@ -402,7 +402,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
             }
         };
         daily_sheet
-            .write_string_with_format(row, 12, &fmt_delta_hms(delta_productive), delta_fmt)
+            .write_string_with_format(row, 12, fmt_delta_hms(delta_productive), delta_fmt)
             .map_err(xlsx_err)?;
 
         row = row.saturating_add(1);
@@ -489,21 +489,16 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         .write_string_with_format(row, 0, "TOTAL", &total_fmt)
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_string_with_format(
-            row,
-            1,
-            &fmt_hms(sum_truncated_total_secs * 1000),
-            &total_fmt,
-        )
+        .write_string_with_format(row, 1, fmt_hms(sum_truncated_total_secs * 1000), &total_fmt)
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_string_with_format(row, 2, &fmt_hms(sum_truncated_prod_secs * 1000), &total_fmt)
+        .write_string_with_format(row, 2, fmt_hms(sum_truncated_prod_secs * 1000), &total_fmt)
         .map_err(xlsx_err)?;
     daily_sheet
         .write_string_with_format(
             row,
             3,
-            &fmt_hms(sum_truncated_unprod_secs * 1000),
+            fmt_hms(sum_truncated_unprod_secs * 1000),
             &total_fmt,
         )
         .map_err(xlsx_err)?;
@@ -511,7 +506,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         .write_string_with_format(
             row,
             4,
-            &fmt_hms(sum_truncated_neutral_secs * 1000),
+            fmt_hms(sum_truncated_neutral_secs * 1000),
             &total_fmt,
         )
         .map_err(xlsx_err)?;
@@ -519,7 +514,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         .write_string_with_format(
             row,
             5,
-            &fmt_hms(sum_truncated_prod_active_secs * 1000),
+            fmt_hms(sum_truncated_prod_active_secs * 1000),
             &total_fmt,
         )
         .map_err(xlsx_err)?;
@@ -527,7 +522,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         .write_string_with_format(
             row,
             6,
-            &fmt_hms(sum_truncated_prod_passive_secs * 1000),
+            fmt_hms(sum_truncated_prod_passive_secs * 1000),
             &total_fmt,
         )
         .map_err(xlsx_err)?;
@@ -538,10 +533,10 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         .write_number_with_format(row, 8, total_prod_active_pct, &total_pct_fmt)
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_string_with_format(row, 9, &fmt_hms(avg_total_ms), &total_fmt)
+        .write_string_with_format(row, 9, fmt_hms(avg_total_ms), &total_fmt)
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_string_with_format(row, 10, &fmt_hms(avg_productive_ms), &total_fmt)
+        .write_string_with_format(row, 10, fmt_hms(avg_productive_ms), &total_fmt)
         .map_err(xlsx_err)?;
     daily_sheet
         .write_number_with_format(row, 11, workdays as f64, &total_fmt)

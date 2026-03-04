@@ -390,8 +390,8 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
         unproductive_ms: i64,
         idle_ms: i64,
         keystrokes: i64,
-        dominant_app: String,
-        dominant_app_ms: i64,
+        /// Cumulative time per app_id, for computing true dominant app
+        app_totals: HashMap<String, i64>,
     }
 
     let mut bucket_map: std::collections::BTreeMap<u32, BucketAcc> =
@@ -412,8 +412,7 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
             unproductive_ms: 0,
             idle_ms: 0,
             keystrokes: 0,
-            dominant_app: String::new(),
-            dominant_app_ms: 0,
+            app_totals: HashMap::new(),
         });
 
         match Category::from_str(&ev.category).unwrap_or(Category::Neutral) {
@@ -423,29 +422,34 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
             }
             Category::Neutral => b.neutral_ms = b.neutral_ms.saturating_add(total_ms),
         }
-        b.idle_ms = b
-            .idle_ms
-            .saturating_add(ev.passive_ms)
-            .saturating_add(ev.idle_ms);
+        // Only count actual idle time, not passive (passive is already included in category totals)
+        b.idle_ms = b.idle_ms.saturating_add(ev.idle_ms);
         b.keystrokes = b.keystrokes.saturating_add(ev.keystrokes);
 
-        if total_ms > b.dominant_app_ms {
-            b.dominant_app_ms = total_ms;
-            b.dominant_app.clone_from(&ev.app_id);
-        }
+        // Accumulate per-app time so dominant app reflects total time, not single-event max
+        let app_entry = b.app_totals.entry(ev.app_id.clone()).or_insert(0);
+        *app_entry = app_entry.saturating_add(total_ms);
     }
 
     let buckets = bucket_map
         .into_iter()
-        .map(|(key, b)| TimelineBucket {
-            hour: key / 60,
-            minute: key % 60,
-            productive_ms: b.productive_ms,
-            neutral_ms: b.neutral_ms,
-            unproductive_ms: b.unproductive_ms,
-            idle_ms: b.idle_ms,
-            keystrokes: b.keystrokes,
-            dominant_app: b.dominant_app,
+        .map(|(key, b)| {
+            let dominant_app = b
+                .app_totals
+                .iter()
+                .max_by_key(|(_, ms)| *ms)
+                .map(|(app, _)| app.clone())
+                .unwrap_or_default();
+            TimelineBucket {
+                hour: key / 60,
+                minute: key % 60,
+                productive_ms: b.productive_ms,
+                neutral_ms: b.neutral_ms,
+                unproductive_ms: b.unproductive_ms,
+                idle_ms: b.idle_ms,
+                keystrokes: b.keystrokes,
+                dominant_app,
+            }
         })
         .collect();
 
@@ -611,7 +615,8 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         // ms_left_in_hour = ms until the next hour starts
         let minute = local_dt.minute() as i64;
         let second = local_dt.second() as i64;
-        let ms_into_hour = (minute * 60 + second) * 1000;
+        let millis = (local_dt.nanosecond() / 1_000_000) as i64;
+        let ms_into_hour = (minute * 60 + second) * 1000 + millis;
         let ms_left_in_hour = 3_600_000_i64.saturating_sub(ms_into_hour).max(1);
 
         let mut remaining_ms = total;
@@ -1393,10 +1398,6 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
     Ok(())
 }
 
-pub fn generate_report(app: &App, days: u32) -> Result<(), Error> {
-    generate_report_range(app, TimeRange::Days(days))
-}
-
 pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
     let data = query_report_range(app, range)?;
 
@@ -1737,53 +1738,53 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
         );
     }
 
-    if let Some(away) = &data.away {
-        if !away.summaries.is_empty() {
+    if let Some(away) = &data.away
+        && !away.summaries.is_empty()
+    {
+        println!(
+            "\n{}",
+            section_header("── Away Time ─────────────────────────────────────────")
+        );
+
+        // Visible col layout: "  X label:  " padded to col 20, then right-aligned duration
+        // Using text symbols (1-col wide) to avoid emoji width inconsistencies
+        let col_target: usize = 20;
+        for summary in &away.summaries {
+            let (icon, label_colored, visible_cols) = match summary.gap_type {
+                GapType::Sleep => ("◑".blue().to_string(), "Sleep:".blue().to_string(), 8),
+                GapType::LongBreak => (
+                    "◐".yellow().to_string(),
+                    "Long Break:".yellow().to_string(),
+                    13,
+                ),
+                GapType::ShortBreak => (
+                    "◌".dimmed().to_string(),
+                    "Short Break:".dimmed().to_string(),
+                    14,
+                ),
+            };
+            let total_str = fmt_duration(summary.total_ms);
+            let avg_str = fmt_duration(summary.avg_ms);
+            let pad = col_target.saturating_sub(visible_cols);
+
             println!(
-                "\n{}",
-                section_header("── Away Time ─────────────────────────────────────────")
-            );
-
-            // Visible col layout: "  X label:  " padded to col 20, then right-aligned duration
-            // Using text symbols (1-col wide) to avoid emoji width inconsistencies
-            let col_target: usize = 20;
-            for summary in &away.summaries {
-                let (icon, label_colored, visible_cols) = match summary.gap_type {
-                    GapType::Sleep => ("◑".blue().to_string(), "Sleep:".blue().to_string(), 8),
-                    GapType::LongBreak => (
-                        "◐".yellow().to_string(),
-                        "Long Break:".yellow().to_string(),
-                        13,
-                    ),
-                    GapType::ShortBreak => (
-                        "◌".dimmed().to_string(),
-                        "Short Break:".dimmed().to_string(),
-                        14,
-                    ),
-                };
-                let total_str = fmt_duration(summary.total_ms);
-                let avg_str = fmt_duration(summary.avg_ms);
-                let pad = col_target.saturating_sub(visible_cols);
-
-                println!(
-                    "  {} {}{}{:>8} total  ({} × {} avg)",
-                    icon,
-                    label_colored,
-                    " ".repeat(pad),
-                    total_str.bold(),
-                    summary.count,
-                    avg_str.dimmed(),
-                );
-            }
-
-            let pad = col_target.saturating_sub(13) + 1;
-            println!(
-                "  {}{}{:>8}",
-                "Total Away:".dimmed(),
+                "  {} {}{}{:>8} total  ({} × {} avg)",
+                icon,
+                label_colored,
                 " ".repeat(pad),
-                fmt_duration(away.total_away_ms).dimmed(),
+                total_str.bold(),
+                summary.count,
+                avg_str.dimmed(),
             );
         }
+
+        let pad = col_target.saturating_sub(13) + 1;
+        println!(
+            "  {}{}{:>8}",
+            "Total Away:".dimmed(),
+            " ".repeat(pad),
+            fmt_duration(away.total_away_ms).dimmed(),
+        );
     }
 
     println!(
@@ -1803,40 +1804,40 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
         );
     }
 
-    if let Some(streaks) = &data.streaks {
-        if streaks.total_productive_streaks > 0 {
-            println!(
-                "\n{}",
-                section_header("── Focus Streaks ─────────────────────────────────────")
-            );
+    if let Some(streaks) = &data.streaks
+        && streaks.total_productive_streaks > 0
+    {
+        println!(
+            "\n{}",
+            section_header("── Focus Streaks ─────────────────────────────────────")
+        );
 
-            println!(
-                "  Longest Streak:     {} in {}",
-                fmt_duration(streaks.longest_productive_ms).green().bold(),
-                streaks.longest_productive_app.bold()
-            );
-            println!(
-                "  Average Streak:     {}",
-                fmt_duration(streaks.avg_productive_streak_ms)
-            );
-            println!(
-                "  Total Streaks:      {} (5+ min productive sessions)",
-                streaks.total_productive_streaks
-            );
+        println!(
+            "  Longest Streak:     {} in {}",
+            fmt_duration(streaks.longest_productive_ms).green().bold(),
+            streaks.longest_productive_app.bold()
+        );
+        println!(
+            "  Average Streak:     {}",
+            fmt_duration(streaks.avg_productive_streak_ms)
+        );
+        println!(
+            "  Total Streaks:      {} (5+ min productive sessions)",
+            streaks.total_productive_streaks
+        );
 
-            if !streaks.top_streaks.is_empty() {
-                println!();
-                for (i, streak) in streaks.top_streaks.iter().enumerate() {
-                    let rank = format!("{}.", i + 1);
-                    println!(
-                        "  {:>3} {:>8}  {}  {} keys  {}",
-                        rank.dimmed(),
-                        fmt_duration(streak.duration_ms).green(),
-                        streak.start_time.dimmed(),
-                        streak.keystrokes,
-                        truncate(&streak.app_id, 20),
-                    );
-                }
+        if !streaks.top_streaks.is_empty() {
+            println!();
+            for (i, streak) in streaks.top_streaks.iter().enumerate() {
+                let rank = format!("{}.", i + 1);
+                println!(
+                    "  {:>3} {:>8}  {}  {} keys  {}",
+                    rank.dimmed(),
+                    fmt_duration(streak.duration_ms).green(),
+                    streak.start_time.dimmed(),
+                    streak.keystrokes,
+                    truncate(&streak.app_id, 20),
+                );
             }
         }
     }
@@ -2007,10 +2008,6 @@ pub fn show_comparison(app: &App, range: TimeRange) -> Result<(), Error> {
 // ---------------------------------------------------------------------------
 // Export functions
 // ---------------------------------------------------------------------------
-
-pub fn export_csv(app: &App, days: u32) -> Result<(), Error> {
-    export_csv_range(app, TimeRange::Days(days))
-}
 
 pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
     let bounds = range.resolve()?;

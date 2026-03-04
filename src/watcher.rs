@@ -379,8 +379,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         let time_jump_secs = wall_elapsed_secs.saturating_sub(mono_elapsed_secs);
 
         // Suspend/resume detection: wall-clock jump OR D-Bus PrepareForSleep(false).
-        // `take_suspend_resumed()` has a side-effect (clears the flag), so call it
+        // `take_suspend_resumed()` clears the flag atomically (swap), so we call it
         // every iteration regardless of whether the wall-clock path fires.
+        // When both detect resume simultaneously, wall_clock_resume takes priority
+        // and dbus_resume is suppressed — both indicate the same physical event.
         let wall_clock_resume = time_jump_secs > SUSPEND_JUMP_THRESHOLD_SECS;
         let dbus_resume_signalled = logind.take_suspend_resumed();
         let dbus_resume = dbus_resume_signalled && !wall_clock_resume;
@@ -425,6 +427,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     new_session_mono_ms: millis_u64(monitor_start.elapsed()),
                 },
             )?;
+            // Post-resume invariants:
+            // - current_state = Active prevents false idle/away transitions
+            // - last_idle_check = now_instant prevents elapsed_since_last_check spike
+            // - FlushReset::Full resets baselines so idle_duration_ms starts fresh
             current_state = ActivityState::Active;
             last_idle_check = now_instant;
             last_flush = now_instant;

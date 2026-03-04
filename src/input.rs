@@ -87,15 +87,21 @@ struct IntervalTracker {
     window_ms: u64,
     min_events: usize,
     variance_threshold_ms: u64,
+    /// Hard cap on deque size to prevent unbounded growth
+    max_capacity: usize,
 }
 
 impl IntervalTracker {
     fn new(config: &JigglerConfig) -> Self {
+        // Hard cap: even at 1 event/ms for a 5-min window, 300k entries is extreme.
+        // 10_000 is generous for jiggler detection (typically ~1/sec over 2 min = 120).
+        const MAX_TRACKER_CAPACITY: usize = 10_000;
         Self {
             timestamps_ms: VecDeque::with_capacity(256),
             window_ms: config.window_secs.saturating_mul(1000),
             min_events: config.min_events,
             variance_threshold_ms: config.variance_threshold_ms,
+            max_capacity: MAX_TRACKER_CAPACITY,
         }
     }
 
@@ -108,6 +114,10 @@ impl IntervalTracker {
             } else {
                 break;
             }
+        }
+        // Hard cap: drop oldest entries if deque exceeds max_capacity
+        while self.timestamps_ms.len() > self.max_capacity {
+            self.timestamps_ms.pop_front();
         }
     }
 
@@ -235,83 +245,95 @@ pub fn start_idle_monitor(
     let devices_changed = Arc::new(AtomicBool::new(false));
     let devices_changed_clone = Arc::clone(&devices_changed);
 
-    thread::spawn(move || {
-        let mut inotify = match Inotify::init() {
-            Ok(i) => i,
-            Err(e) => {
+    // Detached thread: runs for process lifetime monitoring /dev/input hotplug.
+    // JoinHandle intentionally dropped — thread terminates with process exit.
+    let _ = thread::Builder::new()
+        .name("input-hotplug".into())
+        .spawn(move || {
+            let mut inotify = match Inotify::init() {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to init inotify: {}. Device hotplug disabled.",
+                        e
+                    );
+                    return;
+                }
+            };
+
+            if let Err(e) = inotify
+                .watches()
+                .add("/dev/input", WatchMask::CREATE | WatchMask::DELETE)
+            {
                 eprintln!(
-                    "Warning: Failed to init inotify: {}. Device hotplug disabled.",
+                    "Warning: Failed to watch /dev/input: {}. Device hotplug disabled.",
                     e
                 );
                 return;
             }
-        };
 
-        if let Err(e) = inotify
-            .watches()
-            .add("/dev/input", WatchMask::CREATE | WatchMask::DELETE)
-        {
-            eprintln!(
-                "Warning: Failed to watch /dev/input: {}. Device hotplug disabled.",
-                e
-            );
-            return;
-        }
-
-        let mut buffer = [0; 1024];
-        // JPL-R11: bounded by process lifetime — inotify::read_events_blocking
-        // blocks on kernel I/O and terminates when the process exits.
-        let mut inotify_iterations: u64 = 0;
-        const MAX_INOTIFY_ITERATIONS: u64 = u64::MAX;
-        loop {
-            inotify_iterations = inotify_iterations.saturating_add(1);
-            if inotify_iterations == MAX_INOTIFY_ITERATIONS {
-                eprintln!("inotify loop reached iteration limit, exiting");
-                break;
-            }
-            match inotify.read_events_blocking(&mut buffer) {
-                Ok(events) => {
-                    for event in events {
-                        if let Some(name) = event.name {
-                            let name_str = name.to_string_lossy();
-                            if name_str.starts_with("event") {
-                                eprintln!("Input device changed: {:?}", name);
-                                devices_changed_clone.store(true, Ordering::SeqCst);
+            let mut buffer = [0; 1024];
+            // JPL-R11: bounded by process lifetime — inotify::read_events_blocking
+            // blocks on kernel I/O and terminates when the process exits.
+            let mut inotify_iterations: u64 = 0;
+            const MAX_INOTIFY_ITERATIONS: u64 = u64::MAX;
+            loop {
+                inotify_iterations = inotify_iterations.saturating_add(1);
+                if inotify_iterations == MAX_INOTIFY_ITERATIONS {
+                    eprintln!("inotify loop reached iteration limit, exiting");
+                    break;
+                }
+                match inotify.read_events_blocking(&mut buffer) {
+                    Ok(events) => {
+                        for event in events {
+                            if let Some(name) = event.name {
+                                let name_str = name.to_string_lossy();
+                                if name_str.starts_with("event") {
+                                    eprintln!("Input device changed: {:?}", name);
+                                    devices_changed_clone.store(true, Ordering::SeqCst);
+                                }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    eprintln!("inotify error: {}", e);
-                    thread::sleep(Duration::from_secs(1));
+                    Err(e) => {
+                        eprintln!("inotify error: {}", e);
+                        thread::sleep(Duration::from_secs(1));
+                    }
                 }
             }
-        }
-    });
+        });
 
     if jiggler_config.enabled {
         let jiggler_process_flag = Arc::clone(&stats.jiggler_process);
         let blacklist = jiggler_config.process_blacklist.clone();
-        thread::spawn(move || {
-            // JPL-R11: bounded by process lifetime — sleeps 30s between iterations.
-            let mut jiggler_iterations: u64 = 0;
-            const MAX_JIGGLER_ITERATIONS: u64 = u64::MAX;
-            loop {
-                jiggler_iterations = jiggler_iterations.saturating_add(1);
-                if jiggler_iterations == MAX_JIGGLER_ITERATIONS {
-                    eprintln!("jiggler scan loop reached iteration limit, exiting");
-                    break;
+        // Detached thread: runs for process lifetime scanning for jiggler processes.
+        // JoinHandle intentionally dropped — thread terminates with process exit.
+        let _ = thread::Builder::new()
+            .name("jiggler-scan".into())
+            .spawn(move || {
+                // JPL-R11: bounded by process lifetime — sleeps 30s between iterations.
+                let mut jiggler_iterations: u64 = 0;
+                const MAX_JIGGLER_ITERATIONS: u64 = u64::MAX;
+                loop {
+                    jiggler_iterations = jiggler_iterations.saturating_add(1);
+                    if jiggler_iterations == MAX_JIGGLER_ITERATIONS {
+                        eprintln!("jiggler scan loop reached iteration limit, exiting");
+                        break;
+                    }
+                    let found = scan_jiggler_processes(&blacklist);
+                    jiggler_process_flag.store(found, Ordering::Release);
+                    thread::sleep(Duration::from_secs(30));
                 }
-                let found = scan_jiggler_processes(&blacklist);
-                jiggler_process_flag.store(found, Ordering::Release);
-                thread::sleep(Duration::from_secs(30));
-            }
-        });
+            });
     }
 
     let jiggler_enabled = jiggler_config.enabled;
 
-    thread::spawn(move || {
+    // Detached thread: runs for process lifetime polling input devices.
+    // JoinHandle intentionally dropped — thread terminates with process exit.
+    let _ = thread::Builder::new()
+        .name("input-poll".into())
+        .spawn(move || {
         let mut devices = enumerate_input_devices();
 
         if devices.is_empty() {
@@ -391,8 +413,8 @@ pub fn start_idle_monitor(
                         let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
                         match ev.event_type() {
-                            evdev::EventType::KEY => {
-                                if ev.value() == 1 {
+                            evdev::EventType::KEY
+                                if ev.value() == 1 => {
                                     let code = ev.code();
                                     if BTN_MOUSE_RANGE.contains(&code) {
                                         mouse_clicks.fetch_add(1, Ordering::Release);
@@ -413,7 +435,6 @@ pub fn start_idle_monitor(
                                         }
                                     }
                                 }
-                            }
                             evdev::EventType::RELATIVE => {
                                 let code = ev.code();
                                 if code == REL_X || code == REL_Y {

@@ -132,7 +132,7 @@ fn run_loop(app: &mut TuiApp, mut terminal: DefaultTerminal) -> Result<(), Error
     loop {
         terminal
             .draw(|frame| render(app, frame))
-            .map_err(|e| Error::Io(e))?;
+            .map_err(Error::Io)?;
         if app.quit {
             return Ok(());
         }

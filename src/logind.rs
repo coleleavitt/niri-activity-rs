@@ -137,7 +137,14 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
 
                 match session.receive_lock() {
                     Ok(mut signals) => {
+                        // JPL-R11: bounded by process lifetime — blocks on D-Bus I/O.
+                        let mut iterations: u64 = 0;
                         while signals.next().is_some() {
+                            iterations = iterations.saturating_add(1);
+                            if iterations == u64::MAX {
+                                eprintln!("[logind] Lock signal loop reached iteration limit");
+                                break;
+                            }
                             is_locked.store(true, Ordering::Release);
                             eprintln!("[logind] Lock signal received");
                         }
@@ -182,7 +189,14 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
 
                 match session.receive_unlock() {
                     Ok(mut signals) => {
+                        // JPL-R11: bounded by process lifetime — blocks on D-Bus I/O.
+                        let mut iterations: u64 = 0;
                         while signals.next().is_some() {
+                            iterations = iterations.saturating_add(1);
+                            if iterations == u64::MAX {
+                                eprintln!("[logind] Unlock signal loop reached iteration limit");
+                                break;
+                            }
                             is_locked.store(false, Ordering::Release);
                             eprintln!("[logind] Unlock signal received");
                         }
@@ -223,7 +237,14 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
 
                 match manager.receive_prepare_for_sleep() {
                     Ok(signals) => {
+                        // JPL-R11: bounded by process lifetime — blocks on D-Bus I/O.
+                        let mut iterations: u64 = 0;
                         for signal in signals {
+                            iterations = iterations.saturating_add(1);
+                            if iterations == u64::MAX {
+                                eprintln!("[logind] Sleep signal loop reached iteration limit");
+                                break;
+                            }
                             match signal.args() {
                                 Ok(args) => {
                                     if args.start {

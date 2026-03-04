@@ -189,6 +189,18 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
 }
 
 pub fn reclassify_all(conn: &mut Connection, config: &Config) -> Result<(), Error> {
+    // Safety: check row count before loading all rows into memory.
+    // For databases with >5M events, this could use significant RAM.
+    const MAX_RECLASSIFY_ROWS: i64 = 5_000_000;
+    let row_count: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+    if row_count > MAX_RECLASSIFY_ROWS {
+        eprintln!(
+            "Warning: {} events exceeds reclassify limit ({}), skipping bulk reclassify",
+            row_count, MAX_RECLASSIFY_ROWS
+        );
+        return Ok(());
+    }
+
     let rows: Vec<(i64, String, String, String)> = {
         let mut stmt = conn.prepare("SELECT id, app_id, title, category FROM events")?;
         stmt.query_map([], |row| {
