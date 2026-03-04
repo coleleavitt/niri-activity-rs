@@ -135,7 +135,9 @@ pub fn colored_bar(prod_frac: f64, neutral_frac: f64, _unprod_frac: f64, width: 
     let total_used = prod_chars.saturating_add(neutral_chars);
     let (prod_chars, neutral_chars) = if total_used > width {
         let excess = total_used.saturating_sub(width);
-        (prod_chars, neutral_chars.saturating_sub(excess))
+        let new_neutral = neutral_chars.saturating_sub(excess);
+        let remaining = excess.saturating_sub(neutral_chars);
+        (prod_chars.saturating_sub(remaining), new_neutral)
     } else {
         (prod_chars, neutral_chars)
     };

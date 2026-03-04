@@ -594,7 +594,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
         }
         (false, false) => {
             if let Some((prefix, suffix)) = pattern.split_once('*') {
-                prefix.len() + suffix.len() <= value.len()
+                prefix.len() + suffix.len() < value.len()
                     && value.starts_with(prefix)
                     && value.ends_with(suffix)
             } else {

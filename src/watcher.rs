@@ -356,7 +356,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     jiggler,
                     FlushReset::NoReset,
                 )?;
-                let total = flushed.active_ms + flushed.passive_ms + flushed.idle_ms;
+                let total = flushed
+                    .active_ms
+                    .saturating_add(flushed.passive_ms)
+                    .saturating_add(flushed.idle_ms);
                 eprintln!(
                     "Flushed: {} ({}ms active, {}ms passive, {}ms idle)",
                     info.app_id, flushed.active_ms, flushed.passive_ms, flushed.idle_ms
@@ -624,7 +627,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         },
                     )?;
                     if !quiet {
-                        let total = flushed.active_ms + flushed.passive_ms + flushed.idle_ms;
+                        let total = flushed
+                            .active_ms
+                            .saturating_add(flushed.passive_ms)
+                            .saturating_add(flushed.idle_ms);
                         eprintln!(
                             "{} {} ({})",
                             "[flush]".dimmed(),
@@ -789,7 +795,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         FlushReset::NoReset,
                     )?;
 
-                    let total = flushed.active_ms + flushed.passive_ms + flushed.idle_ms;
+                    let total = flushed
+                        .active_ms
+                        .saturating_add(flushed.passive_ms)
+                        .saturating_add(flushed.idle_ms);
 
                     let category = config.classify(&info.app_id, &info.title);
                     if category == Category::Neutral
@@ -799,14 +808,15 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             .create(true)
                             .append(true)
                             .open(&untracked_log_path)
+                        && let Err(e) = writeln!(file, "{}", info.app_id)
                     {
-                        let _ = writeln!(file, "{}", info.app_id);
+                        eprintln!("Warning: failed to write to untracked log: {}", e);
                     }
 
                     if !quiet && total >= 500 {
                         let idle_pct = if total > 0 {
                             ((flushed.passive_ms + flushed.idle_ms) as f64 / total as f64 * 100.0)
-                                as u32
+                                .round() as u32
                         } else {
                             0
                         };

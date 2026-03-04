@@ -204,7 +204,13 @@ pub fn enumerate_input_devices() -> Vec<evdev::Device> {
             if has_keys || has_relative || has_absolute {
                 match evdev::Device::open(&path) {
                     Ok(dev) => {
-                        let _ = dev.set_nonblocking(true);
+                        if let Err(e) = dev.set_nonblocking(true) {
+                            eprintln!(
+                                "Warning: failed to set nonblocking on {}: {}",
+                                path.display(),
+                                e
+                            );
+                        }
                         Some(dev)
                     }
                     Err(_) => None,
@@ -453,8 +459,8 @@ pub fn start_idle_monitor(
 
                                     let net_sq = (motion_dx.saturating_mul(motion_dx))
                                         .saturating_add(motion_dy.saturating_mul(motion_dy));
-                                    let threshold_sq = (mouse_idle_threshold as i64)
-                                        .saturating_mul(mouse_idle_threshold as i64);
+                                    let threshold_i64 = i64::try_from(mouse_idle_threshold).unwrap_or(i64::MAX);
+                                    let threshold_sq = threshold_i64.saturating_mul(threshold_i64);
                                     let above_threshold = net_sq >= threshold_sq;
 
                                     if window_expired || above_threshold {

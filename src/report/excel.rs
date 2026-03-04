@@ -489,16 +489,26 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         .write_string_with_format(row, 0, "TOTAL", &total_fmt)
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_string_with_format(row, 1, fmt_hms(sum_truncated_total_secs * 1000), &total_fmt)
+        .write_string_with_format(
+            row,
+            1,
+            fmt_hms(sum_truncated_total_secs.saturating_mul(1000)),
+            &total_fmt,
+        )
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_string_with_format(row, 2, fmt_hms(sum_truncated_prod_secs * 1000), &total_fmt)
+        .write_string_with_format(
+            row,
+            2,
+            fmt_hms(sum_truncated_prod_secs.saturating_mul(1000)),
+            &total_fmt,
+        )
         .map_err(xlsx_err)?;
     daily_sheet
         .write_string_with_format(
             row,
             3,
-            fmt_hms(sum_truncated_unprod_secs * 1000),
+            fmt_hms(sum_truncated_unprod_secs.saturating_mul(1000)),
             &total_fmt,
         )
         .map_err(xlsx_err)?;
@@ -506,7 +516,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         .write_string_with_format(
             row,
             4,
-            fmt_hms(sum_truncated_neutral_secs * 1000),
+            fmt_hms(sum_truncated_neutral_secs.saturating_mul(1000)),
             &total_fmt,
         )
         .map_err(xlsx_err)?;
@@ -514,7 +524,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         .write_string_with_format(
             row,
             5,
-            fmt_hms(sum_truncated_prod_active_secs * 1000),
+            fmt_hms(sum_truncated_prod_active_secs.saturating_mul(1000)),
             &total_fmt,
         )
         .map_err(xlsx_err)?;
@@ -522,7 +532,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         .write_string_with_format(
             row,
             6,
-            fmt_hms(sum_truncated_prod_passive_secs * 1000),
+            fmt_hms(sum_truncated_prod_passive_secs.saturating_mul(1000)),
             &total_fmt,
         )
         .map_err(xlsx_err)?;

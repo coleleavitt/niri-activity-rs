@@ -404,7 +404,10 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
 
         let minutes_since_midnight = ts.hour() * 60 + ts.minute();
         let bucket_key = minutes_since_midnight / bucket_min * bucket_min;
-        let total_ms = ev.active_ms + ev.passive_ms + ev.idle_ms;
+        let total_ms = ev
+            .active_ms
+            .saturating_add(ev.passive_ms)
+            .saturating_add(ev.idle_ms);
 
         let b = bucket_map.entry(bucket_key).or_insert_with(|| BucketAcc {
             productive_ms: 0,
@@ -1340,7 +1343,10 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
     let bar_width: usize = 20;
 
     for b in &data.buckets {
-        let total = b.productive_ms + b.neutral_ms + b.unproductive_ms;
+        let total = b
+            .productive_ms
+            .saturating_add(b.neutral_ms)
+            .saturating_add(b.unproductive_ms);
         if total == 0 {
             continue;
         }
@@ -1623,19 +1629,23 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             let mut unprod_ms: i64 = 0;
             for child in &group.children {
                 match child.category {
-                    Category::Productive => prod_ms += child.total_ms,
-                    Category::Neutral => neutral_ms += child.total_ms,
-                    Category::Unproductive => unprod_ms += child.total_ms,
+                    Category::Productive => prod_ms = prod_ms.saturating_add(child.total_ms),
+                    Category::Neutral => neutral_ms = neutral_ms.saturating_add(child.total_ms),
+                    Category::Unproductive => unprod_ms = unprod_ms.saturating_add(child.total_ms),
                 }
             }
-            let bar = format!(
-                "{}{}",
-                colored_bar(
+            let (prod_frac, neutral_frac, unprod_frac) = if group.total_ms > 0 {
+                (
                     prod_ms as f64 / group.total_ms as f64,
                     neutral_ms as f64 / group.total_ms as f64,
                     unprod_ms as f64 / group.total_ms as f64,
-                    filled,
-                ),
+                )
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            let bar = format!(
+                "{}{}",
+                colored_bar(prod_frac, neutral_frac, unprod_frac, filled),
                 " ".repeat(BAR_WIDTH.saturating_sub(filled))
             );
 
@@ -1849,7 +1859,9 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
 
 pub fn show_comparison(app: &App, range: TimeRange) -> Result<(), Error> {
     let current_bounds = range.resolve()?;
-    let current_days = (current_bounds.end_date - current_bounds.start_date).num_days() + 1;
+    let current_days = (current_bounds.end_date - current_bounds.start_date)
+        .num_days()
+        .saturating_add(1);
 
     // Calculate previous period
     let prev_end = current_bounds.start_date - chrono::Duration::days(1);
