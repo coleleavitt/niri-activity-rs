@@ -577,9 +577,18 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 i64::try_from(now_instant.duration_since(last_idle_check).as_millis())
                     .unwrap_or(i64::MAX);
             match current_state {
-                ActivityState::Active => accumulated_active_ms += elapsed_since_last_check,
-                ActivityState::Passive => accumulated_passive_ms += elapsed_since_last_check,
-                ActivityState::Idle => accumulated_idle_ms += elapsed_since_last_check,
+                ActivityState::Active => {
+                    accumulated_active_ms =
+                        accumulated_active_ms.saturating_add(elapsed_since_last_check)
+                }
+                ActivityState::Passive => {
+                    accumulated_passive_ms =
+                        accumulated_passive_ms.saturating_add(elapsed_since_last_check)
+                }
+                ActivityState::Idle => {
+                    accumulated_idle_ms =
+                        accumulated_idle_ms.saturating_add(elapsed_since_last_check)
+                }
                 ActivityState::Locked | ActivityState::Away => {}
             }
             last_idle_check = now_instant;

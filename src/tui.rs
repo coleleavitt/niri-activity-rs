@@ -84,11 +84,16 @@ impl TuiApp {
     }
 
     fn reload(&mut self) {
-        if let Ok(app) = App::open() {
-            self.today = query_today(&app).ok();
-            self.metrics = query_metrics_range(&app, self.range.clone()).ok();
-            self.timeline = query_timeline(&app, 0, 15).ok();
-            self.report = query_report_range(&app, self.range.clone()).ok();
+        match App::open() {
+            Ok(app) => {
+                self.today = query_today(&app).ok();
+                self.metrics = query_metrics_range(&app, self.range.clone()).ok();
+                self.timeline = query_timeline(&app, 0, 15).ok();
+                self.report = query_report_range(&app, self.range.clone()).ok();
+            }
+            Err(e) => {
+                eprintln!("TUI reload failed: {}", e);
+            }
         }
     }
 
@@ -113,6 +118,11 @@ pub fn run_tui(days: u32) -> Result<(), Error> {
 pub fn run_tui_range(range: TimeRange) -> Result<(), Error> {
     let mut app = TuiApp::load(range)?;
     let terminal = ratatui::init();
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        hook(info);
+    }));
     let result = run_loop(&mut app, terminal);
     ratatui::restore();
     result

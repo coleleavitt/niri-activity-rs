@@ -613,6 +613,9 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
             } else {
                 remaining_ms.min(3_600_000)
             };
+            if chunk_ms <= 0 {
+                break; // guard against infinite loop if ms_left_in_hour is 0
+            }
 
             let h = hourly.entry(current_hour).or_insert((0, 0));
             h.0 += chunk_ms;
@@ -1447,7 +1450,7 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
 
         if let Some(daily_goal) = app.config.goals.daily_ms() {
             let days = (data.daily.len() as i64).max(1);
-            let daily_avg = productive_ms / days;
+            let daily_avg = productive_ms.checked_div(days).unwrap_or(0);
             let daily_pct = (daily_avg as f64 / daily_goal as f64 * 100.0).min(999.0);
             let bar_len = ((daily_pct / 5.0).round() as usize).min(20);
             let progress_bar = "█".repeat(bar_len);

@@ -150,6 +150,7 @@ fn build_mailer(config: &Email) -> Result<SmtpTransport, Error> {
             .map_err(|e| Error::NiriError(format!("Failed to create SMTP relay (TLS): {}", e)))?
             .port(config.smtp_port)
             .credentials(creds)
+            .timeout(Some(std::time::Duration::from_secs(30)))
             .build()
     } else {
         SmtpTransport::starttls_relay(&config.smtp_host)
@@ -158,10 +159,18 @@ fn build_mailer(config: &Email) -> Result<SmtpTransport, Error> {
             })?
             .port(config.smtp_port)
             .credentials(creds)
+            .timeout(Some(std::time::Duration::from_secs(30)))
             .build()
     };
 
     Ok(mailer)
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn build_html_summary(bounds: &report::TimeBounds, period_name: &str) -> String {
@@ -194,9 +203,9 @@ fn build_html_summary(bounds: &report::TimeBounds, period_name: &str) -> String 
     </div>
 </body>
 </html>"#,
-        period_name,
-        bounds.start_date,
-        bounds.end_date,
+        html_escape(period_name),
+        html_escape(&bounds.start_date.to_string()),
+        html_escape(&bounds.end_date.to_string()),
         Local::now().format("%Y-%m-%d %H:%M:%S")
     )
 }

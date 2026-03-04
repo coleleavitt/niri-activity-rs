@@ -75,7 +75,7 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
                 "UPDATE events SET category = ?1 WHERE app_id = ?2 AND category != ?1",
                 params![category.to_string(), app_id],
             )?;
-            updated += count as i64;
+            updated = updated.saturating_add(i64::try_from(count).unwrap_or(i64::MAX));
         }
         tx.execute(
             "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
@@ -111,7 +111,7 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
                 "UPDATE events SET category = ?1 WHERE id = ?2 AND category != ?1",
                 params![correct.to_string(), id],
             )?;
-            updated += count as i64;
+            updated = updated.saturating_add(i64::try_from(count).unwrap_or(i64::MAX));
         }
 
         tx.execute(
@@ -201,17 +201,19 @@ pub fn reclassify_all(conn: &Connection, config: &Config) -> Result<(), Error> {
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
+    let tx = conn.unchecked_transaction()?;
     let mut updated = 0i64;
     for (id, app_id, title, old_category) in &rows {
         let correct = config.classify(app_id, title).to_string();
         if correct != *old_category {
-            conn.execute(
+            tx.execute(
                 "UPDATE events SET category = ?1 WHERE id = ?2",
                 params![correct, id],
             )?;
-            updated += 1;
+            updated = updated.saturating_add(1);
         }
     }
+    tx.commit()?;
     if updated > 0 {
         eprintln!("Reclassified {} events to match current config", updated);
     }
@@ -226,9 +228,9 @@ pub fn fix_false_active(conn: &Connection, input_active_ms: u64) -> Result<i64, 
           WHERE keystrokes = 0
             AND mouse_clicks = 0
             AND active_ms > ?1",
-        params![input_active_ms as i64],
+        params![i64::try_from(input_active_ms).unwrap_or(i64::MAX)],
     )?;
-    Ok(updated as i64)
+    Ok(i64::try_from(updated).unwrap_or(i64::MAX))
 }
 
 pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<(), Error> {

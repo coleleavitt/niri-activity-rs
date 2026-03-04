@@ -439,23 +439,29 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         }
     }
 
-    // Calculate average of daily ratios for comparison
-    // Also calculate sum of truncated values to show truncation error
-    let mut sum_truncated_total_secs: i64 = 0;
-    let mut sum_truncated_prod_secs: i64 = 0;
-    let mut sum_truncated_unprod_secs: i64 = 0;
-    let mut sum_truncated_neutral_secs: i64 = 0;
-    let mut sum_truncated_prod_active_secs: i64 = 0;
-    let mut sum_truncated_prod_passive_secs: i64 = 0;
+    // Calculate sum of truncated values to show truncation error.
+    // Sum ms first, then divide once to minimize per-row truncation loss.
+    let mut sum_total_ms: i64 = 0;
+    let mut sum_prod_ms: i64 = 0;
+    let mut sum_unprod_ms: i64 = 0;
+    let mut sum_neutral_ms: i64 = 0;
+    let mut sum_prod_active_ms: i64 = 0;
+    let mut sum_prod_passive_ms: i64 = 0;
 
     for (_, m, _) in &daily_metrics {
-        sum_truncated_total_secs += m.total_ms / 1000;
-        sum_truncated_prod_secs += m.productive_ms / 1000;
-        sum_truncated_unprod_secs += m.unproductive_ms / 1000;
-        sum_truncated_neutral_secs += m.neutral_ms / 1000;
-        sum_truncated_prod_active_secs += m.productive_active_ms / 1000;
-        sum_truncated_prod_passive_secs += m.productive_passive_ms / 1000;
+        sum_total_ms = sum_total_ms.saturating_add(m.total_ms);
+        sum_prod_ms = sum_prod_ms.saturating_add(m.productive_ms);
+        sum_unprod_ms = sum_unprod_ms.saturating_add(m.unproductive_ms);
+        sum_neutral_ms = sum_neutral_ms.saturating_add(m.neutral_ms);
+        sum_prod_active_ms = sum_prod_active_ms.saturating_add(m.productive_active_ms);
+        sum_prod_passive_ms = sum_prod_passive_ms.saturating_add(m.productive_passive_ms);
     }
+    let sum_truncated_total_secs = sum_total_ms / 1000;
+    let sum_truncated_prod_secs = sum_prod_ms / 1000;
+    let sum_truncated_unprod_secs = sum_unprod_ms / 1000;
+    let sum_truncated_neutral_secs = sum_neutral_ms / 1000;
+    let sum_truncated_prod_active_secs = sum_prod_active_ms / 1000;
+    let sum_truncated_prod_passive_secs = sum_prod_passive_ms / 1000;
 
     let total_prod_ratio = if daily_total.total_ms > 0 {
         daily_total.productive_ms as f64 / daily_total.total_ms as f64

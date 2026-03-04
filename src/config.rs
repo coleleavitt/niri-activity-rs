@@ -577,21 +577,22 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     }
     match (pattern.starts_with('*'), pattern.ends_with('*')) {
         (true, true) => {
+            // SAFETY: '*' is ASCII (single byte), so byte index 1 and len-1 are valid UTF-8 boundaries
             let inner = &pattern[1..pattern.len() - 1];
             value.contains(inner)
         }
         (true, false) => {
+            // SAFETY: '*' is ASCII (single byte), so byte index 1 is a valid UTF-8 boundary
             let suffix = &pattern[1..];
             value.ends_with(suffix)
         }
         (false, true) => {
+            // SAFETY: '*' is ASCII (single byte), so byte index len-1 is a valid UTF-8 boundary
             let prefix = &pattern[..pattern.len() - 1];
             value.starts_with(prefix)
         }
         (false, false) => {
-            if let Some(pos) = pattern.find('*') {
-                let prefix = &pattern[..pos];
-                let suffix = &pattern[pos + 1..];
+            if let Some((prefix, suffix)) = pattern.split_once('*') {
                 prefix.len() + suffix.len() <= value.len()
                     && value.starts_with(prefix)
                     && value.ends_with(suffix)
@@ -709,7 +710,10 @@ impl Schedule {
             return false;
         }
         let weekday = date.weekday().to_string().to_lowercase();
-        let weekday_short = &weekday[..3];
+        let weekday_short = match weekday.get(..3) {
+            Some(s) => s,
+            None => return false, // weekday name unexpectedly short
+        };
         self.days.iter().any(|d| {
             let d_lower = d.to_lowercase();
             d_lower == weekday || d_lower == weekday_short

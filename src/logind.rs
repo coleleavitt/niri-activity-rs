@@ -138,7 +138,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                 match session.receive_lock() {
                     Ok(mut signals) => {
                         while signals.next().is_some() {
-                            is_locked.store(true, Ordering::SeqCst);
+                            is_locked.store(true, Ordering::Release);
                             eprintln!("[logind] Lock signal received");
                         }
                         // Signal iterator ended - thread dying
@@ -183,7 +183,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                 match session.receive_unlock() {
                     Ok(mut signals) => {
                         while signals.next().is_some() {
-                            is_locked.store(false, Ordering::SeqCst);
+                            is_locked.store(false, Ordering::Release);
                             eprintln!("[logind] Unlock signal received");
                         }
                         // Signal iterator ended - thread dying
@@ -229,7 +229,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                                     if args.start {
                                         eprintln!("[logind] PrepareForSleep: suspending");
                                     } else {
-                                        suspend_resumed.store(true, Ordering::SeqCst);
+                                        suspend_resumed.store(true, Ordering::Release);
                                         eprintln!("[logind] PrepareForSleep: resumed");
                                     }
                                 }

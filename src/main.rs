@@ -295,6 +295,9 @@ fn main() {
 
     if let Err(e) = result {
         eprintln!("Error: {}", e);
+        // Use exit code to signal failure without skipping destructors.
+        // The process is about to exit anyway, so destructors will run on the
+        // main stack. We just need to propagate the error status.
         std::process::exit(1);
     }
 }

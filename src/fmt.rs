@@ -80,7 +80,11 @@ pub fn fmt_distance(counts: i64, mouse_dpi: f64) -> String {
 }
 
 fn fractional_block(remainder: f64) -> &'static str {
-    let idx = (remainder * 8.0).round() as usize;
+    if !remainder.is_finite() || remainder <= 0.0 {
+        return "";
+    }
+    let clamped = remainder.min(1.0);
+    let idx = (clamped * 8.0).round() as usize;
     match idx {
         0 => "",
         1 => "▏",
@@ -95,8 +99,17 @@ fn fractional_block(remainder: f64) -> &'static str {
 }
 
 pub fn cat_bar_fractional(category: Category, frac_blocks: f64, width: usize) -> String {
-    let full = frac_blocks.floor() as usize;
-    let remainder = frac_blocks - full as f64;
+    if !frac_blocks.is_finite() || frac_blocks <= 0.0 {
+        let pad = " ".repeat(width);
+        return match category {
+            Category::Productive => pad.green().to_string(),
+            Category::Unproductive => pad.red().to_string(),
+            Category::Neutral => pad.yellow().to_string(),
+        };
+    }
+    let clamped = frac_blocks.min(width as f64);
+    let full = clamped.floor() as usize;
+    let remainder = clamped - full as f64;
     let partial = fractional_block(remainder);
     let used = full + if partial.is_empty() { 0 } else { 1 };
     let pad = width.saturating_sub(used);
@@ -109,8 +122,16 @@ pub fn cat_bar_fractional(category: Category, frac_blocks: f64, width: usize) ->
 }
 
 pub fn colored_bar(prod_frac: f64, neutral_frac: f64, _unprod_frac: f64, width: usize) -> String {
-    let prod_chars = (prod_frac * width as f64).round() as usize;
-    let neutral_chars = (neutral_frac * width as f64).round() as usize;
+    let prod_chars = if prod_frac.is_finite() && prod_frac > 0.0 {
+        (prod_frac.min(1.0) * width as f64).round() as usize
+    } else {
+        0
+    };
+    let neutral_chars = if neutral_frac.is_finite() && neutral_frac > 0.0 {
+        (neutral_frac.min(1.0) * width as f64).round() as usize
+    } else {
+        0
+    };
     let total_used = prod_chars.saturating_add(neutral_chars);
     let (prod_chars, neutral_chars) = if total_used > width {
         let excess = total_used.saturating_sub(width);
