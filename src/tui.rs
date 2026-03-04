@@ -437,10 +437,12 @@ fn render_timeline(app: &TuiApp, area: Rect, frame: &mut Frame) {
             };
 
             let bar_width = 20usize;
-            let prod_chars =
-                (b.productive_ms as f64 / total as f64 * bar_width as f64).round() as usize;
-            let neut_chars =
-                (b.neutral_ms as f64 / total as f64 * bar_width as f64).round() as usize;
+            let prod_chars = (b.productive_ms as f64 / total as f64 * bar_width as f64)
+                .round()
+                .max(0.0) as usize;
+            let neut_chars = (b.neutral_ms as f64 / total as f64 * bar_width as f64)
+                .round()
+                .max(0.0) as usize;
             let unp_chars = bar_width.saturating_sub(prod_chars + neut_chars);
 
             let bar_line = Line::from(vec![
@@ -520,7 +522,13 @@ fn render_apps(app: &TuiApp, area: Rect, frame: &mut Frame) {
 
         if group.children.len() == 1 {
             let a = &group.children[0];
-            let bar_len = (a.total_ms as f64 / total_ms as f64 * 20.0).round() as usize;
+            let bar_len = if total_ms > 0 {
+                (a.total_ms as f64 / total_ms as f64 * 20.0)
+                    .round()
+                    .clamp(0.0, 20.0) as usize
+            } else {
+                0
+            };
             let bar_span = Span::styled("█".repeat(bar_len), category_style(a.category));
 
             rows.push(
@@ -535,7 +543,13 @@ fn render_apps(app: &TuiApp, area: Rect, frame: &mut Frame) {
                 .style(base),
             );
         } else {
-            let bar_len = (group.total_ms as f64 / total_ms as f64 * 20.0).round() as usize;
+            let bar_len = if total_ms > 0 {
+                (group.total_ms as f64 / total_ms as f64 * 20.0)
+                    .round()
+                    .clamp(0.0, 20.0) as usize
+            } else {
+                0
+            };
             let mut prod_ms: i64 = 0;
             let mut neutral_ms: i64 = 0;
             let mut unprod_ms: i64 = 0;
@@ -547,9 +561,12 @@ fn render_apps(app: &TuiApp, area: Rect, frame: &mut Frame) {
                 }
             }
             let total = (prod_ms + neutral_ms + unprod_ms).max(1);
-            let prod_chars = (prod_ms as f64 / total as f64 * bar_len as f64).round() as usize;
-            let neutral_chars =
-                (neutral_ms as f64 / total as f64 * bar_len as f64).round() as usize;
+            let prod_chars = (prod_ms as f64 / total as f64 * bar_len as f64)
+                .round()
+                .max(0.0) as usize;
+            let neutral_chars = (neutral_ms as f64 / total as f64 * bar_len as f64)
+                .round()
+                .max(0.0) as usize;
             let unprod_chars = bar_len.saturating_sub(prod_chars + neutral_chars);
             let bar_line = Line::from(vec![
                 Span::styled(
@@ -716,7 +733,13 @@ fn render_categories(rpt: &ReportData, area: Rect, frame: &mut Frame) {
         .categories
         .iter()
         .map(|c| {
-            let filled = (c.total_ms as f64 / total as f64 * 25.0).round() as usize;
+            let filled = if total > 0 {
+                (c.total_ms as f64 / total as f64 * 25.0)
+                    .round()
+                    .clamp(0.0, 25.0) as usize
+            } else {
+                0
+            };
             let bar_span = Span::styled("█".repeat(filled), category_style(c.category));
 
             Row::new(vec![
@@ -821,7 +844,13 @@ fn render_peaks(rpt: &ReportData, area: Rect, frame: &mut Frame) {
         .peak_hours
         .iter()
         .map(|h| {
-            let bar_len = (h.total_ms as f64 / max_ms as f64 * 15.0).round() as usize;
+            let bar_len = if max_ms > 0 {
+                (h.total_ms as f64 / max_ms as f64 * 15.0)
+                    .round()
+                    .clamp(0.0, 15.0) as usize
+            } else {
+                0
+            };
             Row::new(vec![
                 Cell::from(format!("{:02}:00", h.hour)).style(THEME.value_dim),
                 Cell::from(Span::styled("█".repeat(bar_len), THEME.accent)),

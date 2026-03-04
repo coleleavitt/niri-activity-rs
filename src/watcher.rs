@@ -259,7 +259,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let mut conn = Connection::open(&db_path)?;
     init_db(&conn)?;
     run_migrations(&mut conn, &config)?;
-    reclassify_all(&conn, &config)?;
+    reclassify_all(&mut conn, &config)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);

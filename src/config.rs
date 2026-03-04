@@ -251,6 +251,10 @@ impl Goals {
 
 fn parse_duration_ms(s: &str) -> Option<i64> {
     let s = s.trim().to_lowercase();
+    // Reject negative durations
+    if s.contains('-') {
+        return None;
+    }
     let mut total_ms: i64 = 0;
     let mut current_num = String::new();
 
@@ -577,18 +581,15 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     }
     match (pattern.starts_with('*'), pattern.ends_with('*')) {
         (true, true) => {
-            // SAFETY: '*' is ASCII (single byte), so byte index 1 and len-1 are valid UTF-8 boundaries
-            let inner = &pattern[1..pattern.len() - 1];
+            let inner = pattern.trim_start_matches('*').trim_end_matches('*');
             value.contains(inner)
         }
         (true, false) => {
-            // SAFETY: '*' is ASCII (single byte), so byte index 1 is a valid UTF-8 boundary
-            let suffix = &pattern[1..];
+            let suffix = pattern.trim_start_matches('*');
             value.ends_with(suffix)
         }
         (false, true) => {
-            // SAFETY: '*' is ASCII (single byte), so byte index len-1 is a valid UTF-8 boundary
-            let prefix = &pattern[..pattern.len() - 1];
+            let prefix = pattern.trim_end_matches('*');
             value.starts_with(prefix)
         }
         (false, false) => {
@@ -662,11 +663,11 @@ impl Schedule {
 
         let start = match NaiveTime::parse_from_str(&self.start, "%H:%M") {
             Ok(time) => time,
-            Err(_) => return true,
+            Err(_) => return false,
         };
         let end = match NaiveTime::parse_from_str(&self.end, "%H:%M") {
             Ok(time) => time,
-            Err(_) => return true,
+            Err(_) => return false,
         };
         let current = dt.time();
 
@@ -687,9 +688,13 @@ impl Schedule {
         let mut date = start_date;
         while date <= end_date {
             if self.is_workday_with_holidays(date, &holiday_set) {
-                count += 1;
+                count = count.saturating_add(1);
             }
             date += chrono::Duration::days(1);
+            // Safety bound: max 100 years of days
+            if count > 36_525 {
+                break;
+            }
         }
         count
     }
@@ -987,7 +992,7 @@ mod tests {
         let re = regex::RegexBuilder::new("YouTube|Reddit|TikTok")
             .case_insensitive(true)
             .build()
-            .unwrap();
+            .expect("hardcoded regex pattern is valid");
         let config = Config {
             title_rules: vec![TitleRule {
                 pattern: "YouTube|Reddit|TikTok".to_string(),
@@ -1016,7 +1021,7 @@ mod tests {
         let re = regex::RegexBuilder::new("GitHub")
             .case_insensitive(true)
             .build()
-            .unwrap();
+            .expect("hardcoded regex pattern is valid");
         let config = Config {
             title_rules: vec![TitleRule {
                 pattern: "GitHub".to_string(),
@@ -1037,7 +1042,7 @@ mod tests {
         let re = regex::RegexBuilder::new("YouTube|Spotify")
             .case_insensitive(true)
             .build()
-            .unwrap();
+            .expect("hardcoded regex pattern is valid");
         let config = Config {
             title_rules: vec![TitleRule {
                 pattern: "YouTube|Spotify".to_string(),

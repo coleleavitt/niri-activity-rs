@@ -60,12 +60,26 @@ fn parse_time_range(days: u32, time: &TimeRangeArgs) -> Result<report::TimeRange
             .map_err(|e| Error::NiriError(format!("invalid --from date: {}", e)))?;
         let end = NaiveDate::parse_from_str(to_str, "%Y-%m-%d")
             .map_err(|e| Error::NiriError(format!("invalid --to date: {}", e)))?;
+        if start > end {
+            return Err(Error::NiriError(format!(
+                "--from date ({}) must be on or before --to date ({})",
+                from_str, to_str
+            )));
+        }
         return Ok(report::TimeRange::DateRange(start, end));
     }
     if time.from.is_some() || time.to.is_some() {
         return Err(Error::NiriError(
             "--from and --to must be used together".into(),
         ));
+    }
+
+    const MAX_DAYS: u32 = 10_000;
+    if days > MAX_DAYS {
+        return Err(Error::NiriError(format!(
+            "--days {} exceeds maximum of {}",
+            days, MAX_DAYS
+        )));
     }
 
     Ok(if time.today {

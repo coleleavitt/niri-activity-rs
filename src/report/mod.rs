@@ -53,7 +53,7 @@ impl App {
         let db_path = get_data_dir()?.join("activity.db");
         let mut conn = Connection::open(&db_path)?;
         run_migrations(&mut conn, &config)?;
-        reclassify_all(&conn, &config)?;
+        reclassify_all(&mut conn, &config)?;
         Ok(App { config, conn })
     }
 }
@@ -255,16 +255,17 @@ pub fn query_today(app: &App) -> Result<TodayData, Error> {
     let date = Local::now().date_naive();
     let day_start_utc = local_day_start_utc(date)?;
 
+    let day_end_utc = local_day_end_utc(date)?;
     let mut stmt = app.conn.prepare(
         "SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) as total_ms 
          FROM events 
-         WHERE timestamp >= ?1 
+         WHERE timestamp >= ?1 AND timestamp < ?2
          GROUP BY app_id 
          ORDER BY total_ms DESC",
     )?;
 
     let rows = stmt
-        .query_map([&day_start_utc], |row| {
+        .query_map(params![&day_start_utc, &day_end_utc], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -291,7 +292,9 @@ pub fn query_metrics(app: &App, days: u32) -> Result<MetricsData, Error> {
 pub fn query_metrics_range(app: &App, range: TimeRange) -> Result<MetricsData, Error> {
     let bounds = range.resolve()?;
     let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
-    let days = (bounds.end_date - bounds.start_date).num_days() as u32 + 1;
+    let days = u32::try_from((bounds.end_date - bounds.start_date).num_days())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
     let mut stmt = app.conn.prepare(
         "SELECT category, SUM(active_ms) as active, COALESCE(SUM(passive_ms),0) as passive, SUM(idle_ms) as idle
          FROM events
@@ -414,12 +417,17 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
         });
 
         match Category::from_str(&ev.category).unwrap_or(Category::Neutral) {
-            Category::Productive => b.productive_ms += total_ms,
-            Category::Unproductive => b.unproductive_ms += total_ms,
-            Category::Neutral => b.neutral_ms += total_ms,
+            Category::Productive => b.productive_ms = b.productive_ms.saturating_add(total_ms),
+            Category::Unproductive => {
+                b.unproductive_ms = b.unproductive_ms.saturating_add(total_ms)
+            }
+            Category::Neutral => b.neutral_ms = b.neutral_ms.saturating_add(total_ms),
         }
-        b.idle_ms += ev.passive_ms + ev.idle_ms;
-        b.keystrokes += ev.keystrokes;
+        b.idle_ms = b
+            .idle_ms
+            .saturating_add(ev.passive_ms)
+            .saturating_add(ev.idle_ms);
+        b.keystrokes = b.keystrokes.saturating_add(ev.keystrokes);
 
         if total_ms > b.dominant_app_ms {
             b.dominant_app_ms = total_ms;
@@ -588,20 +596,23 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         };
 
         let day_key = local_dt.format("%Y-%m-%d").to_string();
-        let total = row.active_ms + row.passive_ms + row.idle_ms;
+        let total = row
+            .active_ms
+            .saturating_add(row.passive_ms)
+            .saturating_add(row.idle_ms);
 
         let d = daily_map.entry(day_key).or_insert((0, 0, 0, 0));
-        d.0 += total;
-        d.1 += row.active_ms;
-        d.2 += row.keystrokes;
-        d.3 += 1;
+        d.0 = d.0.saturating_add(total);
+        d.1 = d.1.saturating_add(row.active_ms);
+        d.2 = d.2.saturating_add(row.keystrokes);
+        d.3 = d.3.saturating_add(1);
 
         // Split event duration across hour boundaries
         // ms_left_in_hour = ms until the next hour starts
         let minute = local_dt.minute() as i64;
         let second = local_dt.second() as i64;
         let ms_into_hour = (minute * 60 + second) * 1000;
-        let ms_left_in_hour = 3_600_000_i64.saturating_sub(ms_into_hour);
+        let ms_left_in_hour = 3_600_000_i64.saturating_sub(ms_into_hour).max(1);
 
         let mut remaining_ms = total;
         let mut current_hour = local_dt.hour();
@@ -670,15 +681,18 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
             let Some(local_dt) = parse_timestamp_local(&row.timestamp) else {
                 continue;
             };
-            let total = row.active_ms + row.passive_ms + row.idle_ms;
+            let total = row
+                .active_ms
+                .saturating_add(row.passive_ms)
+                .saturating_add(row.idle_ms);
             if app.config.schedule.is_in_schedule(&local_dt) {
-                work_total_ms += total;
-                work_active_ms += row.active_ms;
-                work_keys += row.keystrokes;
+                work_total_ms = work_total_ms.saturating_add(total);
+                work_active_ms = work_active_ms.saturating_add(row.active_ms);
+                work_keys = work_keys.saturating_add(row.keystrokes);
             } else {
-                after_total_ms += total;
-                after_active_ms += row.active_ms;
-                after_keys += row.keystrokes;
+                after_total_ms = after_total_ms.saturating_add(total);
+                after_active_ms = after_active_ms.saturating_add(row.active_ms);
+                after_keys = after_keys.saturating_add(row.keystrokes);
             }
         }
 
@@ -1061,7 +1075,14 @@ fn query_gaps(
             continue;
         };
 
-        let duration_ms = (gap_hours * 3_600_000.0) as i64;
+        let duration_ms = if gap_hours.is_finite()
+            && gap_hours >= 0.0
+            && gap_hours <= (i64::MAX as f64 / 3_600_000.0)
+        {
+            (gap_hours * 3_600_000.0) as i64
+        } else {
+            i64::MAX
+        };
 
         raw_gaps.push(RawGap {
             gap_start,
@@ -1325,9 +1346,21 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
             0.0
         };
 
-        let prod_frac = b.productive_ms as f64 / total as f64;
-        let neutral_frac = b.neutral_ms as f64 / total as f64;
-        let unprod_frac = b.unproductive_ms as f64 / total as f64;
+        let prod_frac = if total > 0 {
+            b.productive_ms as f64 / total as f64
+        } else {
+            0.0
+        };
+        let neutral_frac = if total > 0 {
+            b.neutral_ms as f64 / total as f64
+        } else {
+            0.0
+        };
+        let unprod_frac = if total > 0 {
+            b.unproductive_ms as f64 / total as f64
+        } else {
+            0.0
+        };
 
         let bar = colored_bar(prod_frac, neutral_frac, unprod_frac, bar_width);
 
@@ -1451,10 +1484,14 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
         if let Some(daily_goal) = app.config.goals.daily_ms() {
             let days = (data.daily.len() as i64).max(1);
             let daily_avg = productive_ms.checked_div(days).unwrap_or(0);
-            let daily_pct = (daily_avg as f64 / daily_goal as f64 * 100.0).min(999.0);
+            let daily_pct = if daily_goal > 0 {
+                (daily_avg as f64 / daily_goal as f64 * 100.0).min(999.0)
+            } else {
+                0.0
+            };
             let bar_len = ((daily_pct / 5.0).round() as usize).min(20);
             let progress_bar = "█".repeat(bar_len);
-            let remaining_bar = "░".repeat(20 - bar_len);
+            let remaining_bar = "░".repeat(20_usize.saturating_sub(bar_len));
 
             let status = if daily_pct >= 100.0 {
                 format!("{}%", daily_pct.round()).green().bold().to_string()
@@ -1475,10 +1512,14 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
         }
 
         if let Some(weekly_goal) = app.config.goals.weekly_ms() {
-            let weekly_pct = (productive_ms as f64 / weekly_goal as f64 * 100.0).min(999.0);
+            let weekly_pct = if weekly_goal > 0 {
+                (productive_ms as f64 / weekly_goal as f64 * 100.0).min(999.0)
+            } else {
+                0.0
+            };
             let bar_len = ((weekly_pct / 5.0).round() as usize).min(20);
             let progress_bar = "█".repeat(bar_len);
-            let remaining_bar = "░".repeat(20 - bar_len);
+            let remaining_bar = "░".repeat(20_usize.saturating_sub(bar_len));
 
             let status = if weekly_pct >= 100.0 {
                 format!("{}%", weekly_pct.round())
@@ -1513,7 +1554,11 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             Category::Unproductive => "○".red().to_string(),
             Category::Neutral => "◌".yellow().to_string(),
         };
-        let filled = (cat.total_ms as f64 / data.total_ms as f64 * 30.0).round() as usize;
+        let filled = if data.total_ms > 0 {
+            (cat.total_ms as f64 / data.total_ms as f64 * 30.0).round() as usize
+        } else {
+            0
+        };
         let bar = cat_bar(cat.category, filled);
         println!(
             "  {} {:<14} {} {} {}",
@@ -1979,7 +2024,12 @@ pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
     );
 
     let mut date = since_local;
+    let mut csv_iterations = 0u32;
     while date <= today_local {
+        csv_iterations = csv_iterations.saturating_add(1);
+        if csv_iterations > 10_000 {
+            break; // safety bound
+        }
         let day_start = local_day_start_utc(date)?;
         let day_end = local_day_end_utc(date)?;
 
@@ -2153,12 +2203,16 @@ pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
         // Avoid double clone: check if key exists first, only clone for insert
         if let Some(cell) = heatmap.get_mut(&(date.clone(), hour)) {
             match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
-                Category::Productive => cell.productive_ms += total_ms,
-                Category::Unproductive => cell.unproductive_ms += total_ms,
-                Category::Neutral => cell.neutral_ms += total_ms,
+                Category::Productive => {
+                    cell.productive_ms = cell.productive_ms.saturating_add(total_ms)
+                }
+                Category::Unproductive => {
+                    cell.unproductive_ms = cell.unproductive_ms.saturating_add(total_ms)
+                }
+                Category::Neutral => cell.neutral_ms = cell.neutral_ms.saturating_add(total_ms),
             }
-            cell.total_ms += total_ms;
-            cell.keystrokes += keystrokes;
+            cell.total_ms = cell.total_ms.saturating_add(total_ms);
+            cell.keystrokes = cell.keystrokes.saturating_add(keystrokes);
         } else {
             let mut cell = HeatmapCell {
                 date: date.clone(),

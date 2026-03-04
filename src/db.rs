@@ -150,7 +150,7 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
                     "UPDATE events SET category = ?1 WHERE id = ?2",
                     params![correct.to_string(), id],
                 )?;
-                updated += 1;
+                updated = updated.saturating_add(1);
             }
         }
 
@@ -188,10 +188,10 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
     Ok(())
 }
 
-pub fn reclassify_all(conn: &Connection, config: &Config) -> Result<(), Error> {
-    let mut stmt = conn.prepare("SELECT id, app_id, title, category FROM events")?;
-    let rows: Vec<(i64, String, String, String)> = stmt
-        .query_map([], |row| {
+pub fn reclassify_all(conn: &mut Connection, config: &Config) -> Result<(), Error> {
+    let rows: Vec<(i64, String, String, String)> = {
+        let mut stmt = conn.prepare("SELECT id, app_id, title, category FROM events")?;
+        stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -199,9 +199,10 @@ pub fn reclassify_all(conn: &Connection, config: &Config) -> Result<(), Error> {
                 row.get::<_, String>(3)?,
             ))
         })?
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+    };
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = conn.transaction()?;
     let mut updated = 0i64;
     for (id, app_id, title, old_category) in &rows {
         let correct = config.classify(app_id, title).to_string();
@@ -248,10 +249,10 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
             snapshot.active_ms,
             snapshot.passive_ms,
             snapshot.idle_ms,
-            snapshot.input.keystrokes as i64,
-            snapshot.input.mouse_clicks as i64,
-            snapshot.input.scroll_events as i64,
-            snapshot.input.mouse_distance as i64,
+            i64::try_from(snapshot.input.keystrokes).unwrap_or(i64::MAX),
+            i64::try_from(snapshot.input.mouse_clicks).unwrap_or(i64::MAX),
+            i64::try_from(snapshot.input.scroll_events).unwrap_or(i64::MAX),
+            i64::try_from(snapshot.input.mouse_distance).unwrap_or(i64::MAX),
             snapshot.jiggler_detected as i32,
         ],
     )?;

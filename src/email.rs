@@ -44,7 +44,8 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
         .map_err(|e| Error::NiriError(format!("Failed to read generated XLSX: {}", e)))?;
     drop(temp_file); // Explicitly remove the temp file
 
-    let subject = if email_config.report_name.is_empty() {
+    // Sanitize subject line: strip newlines to prevent header injection
+    let raw_subject = if email_config.report_name.is_empty() {
         format!(
             "{} {}: {} to {}",
             email_config.subject_prefix, period_name, bounds.start_date, bounds.end_date
@@ -59,6 +60,7 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
             bounds.end_date
         )
     };
+    let subject = raw_subject.replace(['\n', '\r'], " ");
 
     let html_body = build_html_summary(&bounds, period_name);
     let text_body = build_text_summary(&bounds, period_name);
@@ -206,7 +208,7 @@ fn build_html_summary(bounds: &report::TimeBounds, period_name: &str) -> String 
         html_escape(period_name),
         html_escape(&bounds.start_date.to_string()),
         html_escape(&bounds.end_date.to_string()),
-        Local::now().format("%Y-%m-%d %H:%M:%S")
+        html_escape(&Local::now().format("%Y-%m-%d %H:%M:%S").to_string())
     )
 }
 
