@@ -62,23 +62,8 @@ impl InputStats {
         self.last_activity_ms.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)]
-    pub fn last_meaningful_input_ms(&self) -> u64 {
-        self.last_meaningful_input_ms.load(Ordering::Acquire)
-    }
-
     pub fn jiggler_detected(&self) -> bool {
         self.jiggler_pattern.load(Ordering::Acquire) || self.jiggler_process.load(Ordering::Acquire)
-    }
-
-    #[allow(dead_code)]
-    pub fn jiggler_pattern_detected(&self) -> bool {
-        self.jiggler_pattern.load(Ordering::Acquire)
-    }
-
-    #[allow(dead_code)]
-    pub fn jiggler_process_detected(&self) -> bool {
-        self.jiggler_process.load(Ordering::Acquire)
     }
 }
 

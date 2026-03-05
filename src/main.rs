@@ -255,7 +255,7 @@ fn main() {
                           WHERE keystrokes = 0
                             AND mouse_clicks = 0
                             AND active_ms > ?1",
-                    rusqlite::params![input_active_ms as i64],
+                    rusqlite::params![i64::try_from(input_active_ms).unwrap_or(i64::MAX)],
                     |row| row.get(0),
                 )?;
                 let total_ms: i64 = conn.query_row(
@@ -263,7 +263,7 @@ fn main() {
                           WHERE keystrokes = 0
                             AND mouse_clicks = 0
                             AND active_ms > ?1",
-                    rusqlite::params![input_active_ms as i64],
+                    rusqlite::params![i64::try_from(input_active_ms).unwrap_or(i64::MAX)],
                     |row| row.get(0),
                 )?;
                 let hours = total_ms / 3_600_000;

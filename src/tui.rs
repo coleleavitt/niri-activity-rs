@@ -110,11 +110,6 @@ impl TuiApp {
     }
 }
 
-#[allow(dead_code)]
-pub fn run_tui(days: u32) -> Result<(), Error> {
-    run_tui_range(TimeRange::Days(days))
-}
-
 pub fn run_tui_range(range: TimeRange) -> Result<(), Error> {
     let mut app = TuiApp::load(range)?;
     let terminal = ratatui::init();
@@ -424,7 +419,10 @@ fn render_timeline(app: &TuiApp, area: Rect, frame: &mut Frame) {
         .buckets
         .iter()
         .map(|b| {
-            let total = b.productive_ms + b.neutral_ms + b.unproductive_ms;
+            let total = b
+                .productive_ms
+                .saturating_add(b.neutral_ms)
+                .saturating_add(b.unproductive_ms);
             if total == 0 {
                 return Row::new(vec![Cell::from(""); 6]);
             }
@@ -555,12 +553,21 @@ fn render_apps(app: &TuiApp, area: Rect, frame: &mut Frame) {
             let mut unprod_ms: i64 = 0;
             for child in &group.children {
                 match child.category {
-                    crate::config::Category::Productive => prod_ms += child.total_ms,
-                    crate::config::Category::Neutral => neutral_ms += child.total_ms,
-                    crate::config::Category::Unproductive => unprod_ms += child.total_ms,
+                    crate::config::Category::Productive => {
+                        prod_ms = prod_ms.saturating_add(child.total_ms)
+                    }
+                    crate::config::Category::Neutral => {
+                        neutral_ms = neutral_ms.saturating_add(child.total_ms)
+                    }
+                    crate::config::Category::Unproductive => {
+                        unprod_ms = unprod_ms.saturating_add(child.total_ms)
+                    }
                 }
             }
-            let total = (prod_ms + neutral_ms + unprod_ms).max(1);
+            let total = prod_ms
+                .saturating_add(neutral_ms)
+                .saturating_add(unprod_ms)
+                .max(1);
             let prod_chars = (prod_ms as f64 / total as f64 * bar_len as f64)
                 .round()
                 .max(0.0) as usize;

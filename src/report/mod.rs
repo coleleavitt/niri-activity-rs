@@ -284,11 +284,6 @@ pub fn query_today(app: &App) -> Result<TodayData, Error> {
     Ok(TodayData { date, rows })
 }
 
-#[allow(dead_code)]
-pub fn query_metrics(app: &App, days: u32) -> Result<MetricsData, Error> {
-    query_metrics_range(app, TimeRange::Days(days))
-}
-
 pub fn query_metrics_range(app: &App, range: TimeRange) -> Result<MetricsData, Error> {
     let bounds = range.resolve()?;
     let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
@@ -1262,11 +1257,6 @@ pub fn show_today(app: &App) -> Result<(), Error> {
     }
 
     Ok(())
-}
-
-#[allow(dead_code)]
-pub fn show_metrics(app: &App, days: u32) -> Result<(), Error> {
-    show_metrics_range(app, TimeRange::Days(days))
 }
 
 pub fn show_metrics_range(app: &App, range: TimeRange) -> Result<(), Error> {

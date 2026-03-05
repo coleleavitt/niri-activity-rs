@@ -97,8 +97,8 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
             .query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -134,9 +134,9 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
             .query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -201,20 +201,20 @@ pub fn reclassify_all(conn: &mut Connection, config: &Config) -> Result<(), Erro
         return Ok(());
     }
 
+    let tx = conn.transaction()?;
     let rows: Vec<(i64, String, String, String)> = {
-        let mut stmt = conn.prepare("SELECT id, app_id, title, category FROM events")?;
+        let mut stmt = tx.prepare("SELECT id, app_id, title, category FROM events")?;
         stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?
     };
 
-    let tx = conn.transaction()?;
     let mut updated = 0i64;
     for (id, app_id, title, old_category) in &rows {
         let correct = config.classify(app_id, title).to_string();

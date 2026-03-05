@@ -84,12 +84,3 @@ pub fn category_style(cat: Category) -> Style {
         Category::Neutral => THEME.neutral,
     }
 }
-
-#[allow(dead_code)]
-pub fn category_color(cat: Category) -> Color {
-    match cat {
-        Category::Productive => PRODUCTIVE,
-        Category::Unproductive => UNPRODUCTIVE,
-        Category::Neutral => NEUTRAL,
-    }
-}

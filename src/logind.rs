@@ -137,6 +137,10 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
 
                 match session.receive_lock() {
                     Ok(mut signals) => {
+                        // TOCTOU fix: re-check lock state after subscription is active
+                        if session.locked_hint().unwrap_or(false) {
+                            is_locked.store(true, Ordering::Release);
+                        }
                         // JPL-R11: bounded by process lifetime — blocks on D-Bus I/O.
                         let mut iterations: u64 = 0;
                         while signals.next().is_some() {
@@ -189,6 +193,10 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
 
                 match session.receive_unlock() {
                     Ok(mut signals) => {
+                        // TOCTOU fix: re-check lock state after subscription is active
+                        if !session.locked_hint().unwrap_or(true) {
+                            is_locked.store(false, Ordering::Release);
+                        }
                         // JPL-R11: bounded by process lifetime — blocks on D-Bus I/O.
                         let mut iterations: u64 = 0;
                         while signals.next().is_some() {

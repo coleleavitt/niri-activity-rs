@@ -594,7 +594,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
         }
         (false, false) => {
             if let Some((prefix, suffix)) = pattern.split_once('*') {
-                prefix.len() + suffix.len() < value.len()
+                prefix.len() + suffix.len() <= value.len()
                     && value.starts_with(prefix)
                     && value.ends_with(suffix)
             } else {
@@ -939,6 +939,8 @@ mod tests {
     fn glob_middle() {
         assert!(glob_match("com.*desktop", "com.ayugram.desktop"));
         assert!(!glob_match("com.*desktop", "org.pulseaudio.pavucontrol"));
+        // * matches zero characters (off-by-one regression test)
+        assert!(glob_match("com.*desktop", "com.desktop"));
     }
 
     #[test]

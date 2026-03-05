@@ -64,12 +64,6 @@ fn fmt_delta_hms(delta_ms: i64) -> String {
     format!("{sign}{h}:{m:02}")
 }
 
-#[allow(dead_code)]
-fn fmt_delta_pct(delta: f64) -> String {
-    let sign = if delta >= 0.0 { "+" } else { "-" };
-    format!("{sign}{:.1}%", delta.abs() * 100.0)
-}
-
 #[cfg(feature = "excel-extra-sheets")]
 /// Row from a top-apps query.
 struct TopApp {
@@ -120,7 +114,6 @@ fn query_top_apps(
 // ---------------------------------------------------------------------------
 // Weekly aggregation helper
 // ---------------------------------------------------------------------------
-
 struct WeekBucket {
     iso_year: i32,
     iso_week: u32,
@@ -174,12 +167,6 @@ fn aggregate_weeks(daily: &[(NaiveDate, Metrics, bool)]) -> Vec<WeekBucket> {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-
-/// Convenience wrapper: export N days ending today.
-#[allow(dead_code)]
-pub fn export_xlsx(app: &App, days: u32, path: &str) -> Result<(), Error> {
-    export_xlsx_range(app, TimeRange::Days(days), path)
-}
 
 /// Export an enhanced multi-sheet Excel workbook for the given time range.
 pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), Error> {
@@ -633,25 +620,25 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
                 .write_string(wrow, 0, &week_label)
                 .map_err(xlsx_err)?;
             weekly_sheet
-                .write_string(wrow, 1, &w.start_date.to_string())
+                .write_string(wrow, 1, w.start_date.to_string())
                 .map_err(xlsx_err)?;
             weekly_sheet
-                .write_string(wrow, 2, &w.end_date.to_string())
+                .write_string(wrow, 2, w.end_date.to_string())
                 .map_err(xlsx_err)?;
             weekly_sheet
-                .write_string(wrow, 3, &fmt_hms(w.total_ms))
+                .write_string(wrow, 3, fmt_hms(w.total_ms))
                 .map_err(xlsx_err)?;
             weekly_sheet
-                .write_string(wrow, 4, &fmt_hms(w.productive_ms))
+                .write_string(wrow, 4, fmt_hms(w.productive_ms))
                 .map_err(xlsx_err)?;
             weekly_sheet
-                .write_string(wrow, 5, &fmt_hms(w.unproductive_ms))
+                .write_string(wrow, 5, fmt_hms(w.unproductive_ms))
                 .map_err(xlsx_err)?;
             weekly_sheet
                 .write_number_with_format(wrow, 6, prod_ratio, &pct_fmt)
                 .map_err(xlsx_err)?;
             weekly_sheet
-                .write_string(wrow, 7, &fmt_hms(avg_daily))
+                .write_string(wrow, 7, fmt_hms(avg_daily))
                 .map_err(xlsx_err)?;
         }
 
@@ -729,10 +716,10 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
                 .write_string(arow, 1, &app_row.app_id)
                 .map_err(xlsx_err)?;
             app_sheet
-                .write_string(arow, 2, &app_row.category.to_string())
+                .write_string(arow, 2, app_row.category.to_string())
                 .map_err(xlsx_err)?;
             app_sheet
-                .write_string(arow, 3, &fmt_hms(app_row.total_ms))
+                .write_string(arow, 3, fmt_hms(app_row.total_ms))
                 .map_err(xlsx_err)?;
             app_sheet
                 .write_number_with_format(arow, 4, pct_of_total, &pct_fmt)

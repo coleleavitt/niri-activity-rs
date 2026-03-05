@@ -815,7 +815,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
 
                     if !quiet && total >= 500 {
                         let idle_pct = if total > 0 {
-                            ((flushed.passive_ms + flushed.idle_ms) as f64 / total as f64 * 100.0)
+                            ((flushed.passive_ms.saturating_add(flushed.idle_ms)) as f64
+                                / total as f64
+                                * 100.0)
                                 .round() as u32
                         } else {
                             0
