@@ -219,10 +219,11 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         "Undefined",
         "Prod Active",
         "Prod Passive",
+        "Prod Idle",
         "Productive Ratio",
         "Productive Active %",
-        "Avg Total",
-        "Avg Productive",
+        "Avg Workday",
+        "Avg Workday Prod",
         &days_header,
         "Daily \u{0394}",
     ];
@@ -358,19 +359,24 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
             .write_string_with_format(row, 6, fmt_hms(m.productive_passive_ms), str_fmt)
             .map_err(xlsx_err)?;
 
-        // Productive Ratio (col 7)
+        // Prod Idle (col 7)
         daily_sheet
-            .write_number_with_format(row, 7, prod_ratio, pct_fmt)
+            .write_string_with_format(row, 7, fmt_hms(m.productive_idle_ms), str_fmt)
             .map_err(xlsx_err)?;
 
-        // Productive Active % (col 8)
+        // Productive Ratio (col 8)
         daily_sheet
-            .write_number_with_format(row, 8, prod_active_pct, pct_fmt)
+            .write_number_with_format(row, 8, prod_ratio, pct_fmt)
             .map_err(xlsx_err)?;
 
-        // Cols 9-11 (avg/days) written in totals pass below; leave blank per-row
+        // Productive Active % (col 9)
+        daily_sheet
+            .write_number_with_format(row, 9, prod_active_pct, pct_fmt)
+            .map_err(xlsx_err)?;
 
-        // Daily Δ (col 12) - colored based on productive time change
+        // Cols 10-12 (avg/days) written in totals pass below; leave blank per-row
+
+        // Daily Δ (col 13) - colored based on productive time change
         let delta_fmt = if *is_workday {
             if delta_productive > 60_000 {
                 &delta_positive_fmt
@@ -389,7 +395,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
             }
         };
         daily_sheet
-            .write_string_with_format(row, 12, fmt_delta_hms(delta_productive), delta_fmt)
+            .write_string_with_format(row, 13, fmt_delta_hms(delta_productive), delta_fmt)
             .map_err(xlsx_err)?;
 
         row = row.saturating_add(1);
@@ -397,9 +403,8 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
 
     // ── Totals row ──────────────────────────────────────────────────────────────
     let mut daily_total = Metrics::default();
-    let mut workday_total = Metrics::default();
 
-    for (_, m, is_workday) in &daily_metrics {
+    for (_, m, _is_workday) in &daily_metrics {
         daily_total.total_ms = daily_total.total_ms.saturating_add(m.total_ms);
         daily_total.productive_ms = daily_total.productive_ms.saturating_add(m.productive_ms);
         daily_total.unproductive_ms = daily_total
@@ -415,15 +420,6 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         daily_total.productive_idle_ms = daily_total
             .productive_idle_ms
             .saturating_add(m.productive_idle_ms);
-
-        if *is_workday {
-            workday_total.total_ms = workday_total.total_ms.saturating_add(m.total_ms);
-            workday_total.productive_ms =
-                workday_total.productive_ms.saturating_add(m.productive_ms);
-            workday_total.productive_active_ms = workday_total
-                .productive_active_ms
-                .saturating_add(m.productive_active_ms);
-        }
     }
 
     // Calculate sum of truncated values to show truncation error.
@@ -434,6 +430,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     let mut sum_neutral_ms: i64 = 0;
     let mut sum_prod_active_ms: i64 = 0;
     let mut sum_prod_passive_ms: i64 = 0;
+    let mut sum_prod_idle_ms: i64 = 0;
 
     for (_, m, _) in &daily_metrics {
         sum_total_ms = sum_total_ms.saturating_add(m.total_ms);
@@ -442,6 +439,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         sum_neutral_ms = sum_neutral_ms.saturating_add(m.neutral_ms);
         sum_prod_active_ms = sum_prod_active_ms.saturating_add(m.productive_active_ms);
         sum_prod_passive_ms = sum_prod_passive_ms.saturating_add(m.productive_passive_ms);
+        sum_prod_idle_ms = sum_prod_idle_ms.saturating_add(m.productive_idle_ms);
     }
     let sum_truncated_total_secs = sum_total_ms / 1000;
     let sum_truncated_prod_secs = sum_prod_ms / 1000;
@@ -449,6 +447,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     let sum_truncated_neutral_secs = sum_neutral_ms / 1000;
     let sum_truncated_prod_active_secs = sum_prod_active_ms / 1000;
     let sum_truncated_prod_passive_secs = sum_prod_passive_ms / 1000;
+    let sum_truncated_prod_idle_secs = sum_prod_idle_ms / 1000;
 
     let total_prod_ratio = if daily_total.total_ms > 0 {
         daily_total.productive_ms as f64 / daily_total.total_ms as f64
@@ -462,12 +461,12 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     };
 
     let avg_total_ms = if workdays > 0 {
-        workday_total.total_ms / workdays
+        daily_total.total_ms / workdays
     } else {
         0
     };
     let avg_productive_ms = if workdays > 0 {
-        workday_total.productive_ms / workdays
+        daily_total.productive_ms / workdays
     } else {
         0
     };
@@ -524,19 +523,27 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         )
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_number_with_format(row, 7, total_prod_ratio, &total_pct_fmt)
+        .write_string_with_format(
+            row,
+            7,
+            fmt_hms(sum_truncated_prod_idle_secs.saturating_mul(1000)),
+            &total_fmt,
+        )
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_number_with_format(row, 8, total_prod_active_pct, &total_pct_fmt)
+        .write_number_with_format(row, 8, total_prod_ratio, &total_pct_fmt)
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_string_with_format(row, 9, fmt_hms(avg_total_ms), &total_fmt)
+        .write_number_with_format(row, 9, total_prod_active_pct, &total_pct_fmt)
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_string_with_format(row, 10, fmt_hms(avg_productive_ms), &total_fmt)
+        .write_string_with_format(row, 10, fmt_hms(avg_total_ms), &total_fmt)
         .map_err(xlsx_err)?;
     daily_sheet
-        .write_number_with_format(row, 11, workdays as f64, &total_fmt)
+        .write_string_with_format(row, 11, fmt_hms(avg_productive_ms), &total_fmt)
+        .map_err(xlsx_err)?;
+    daily_sheet
+        .write_number_with_format(row, 12, workdays as f64, &total_fmt)
         .map_err(xlsx_err)?;
 
     // ── Feature 5: Freeze header row + autofilter ───────────────────────
@@ -553,24 +560,24 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
 
     // Conditional color formatting on Productive Ratio and Productive Active %
     if last_data_row >= 1 {
-        // Productive Ratio (col 7) - red → yellow → green gradient
+        // Productive Ratio (col 8) - red → yellow → green gradient
         let cond_ratio = ConditionalFormat3ColorScale::new()
             .set_minimum_color(Color::RGB(0xF8696B)) // red
             .set_midpoint_color(Color::RGB(0xFFEB84)) // yellow
             .set_maximum_color(Color::RGB(0x63BE7B)); // green
 
         daily_sheet
-            .add_conditional_format(1, 7, last_data_row, 7, &cond_ratio)
+            .add_conditional_format(1, 8, last_data_row, 8, &cond_ratio)
             .map_err(xlsx_err)?;
 
-        // Productive Active % (col 8) - red → yellow → green gradient
+        // Productive Active % (col 9) - red → yellow → green gradient
         let cond_active = ConditionalFormat3ColorScale::new()
             .set_minimum_color(Color::RGB(0xF8696B)) // red
             .set_midpoint_color(Color::RGB(0xFFEB84)) // yellow
             .set_maximum_color(Color::RGB(0x63BE7B)); // green
 
         daily_sheet
-            .add_conditional_format(1, 8, last_data_row, 8, &cond_active)
+            .add_conditional_format(1, 9, last_data_row, 9, &cond_active)
             .map_err(xlsx_err)?;
     }
     daily_sheet.autofit();
