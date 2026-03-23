@@ -266,7 +266,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
 
         for r in rows_iter {
             let (category_raw, active_ms, passive_ms, idle_ms) = r?;
-            let total = active_ms.saturating_add(passive_ms).saturating_add(idle_ms);
+            let total = active_ms.saturating_add(passive_ms);
             m.total_ms = m.total_ms.saturating_add(total);
 
             match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {

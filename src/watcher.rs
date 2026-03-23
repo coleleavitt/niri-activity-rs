@@ -114,6 +114,8 @@ struct SessionAccum<'a> {
     idle_ms: &'a mut i64,
     input_baseline_ms: &'a mut u64,
     session_start_mono_ms: &'a mut u64,
+    input_offsets: &'a mut Vec<u32>,
+    last_seen_input_ms: &'a mut u64,
 }
 
 /// Post-flush accumulator values, returned so callers can log before reset.
@@ -176,6 +178,7 @@ fn flush_session(
                 idle_ms: *accum.idle_ms,
                 input: *input,
                 jiggler_detected: jiggler,
+                input_offsets: std::mem::take(accum.input_offsets),
             },
         )?;
     }
@@ -193,6 +196,7 @@ fn flush_session(
             *accum.active_ms = 0;
             *accum.passive_ms = 0;
             *accum.idle_ms = 0;
+            accum.input_offsets.clear();
         }
         FlushReset::Full {
             new_focus_start,
@@ -205,6 +209,8 @@ fn flush_session(
             *accum.idle_ms = 0;
             *accum.input_baseline_ms = new_baseline_ms;
             *accum.session_start_mono_ms = new_session_mono_ms;
+            *accum.last_seen_input_ms = new_baseline_ms;
+            accum.input_offsets.clear();
         }
     }
 
@@ -324,6 +330,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let mut input_baseline_ms: u64 = input_stats.last_activity_ms();
     let mut session_start_mono_ms: u64 = millis_u64(monitor_start.elapsed());
     let mut logind_warned = false;
+    let mut input_offsets: Vec<u32> = Vec::new();
+    let mut last_seen_input_ms: u64 = input_baseline_ms;
 
     let flush_ctx = FlushContext {
         conn: &conn,
@@ -351,6 +359,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         idle_ms: &mut accumulated_idle_ms,
                         input_baseline_ms: &mut input_baseline_ms,
                         session_start_mono_ms: &mut session_start_mono_ms,
+                        input_offsets: &mut input_offsets,
+                        last_seen_input_ms: &mut last_seen_input_ms,
                     },
                     &input,
                     jiggler,
@@ -421,6 +431,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                     idle_ms: &mut accumulated_idle_ms,
                     input_baseline_ms: &mut input_baseline_ms,
                     session_start_mono_ms: &mut session_start_mono_ms,
+                    input_offsets: &mut input_offsets,
+                    last_seen_input_ms: &mut last_seen_input_ms,
                 },
                 &input,
                 jiggler,
@@ -466,6 +478,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         idle_ms: &mut accumulated_idle_ms,
                         input_baseline_ms: &mut input_baseline_ms,
                         session_start_mono_ms: &mut session_start_mono_ms,
+                        input_offsets: &mut input_offsets,
+                        last_seen_input_ms: &mut last_seen_input_ms,
                     },
                     &input,
                     jiggler,
@@ -507,6 +521,15 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         if !is_locked {
             let now_ms = millis_u64(monitor_start.elapsed());
             let last_input_ms = input_stats.last_activity_ms();
+
+            if last_input_ms > last_seen_input_ms {
+                let offset = last_input_ms.saturating_sub(session_start_mono_ms);
+                if let Ok(offset_u32) = u32::try_from(offset) {
+                    input_offsets.push(offset_u32);
+                }
+                last_seen_input_ms = last_input_ms;
+            }
+
             let idle_duration_ms = if last_input_ms > input_baseline_ms {
                 now_ms.saturating_sub(last_input_ms)
             } else {
@@ -524,9 +547,20 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             };
 
             if new_state == ActivityState::Away && current_state != ActivityState::Away {
-                let input = input_stats.snapshot();
-                let jiggler = input_stats.jiggler_detected();
                 let info = focused_id.and_then(|id| windows.get(&id));
+                let (input, jiggler) = if info.is_some() {
+                    (input_stats.snapshot(), input_stats.jiggler_detected())
+                } else {
+                    (
+                        InputSnapshot {
+                            keystrokes: 0,
+                            mouse_clicks: 0,
+                            scroll_events: 0,
+                            mouse_distance: 0,
+                        },
+                        false,
+                    )
+                };
                 flush_session(
                     &flush_ctx,
                     info,
@@ -537,6 +571,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                         idle_ms: &mut accumulated_idle_ms,
                         input_baseline_ms: &mut input_baseline_ms,
                         session_start_mono_ms: &mut session_start_mono_ms,
+                        input_offsets: &mut input_offsets,
+                        last_seen_input_ms: &mut last_seen_input_ms,
                     },
                     &input,
                     jiggler,
@@ -619,6 +655,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             idle_ms: &mut accumulated_idle_ms,
                             input_baseline_ms: &mut input_baseline_ms,
                             session_start_mono_ms: &mut session_start_mono_ms,
+                            input_offsets: &mut input_offsets,
+                            last_seen_input_ms: &mut last_seen_input_ms,
                         },
                         &input,
                         jiggler,
@@ -667,6 +705,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             idle_ms: &mut accumulated_idle_ms,
                             input_baseline_ms: &mut input_baseline_ms,
                             session_start_mono_ms: &mut session_start_mono_ms,
+                            input_offsets: &mut input_offsets,
+                            last_seen_input_ms: &mut last_seen_input_ms,
                         },
                         &input,
                         jiggler,
@@ -701,22 +741,28 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             idle_ms: &mut accumulated_idle_ms,
                             input_baseline_ms: &mut input_baseline_ms,
                             session_start_mono_ms: &mut session_start_mono_ms,
+                            input_offsets: &mut input_offsets,
+                            last_seen_input_ms: &mut last_seen_input_ms,
                         },
                         &input,
                         jiggler,
                         FlushReset::NoReset,
                     )?;
                 }
+                // Unconditionally reset accumulators after flush to prevent
+                // double-counting if no window in the new list is focused.
+                accumulated_active_ms = 0;
+                accumulated_passive_ms = 0;
+                accumulated_idle_ms = 0;
+                focused_id = None;
                 windows.clear();
                 for w in &win_list {
                     windows.insert(w.id, WindowInfo::from(w));
                     if w.is_focused {
                         focused_id = Some(w.id);
                         focus_start = now;
-                        accumulated_active_ms = 0;
-                        accumulated_passive_ms = 0;
-                        accumulated_idle_ms = 0;
                         last_idle_check = now_instant;
+                        last_flush = now_instant;
                         input_baseline_ms = input_stats.last_activity_ms();
                         session_start_mono_ms = millis_u64(monitor_start.elapsed());
                     }
@@ -748,6 +794,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                                 idle_ms: &mut accumulated_idle_ms,
                                 input_baseline_ms: &mut input_baseline_ms,
                                 session_start_mono_ms: &mut session_start_mono_ms,
+                                input_offsets: &mut input_offsets,
+                                last_seen_input_ms: &mut last_seen_input_ms,
                             },
                             &input,
                             jiggler,
@@ -789,6 +837,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             idle_ms: &mut accumulated_idle_ms,
                             input_baseline_ms: &mut input_baseline_ms,
                             session_start_mono_ms: &mut session_start_mono_ms,
+                            input_offsets: &mut input_offsets,
+                            last_seen_input_ms: &mut last_seen_input_ms,
                         },
                         &input,
                         jiggler,

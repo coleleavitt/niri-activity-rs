@@ -318,7 +318,7 @@ pub fn query_metrics_range(app: &App, range: TimeRange) -> Result<MetricsData, E
 
     for row in rows {
         let (category_raw, active_ms, passive_ms, idle_ms) = row?;
-        let total = active_ms.saturating_add(passive_ms).saturating_add(idle_ms);
+        let total = active_ms.saturating_add(passive_ms);
         m.total_ms = m.total_ms.saturating_add(total);
 
         match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
@@ -2052,7 +2052,7 @@ pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
 
         for row in rows {
             let (category_raw, active_ms, passive_ms, idle_ms) = row?;
-            let total = active_ms.saturating_add(passive_ms).saturating_add(idle_ms);
+            let total = active_ms.saturating_add(passive_ms);
             m.total_ms = m.total_ms.saturating_add(total);
 
             match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {

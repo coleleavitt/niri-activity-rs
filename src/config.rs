@@ -269,18 +269,24 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
                     let ms = num * 3600.0 * 1000.0;
                     if ms.is_finite() && ms >= 0.0 && ms <= i64::MAX as f64 {
                         total_ms = total_ms.checked_add(ms as i64)?;
+                    } else {
+                        return None;
                     }
                 }
                 'm' => {
                     let ms = num * 60.0 * 1000.0;
                     if ms.is_finite() && ms >= 0.0 && ms <= i64::MAX as f64 {
                         total_ms = total_ms.checked_add(ms as i64)?;
+                    } else {
+                        return None;
                     }
                 }
                 's' => {
                     let ms = num * 1000.0;
                     if ms.is_finite() && ms >= 0.0 && ms <= i64::MAX as f64 {
                         total_ms = total_ms.checked_add(ms as i64)?;
+                    } else {
+                        return None;
                     }
                 }
                 _ => {}
@@ -348,7 +354,7 @@ pub struct Config {
 }
 
 fn default_idle_threshold() -> u64 {
-    60
+    120
 }
 
 fn default_deep_idle() -> u64 {
@@ -790,7 +796,7 @@ pub fn init_config() -> Result<(), Error> {
     }
 
     let example = r#"# Seconds without input before state transitions to Passive (default: 60)
-idle_threshold_secs = 60
+idle_threshold_secs = 120
 
 # Seconds without input before Passive transitions to Idle (default: 300)
 deep_idle_secs = 300

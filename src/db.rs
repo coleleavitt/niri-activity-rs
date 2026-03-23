@@ -15,6 +15,7 @@ pub struct SessionSnapshot<'a> {
     pub idle_ms: i64,
     pub input: InputSnapshot,
     pub jiggler_detected: bool,
+    pub input_offsets: Vec<u32>,
 }
 
 pub fn init_db(conn: &Connection) -> Result<(), Error> {
@@ -185,6 +186,17 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         eprintln!("Migration 004: added passive_ms and jiggler_detected columns");
     }
 
+    if !applied.contains(&"005_add_input_offsets".to_string()) {
+        let tx = conn.transaction()?;
+        tx.execute("ALTER TABLE events ADD COLUMN input_offsets BLOB", [])?;
+        tx.execute(
+            "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
+            params!["005_add_input_offsets", Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        eprintln!("Migration 005: added input_offsets column for retroactive reclassification");
+    }
+
     Ok(())
 }
 
@@ -250,9 +262,14 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
     let category = snapshot
         .config
         .classify(&snapshot.window.app_id, &snapshot.window.title);
+    let offsets_blob: Vec<u8> = snapshot
+        .input_offsets
+        .iter()
+        .flat_map(|&n| n.to_le_bytes())
+        .collect();
     conn.execute(
-        "INSERT INTO events (timestamp, app_id, title, category, active_ms, passive_ms, idle_ms, keystrokes, mouse_clicks, scroll_events, mouse_distance, jiggler_detected) 
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO events (timestamp, app_id, title, category, active_ms, passive_ms, idle_ms, keystrokes, mouse_clicks, scroll_events, mouse_distance, jiggler_detected, input_offsets) 
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             snapshot.focus_start.to_rfc3339(),
             &snapshot.window.app_id,
@@ -266,7 +283,137 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
             i64::try_from(snapshot.input.scroll_events).unwrap_or(i64::MAX),
             i64::try_from(snapshot.input.mouse_distance).unwrap_or(i64::MAX),
             snapshot.jiggler_detected as i32,
+            offsets_blob,
         ],
     )?;
     Ok(())
+}
+
+fn decode_input_offsets(blob: &[u8]) -> Vec<u32> {
+    blob.chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+fn replay_classification(
+    offsets: &[u32],
+    total_duration_ms: i64,
+    idle_threshold_ms: u64,
+    deep_idle_threshold_ms: u64,
+) -> (i64, i64, i64) {
+    if offsets.is_empty() || total_duration_ms <= 0 {
+        return (0, 0, total_duration_ms.max(0));
+    }
+
+    let mut active_ms: i64 = 0;
+    let mut passive_ms: i64 = 0;
+    let mut idle_ms: i64 = 0;
+
+    let mut prev_offset: u64 = 0;
+    for &offset in offsets {
+        let offset_u64 = u64::from(offset);
+        if offset_u64 <= prev_offset {
+            continue;
+        }
+        let gap = offset_u64.saturating_sub(prev_offset);
+
+        if gap <= idle_threshold_ms {
+            active_ms = active_ms.saturating_add(i64::try_from(gap).unwrap_or(i64::MAX));
+        } else if gap <= deep_idle_threshold_ms {
+            active_ms =
+                active_ms.saturating_add(i64::try_from(idle_threshold_ms).unwrap_or(i64::MAX));
+            passive_ms = passive_ms
+                .saturating_add(i64::try_from(gap - idle_threshold_ms).unwrap_or(i64::MAX));
+        } else {
+            active_ms =
+                active_ms.saturating_add(i64::try_from(idle_threshold_ms).unwrap_or(i64::MAX));
+            passive_ms = passive_ms.saturating_add(
+                i64::try_from(deep_idle_threshold_ms - idle_threshold_ms).unwrap_or(i64::MAX),
+            );
+            idle_ms = idle_ms
+                .saturating_add(i64::try_from(gap - deep_idle_threshold_ms).unwrap_or(i64::MAX));
+        }
+        prev_offset = offset_u64;
+    }
+
+    let last_offset = u64::from(*offsets.last().unwrap_or(&0));
+    let total_u64 = u64::try_from(total_duration_ms).unwrap_or(0);
+    if total_u64 > last_offset {
+        let trailing_gap = total_u64 - last_offset;
+        if trailing_gap <= idle_threshold_ms {
+            active_ms = active_ms.saturating_add(i64::try_from(trailing_gap).unwrap_or(i64::MAX));
+        } else if trailing_gap <= deep_idle_threshold_ms {
+            active_ms =
+                active_ms.saturating_add(i64::try_from(idle_threshold_ms).unwrap_or(i64::MAX));
+            passive_ms = passive_ms.saturating_add(
+                i64::try_from(trailing_gap - idle_threshold_ms).unwrap_or(i64::MAX),
+            );
+        } else {
+            active_ms =
+                active_ms.saturating_add(i64::try_from(idle_threshold_ms).unwrap_or(i64::MAX));
+            passive_ms = passive_ms.saturating_add(
+                i64::try_from(deep_idle_threshold_ms - idle_threshold_ms).unwrap_or(i64::MAX),
+            );
+            idle_ms = idle_ms.saturating_add(
+                i64::try_from(trailing_gap - deep_idle_threshold_ms).unwrap_or(i64::MAX),
+            );
+        }
+    }
+
+    (active_ms, passive_ms, idle_ms)
+}
+
+pub fn reclassify_with_thresholds(
+    conn: &mut Connection,
+    idle_threshold_secs: u64,
+    deep_idle_secs: u64,
+) -> Result<(i64, i64), Error> {
+    let idle_threshold_ms = idle_threshold_secs.saturating_mul(1000);
+    let deep_idle_threshold_ms = deep_idle_secs.saturating_mul(1000);
+
+    let rows: Vec<(i64, Option<Vec<u8>>, i64, i64, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, input_offsets, active_ms, passive_ms, idle_ms FROM events WHERE input_offsets IS NOT NULL"
+        )?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let total_rows = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+    let mut updated: i64 = 0;
+
+    let tx = conn.transaction()?;
+    for (id, blob_opt, old_active, old_passive, old_idle) in rows {
+        if let Some(blob) = blob_opt {
+            let offsets = decode_input_offsets(&blob);
+            let total_duration = old_active
+                .saturating_add(old_passive)
+                .saturating_add(old_idle);
+            let (new_active, new_passive, new_idle) = replay_classification(
+                &offsets,
+                total_duration,
+                idle_threshold_ms,
+                deep_idle_threshold_ms,
+            );
+
+            if new_active != old_active || new_passive != old_passive || new_idle != old_idle {
+                tx.execute(
+                    "UPDATE events SET active_ms = ?1, passive_ms = ?2, idle_ms = ?3 WHERE id = ?4",
+                    params![new_active, new_passive, new_idle, id],
+                )?;
+                updated = updated.saturating_add(1);
+            }
+        }
+    }
+    tx.commit()?;
+
+    Ok((updated, total_rows))
 }

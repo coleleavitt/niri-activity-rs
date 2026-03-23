@@ -95,6 +95,9 @@ fn parse_time_range(days: u32, time: &TimeRangeArgs) -> Result<report::TimeRange
     } else if time.this_month {
         report::TimeRange::ThisMonth
     } else if time.aligned {
+        if days == 0 {
+            return Err(Error::NiriError("--aligned requires --days >= 1".into()));
+        }
         report::TimeRange::DaysAligned(days)
     } else {
         report::TimeRange::Days(days)
@@ -173,8 +176,21 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Reclassify active/passive/idle times using new thresholds (only for events with input_offsets)
+    ReclassifyThresholds {
+        /// Seconds of no input before Active → Passive (default: use config value)
+        #[arg(long)]
+        idle_threshold: Option<u64>,
+        /// Seconds of no input before Passive → Idle (default: use config value)
+        #[arg(long)]
+        deep_idle: Option<u64>,
+    },
     /// Send activity report via email
     Email {
+        #[arg(short, long, default_value = "7")]
+        days: u32,
+        #[command(flatten)]
+        time: TimeRangeArgs,
         /// Send weekly report (last Mon-Sun)
         #[arg(long)]
         weekly: bool,
@@ -281,7 +297,34 @@ fn main() {
             }
             Ok(())
         })(),
+        Some(Commands::ReclassifyThresholds {
+            idle_threshold,
+            deep_idle,
+        }) => (|| -> Result<(), Error> {
+            let cfg = config::load_config()?;
+            let idle_secs = idle_threshold.unwrap_or(cfg.idle_threshold_secs);
+            let deep_secs = deep_idle.unwrap_or(cfg.deep_idle_secs);
+
+            let data_dir = config::get_data_dir()?;
+            let db_path = data_dir.join("activity.db");
+            let mut conn = rusqlite::Connection::open(&db_path)?;
+            db::run_migrations(&mut conn, &cfg)?;
+
+            let (updated, total) = db::reclassify_with_thresholds(&mut conn, idle_secs, deep_secs)?;
+            println!(
+                "Reclassified {}/{} events with input_offsets (idle={}s, deep_idle={}s)",
+                updated, total, idle_secs, deep_secs
+            );
+            if total == 0 {
+                println!(
+                    "Note: No events have input_offsets stored yet. Only future events will support retroactive reclassification."
+                );
+            }
+            Ok(())
+        })(),
         Some(Commands::Email {
+            days,
+            time,
             weekly,
             monthly,
             test,
@@ -294,13 +337,23 @@ fn main() {
             if test {
                 let cfg = config::load_config()?;
                 email::test_email_config(&cfg)?;
+            } else if time.from.is_some() || time.to.is_some() {
+                // Custom date range takes precedence
+                let range = parse_time_range(days, &time)?;
+                let period_name = if let (Some(from), Some(to)) = (&time.from, &time.to) {
+                    format!("Custom ({} to {})", from, to)
+                } else {
+                    "Custom".to_string()
+                };
+                report::App::open()
+                    .and_then(|app| email::send_report(&app, range, &period_name))?;
             } else if weekly {
                 report::App::open().and_then(|app| email::send_weekly_report(&app))?;
             } else if monthly {
                 report::App::open().and_then(|app| email::send_monthly_report(&app))?;
             } else if !secure {
                 return Err(Error::NiriError(
-                    "Specify --weekly, --monthly, --test, or --secure".into(),
+                    "Specify --weekly, --monthly, --from/--to, --test, or --secure".into(),
                 ));
             }
             Ok(())
