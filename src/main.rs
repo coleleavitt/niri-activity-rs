@@ -176,12 +176,15 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Reclassify active/passive/idle times using new thresholds (only for events with input_offsets)
+    /// Reclassify active/passive/idle times using new thresholds (only for
+    /// events with input_offsets)
     ReclassifyThresholds {
-        /// Seconds of no input before Active → Passive (default: use config value)
+        /// Seconds of no input before Active → Passive (default: use config
+        /// value)
         #[arg(long)]
         idle_threshold: Option<u64>,
-        /// Seconds of no input before Passive → Idle (default: use config value)
+        /// Seconds of no input before Passive → Idle (default: use config
+        /// value)
         #[arg(long)]
         deep_idle: Option<u64>,
     },
