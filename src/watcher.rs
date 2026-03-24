@@ -333,6 +333,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let mut logind_warned = false;
     let mut input_offsets: Vec<u32> = Vec::new();
     let mut last_seen_input_ms: u64 = input_baseline_ms;
+    let mut last_heartbeat_value: u64 = 0;
+    let mut last_heartbeat_check = Instant::now();
+    let mut input_thread_warned = false;
+    const HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
     let flush_ctx = FlushContext {
         conn: &conn,
@@ -457,12 +461,27 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
 
         let locked_now = logind.is_locked();
 
-        // Check for logind listener thread death (warn once)
         if !logind_warned && logind.has_thread_error() {
             eprintln!(
                 "[watcher] Warning: logind listener thread died, lock/suspend detection may be degraded"
             );
             logind_warned = true;
+        }
+
+        if now_instant.duration_since(last_heartbeat_check) >= HEARTBEAT_CHECK_INTERVAL {
+            let current_hb = input_stats.heartbeat();
+            if current_hb == last_heartbeat_value && current_hb > 0 && !input_thread_warned {
+                eprintln!(
+                    "[watcher] WARNING: input-poll thread heartbeat stalled at {} — input tracking may be degraded",
+                    current_hb,
+                );
+                input_thread_warned = true;
+            } else if current_hb != last_heartbeat_value && input_thread_warned {
+                eprintln!("[watcher] input-poll thread heartbeat resumed");
+                input_thread_warned = false;
+            }
+            last_heartbeat_value = current_hb;
+            last_heartbeat_check = now_instant;
         }
 
         if locked_now && !is_locked {

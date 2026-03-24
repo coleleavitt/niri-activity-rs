@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::{fmt, fs};
 
-use chrono::{DateTime, Datelike, Local, NaiveTime};
+use chrono::{DateTime, Datelike, Local, NaiveTime, TimeZone};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
@@ -321,6 +322,8 @@ struct RawConfig {
     #[serde(default = "default_streak_idle_timeout")]
     streak_idle_timeout_secs: u64,
     #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
     schedule: Schedule,
     #[serde(default)]
     goals: Goals,
@@ -346,6 +349,7 @@ pub struct Config {
     pub input_active_secs: u64,
     pub streak_break_tolerance_secs: u64,
     pub streak_idle_timeout_secs: u64,
+    pub timezone: Option<Tz>,
     pub schedule: Schedule,
     pub goals: Goals,
     pub email: Email,
@@ -499,6 +503,17 @@ impl From<RawConfig> for Config {
                 }
             })
             .collect();
+        let timezone = raw.timezone.and_then(|tz_str| match tz_str.parse::<Tz>() {
+            Ok(tz) => Some(tz),
+            Err(_) => {
+                eprintln!(
+                    "Warning: invalid timezone '{}', using system timezone",
+                    tz_str
+                );
+                None
+            }
+        });
+
         Self {
             idle_threshold_secs: raw.idle_threshold_secs,
             deep_idle_secs: raw.deep_idle_secs,
@@ -508,6 +523,7 @@ impl From<RawConfig> for Config {
             input_active_secs: raw.input_active_secs,
             streak_break_tolerance_secs: raw.streak_break_tolerance_secs,
             streak_idle_timeout_secs: raw.streak_idle_timeout_secs,
+            timezone,
             schedule: raw.schedule,
             goals: raw.goals,
             email: raw.email,
@@ -530,6 +546,7 @@ impl Default for Config {
             input_active_secs: default_input_active_secs(),
             streak_break_tolerance_secs: default_streak_break_tolerance(),
             streak_idle_timeout_secs: default_streak_idle_timeout(),
+            timezone: None,
             schedule: Schedule::default(),
             goals: Goals::default(),
             email: Email::default(),
@@ -613,6 +630,44 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 }
 
 impl Config {
+    pub fn local_now(&self) -> DateTime<chrono::FixedOffset> {
+        let utc_now = chrono::Utc::now();
+        if let Some(tz) = self.timezone {
+            utc_now.with_timezone(&tz).fixed_offset()
+        } else {
+            utc_now.with_timezone(&Local).fixed_offset()
+        }
+    }
+
+    pub fn local_date_today(&self) -> chrono::NaiveDate {
+        self.local_now().date_naive()
+    }
+
+    pub fn day_start_utc(&self, date: chrono::NaiveDate) -> Option<chrono::DateTime<chrono::Utc>> {
+        let midnight = date.and_hms_opt(0, 0, 0)?;
+        let local_dt = if let Some(tz) = self.timezone {
+            match tz.from_local_datetime(&midnight) {
+                chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+                    dt.with_timezone(&chrono::Utc)
+                }
+                chrono::LocalResult::None => return None,
+            }
+        } else {
+            match midnight.and_local_timezone(Local) {
+                chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+                    dt.with_timezone(&chrono::Utc)
+                }
+                chrono::LocalResult::None => return None,
+            }
+        };
+        Some(local_dt)
+    }
+
+    pub fn day_end_utc(&self, date: chrono::NaiveDate) -> Option<chrono::DateTime<chrono::Utc>> {
+        let next_day = date.succ_opt()?;
+        self.day_start_utc(next_day)
+    }
+
     fn app_category(&self, app_id: &str) -> Option<Category> {
         if let Some(&cat) = self.categories.get(app_id) {
             return Some(cat);

@@ -9,7 +9,7 @@ mod types;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use chrono::{Datelike, Local, LocalResult, NaiveDate, Timelike, Utc};
+use chrono::{Datelike, Local, NaiveDate, Timelike};
 // Re-export Excel functions
 pub use excel::export_xlsx_range;
 use owo_colors::OwoColorize;
@@ -85,31 +85,29 @@ pub struct TimeBounds {
 }
 
 impl TimeRange {
-    /// Resolve the time range to concrete UTC timestamps
-    pub fn resolve(&self) -> Result<TimeBounds, Error> {
-        let now = Local::now();
-        let today = now.date_naive();
+    pub fn resolve(&self, config: &Config) -> Result<TimeBounds, Error> {
+        let now_fixed = config.local_now();
+        let today = now_fixed.date_naive();
+        let now_str = now_fixed.format("%Y-%m-%d %H:%M").to_string();
 
         match self {
             TimeRange::Days(days) => {
-                let since = now - chrono::Duration::days(*days as i64);
-                let since_date = since.date_naive();
-                let since_utc = local_day_start_utc(since_date)?;
+                let since_date = today - chrono::Duration::days(*days as i64);
+                let since_utc = config_day_start_utc(config, since_date)?;
                 Ok(TimeBounds {
                     since_utc,
                     until_utc: None,
                     since_str: format!("{} 00:00", since_date),
-                    now_str: now.format("%Y-%m-%d %H:%M").to_string(),
+                    now_str,
                     start_date: since_date,
                     end_date: today,
                 })
             }
             TimeRange::DaysAligned(days) => {
-                // End at yesterday 23:59:59, go back N full days
                 let end_date = today - chrono::Duration::days(1);
                 let start_date = end_date - chrono::Duration::days(*days as i64 - 1);
-                let since_utc = local_day_start_utc(start_date)?;
-                let until_utc = local_day_end_utc(end_date)?;
+                let since_utc = config_day_start_utc(config, start_date)?;
+                let until_utc = config_day_end_utc(config, end_date)?;
                 Ok(TimeBounds {
                     since_utc,
                     until_utc: Some(until_utc),
@@ -120,13 +118,12 @@ impl TimeRange {
                 })
             }
             TimeRange::LastWeek => {
-                // Find last Monday (start of last week)
                 let days_since_monday = today.weekday().num_days_from_monday();
                 let this_monday = today - chrono::Duration::days(days_since_monday as i64);
                 let last_monday = this_monday - chrono::Duration::days(7);
                 let last_sunday = last_monday + chrono::Duration::days(6);
-                let since_utc = local_day_start_utc(last_monday)?;
-                let until_utc = local_day_end_utc(last_sunday)?;
+                let since_utc = config_day_start_utc(config, last_monday)?;
+                let until_utc = config_day_end_utc(config, last_sunday)?;
                 Ok(TimeBounds {
                     since_utc,
                     until_utc: Some(until_utc),
@@ -137,21 +134,19 @@ impl TimeRange {
                 })
             }
             TimeRange::ThisWeek => {
-                // This Monday 00:00 → now
                 let days_since_monday = today.weekday().num_days_from_monday();
                 let this_monday = today - chrono::Duration::days(days_since_monday as i64);
-                let since_utc = local_day_start_utc(this_monday)?;
+                let since_utc = config_day_start_utc(config, this_monday)?;
                 Ok(TimeBounds {
                     since_utc,
                     until_utc: None,
                     since_str: format!("{} 00:00", this_monday),
-                    now_str: now.format("%Y-%m-%d %H:%M").to_string(),
+                    now_str,
                     start_date: this_monday,
                     end_date: today,
                 })
             }
             TimeRange::LastMonth => {
-                // First day of last month → last day of last month
                 let first_of_this_month = today
                     .with_day(1)
                     .ok_or_else(|| Error::NiriError("invalid date calculation".into()))?;
@@ -159,8 +154,8 @@ impl TimeRange {
                 let first_of_last_month = last_day_prev_month
                     .with_day(1)
                     .ok_or_else(|| Error::NiriError("invalid date calculation".into()))?;
-                let since_utc = local_day_start_utc(first_of_last_month)?;
-                let until_utc = local_day_end_utc(last_day_prev_month)?;
+                let since_utc = config_day_start_utc(config, first_of_last_month)?;
+                let until_utc = config_day_end_utc(config, last_day_prev_month)?;
                 Ok(TimeBounds {
                     since_utc,
                     until_utc: Some(until_utc),
@@ -174,20 +169,20 @@ impl TimeRange {
                 let first_of_month = today
                     .with_day(1)
                     .ok_or_else(|| Error::NiriError("invalid date calculation".into()))?;
-                let since_utc = local_day_start_utc(first_of_month)?;
+                let since_utc = config_day_start_utc(config, first_of_month)?;
                 Ok(TimeBounds {
                     since_utc,
                     until_utc: None,
                     since_str: format!("{} 00:00", first_of_month),
-                    now_str: now.format("%Y-%m-%d %H:%M").to_string(),
+                    now_str,
                     start_date: first_of_month,
                     end_date: today,
                 })
             }
             TimeRange::Yesterday => {
                 let yesterday = today - chrono::Duration::days(1);
-                let since_utc = local_day_start_utc(yesterday)?;
-                let until_utc = local_day_end_utc(yesterday)?;
+                let since_utc = config_day_start_utc(config, yesterday)?;
+                let until_utc = config_day_end_utc(config, yesterday)?;
                 Ok(TimeBounds {
                     since_utc,
                     until_utc: Some(until_utc),
@@ -198,8 +193,8 @@ impl TimeRange {
                 })
             }
             TimeRange::DateRange(start, end) => {
-                let since_utc = local_day_start_utc(*start)?;
-                let until_utc = local_day_end_utc(*end)?;
+                let since_utc = config_day_start_utc(config, *start)?;
+                let until_utc = config_day_end_utc(config, *end)?;
                 Ok(TimeBounds {
                     since_utc,
                     until_utc: Some(until_utc),
@@ -217,24 +212,24 @@ impl TimeRange {
 // Time helpers
 // ---------------------------------------------------------------------------
 
-fn local_day_start_utc(date: chrono::NaiveDate) -> Result<String, Error> {
-    let day_start = date
-        .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| Error::NiriError("invalid local day start".into()))?;
-    let local_dt = match day_start.and_local_timezone(Local) {
-        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
-        LocalResult::None => {
-            return Err(Error::NiriError(
-                "local day start is not representable".into(),
-            ));
-        }
-    };
-    Ok(local_dt.with_timezone(&Utc).to_rfc3339())
+pub(super) fn config_day_start_utc(
+    config: &Config,
+    date: chrono::NaiveDate,
+) -> Result<String, Error> {
+    config
+        .day_start_utc(date)
+        .map(|dt| dt.to_rfc3339())
+        .ok_or_else(|| Error::NiriError("day start is not representable".into()))
 }
 
-fn local_day_end_utc(date: chrono::NaiveDate) -> Result<String, Error> {
-    let next_day = date + chrono::Duration::days(1);
-    local_day_start_utc(next_day)
+pub(super) fn config_day_end_utc(
+    config: &Config,
+    date: chrono::NaiveDate,
+) -> Result<String, Error> {
+    config
+        .day_end_utc(date)
+        .map(|dt| dt.to_rfc3339())
+        .ok_or_else(|| Error::NiriError("day end is not representable".into()))
 }
 
 fn parse_timestamp_local(value: &str) -> Option<chrono::DateTime<Local>> {
@@ -248,10 +243,9 @@ fn parse_timestamp_local(value: &str) -> Option<chrono::DateTime<Local>> {
 // ---------------------------------------------------------------------------
 
 pub fn query_today(app: &App) -> Result<TodayData, Error> {
-    let date = Local::now().date_naive();
-    let day_start_utc = local_day_start_utc(date)?;
-
-    let day_end_utc = local_day_end_utc(date)?;
+    let date = app.config.local_date_today();
+    let day_start_utc = config_day_start_utc(&app.config, date)?;
+    let day_end_utc = config_day_end_utc(&app.config, date)?;
     let mut stmt = app.conn.prepare(
         "SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) as total_ms 
          FROM events 
@@ -281,7 +275,7 @@ pub fn query_today(app: &App) -> Result<TodayData, Error> {
 }
 
 pub fn query_metrics_range(app: &App, range: TimeRange) -> Result<MetricsData, Error> {
-    let bounds = range.resolve()?;
+    let bounds = range.resolve(&app.config)?;
     let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
     let days = u32::try_from((bounds.end_date - bounds.start_date).num_days())
         .unwrap_or(u32::MAX)
@@ -340,9 +334,9 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
     if bucket_min == 0 {
         return Err(Error::NiriError("bucket size must be positive".into()));
     }
-    let date = Local::now().date_naive() - chrono::Duration::days(days_back as i64);
-    let day_start_utc = local_day_start_utc(date)?;
-    let day_end_utc = local_day_end_utc(date)?;
+    let date = app.config.local_date_today() - chrono::Duration::days(days_back as i64);
+    let day_start_utc = config_day_start_utc(&app.config, date)?;
+    let day_end_utc = config_day_end_utc(&app.config, date)?;
 
     let mut stmt = app.conn.prepare(
         "SELECT timestamp, app_id, category, active_ms, COALESCE(passive_ms,0), idle_ms, keystrokes
@@ -457,7 +451,7 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
 }
 
 pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Error> {
-    let bounds = range.resolve()?;
+    let bounds = range.resolve(&app.config)?;
     let since_utc = &bounds.since_utc;
     let since_str = bounds.since_str.clone();
     let now_str = bounds.now_str.clone();
@@ -1854,7 +1848,7 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
 }
 
 pub fn show_comparison(app: &App, range: TimeRange) -> Result<(), Error> {
-    let current_bounds = range.resolve()?;
+    let current_bounds = range.resolve(&app.config)?;
     let current_days = (current_bounds.end_date - current_bounds.start_date)
         .num_days()
         .saturating_add(1);
@@ -2018,7 +2012,7 @@ pub fn show_comparison(app: &App, range: TimeRange) -> Result<(), Error> {
 // ---------------------------------------------------------------------------
 
 pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
-    let bounds = range.resolve()?;
+    let bounds = range.resolve(&app.config)?;
     let since_local = bounds.start_date;
     let today_local = bounds.end_date;
 
@@ -2035,8 +2029,8 @@ pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
         if csv_iterations > 10_000 {
             break; // safety bound
         }
-        let day_start = local_day_start_utc(date)?;
-        let day_end = local_day_end_utc(date)?;
+        let day_start = config_day_start_utc(&app.config, date)?;
+        let day_end = config_day_end_utc(&app.config, date)?;
 
         let mut stmt = app.conn.prepare(
             "SELECT category, SUM(active_ms), COALESCE(SUM(passive_ms),0), SUM(idle_ms)
@@ -2170,7 +2164,7 @@ pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
 }
 
 pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
-    let bounds = range.resolve()?;
+    let bounds = range.resolve(&app.config)?;
     let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
 
     let mut stmt = app.conn.prepare(

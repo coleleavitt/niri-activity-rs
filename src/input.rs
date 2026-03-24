@@ -40,6 +40,9 @@ pub struct InputStats {
     jiggler_process: Arc<AtomicBool>,
     last_keyboard_ms: Arc<AtomicU64>,
     last_meaningful_input_ms: Arc<AtomicU64>,
+    /// Monotonic heartbeat counter incremented every poll iteration.
+    /// If this stops advancing, the input-poll thread has died.
+    heartbeat: Arc<AtomicU64>,
 }
 
 impl InputStats {
@@ -64,6 +67,10 @@ impl InputStats {
 
     pub fn jiggler_detected(&self) -> bool {
         self.jiggler_pattern.load(Ordering::Acquire) || self.jiggler_process.load(Ordering::Acquire)
+    }
+
+    pub fn heartbeat(&self) -> u64 {
+        self.heartbeat.load(Ordering::Acquire)
     }
 }
 
@@ -208,6 +215,237 @@ pub fn enumerate_input_devices() -> Vec<evdev::Device> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn input_poll_inner(
+    start: Instant,
+    mouse_idle_threshold: u64,
+    jiggler_enabled: bool,
+    jiggler_config: &JigglerConfig,
+    devices_changed: &AtomicBool,
+    last_activity: &AtomicU64,
+    keystrokes: &AtomicU64,
+    mouse_clicks: &AtomicU64,
+    scroll_events: &AtomicU64,
+    mouse_distance: &AtomicU64,
+    jiggler_pattern_flag: &AtomicBool,
+    last_keyboard_ms: &AtomicU64,
+    last_meaningful: &AtomicU64,
+    heartbeat: &AtomicU64,
+) {
+    let mut devices = enumerate_input_devices();
+
+    if devices.is_empty() {
+        eprintln!("Warning: No input devices found. Idle detection disabled.");
+        eprintln!("  (May need to add user to 'input' group: sudo usermod -aG input $USER)");
+        return;
+    }
+
+    eprintln!("Monitoring {} input device(s) for activity", devices.len());
+
+    let mut last_reenumerate = Instant::now();
+    let mut last_mouse_event = Instant::now();
+    let mut last_keyboard_event = Instant::now();
+
+    let mut kb_tracker = IntervalTracker::new(jiggler_config);
+    let mut mouse_tracker = IntervalTracker::new(jiggler_config);
+    let mut last_mouse_tracker_ms: u64 = 0;
+    let mut last_jiggler_check = Instant::now();
+
+    let mut motion_dx: i64 = 0;
+    let mut motion_dy: i64 = 0;
+    let mut motion_window_start_ms: u64 = 0;
+    const MOTION_WINDOW_MS: u64 = 2000;
+
+    // Hi-res scroll accumulators (120 hi-res units = 1 notch).
+    // Kernel drivers (hid-input.c, hid-logitech-hidpp.c) may emit only
+    // REL_WHEEL_HI_RES without a corresponding REL_WHEEL when the
+    // accumulated value hasn't reached one full notch (120 units).
+    let mut hires_wheel_accum: i64 = 0;
+    let mut hires_hwheel_accum: i64 = 0;
+    let mut seen_hires_wheel = false;
+    let mut seen_hires_hwheel = false;
+
+    const REENUMERATE_INTERVAL: Duration = Duration::from_mins(1);
+    const STALE_MOUSE_THRESHOLD: Duration = Duration::from_secs(30);
+    const REENUMERATE_COOLDOWN: Duration = Duration::from_secs(10);
+    const JIGGLER_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+    const HIRES_SCROLL_DIVISOR: i64 = 120;
+
+    loop {
+        let loop_now = Instant::now();
+        heartbeat.fetch_add(1, Ordering::Release);
+
+        if devices_changed.swap(false, Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(100));
+            let new_devices = enumerate_input_devices();
+            eprintln!(
+                "Re-enumerated (hotplug): {} -> {} devices",
+                devices.len(),
+                new_devices.len()
+            );
+            devices = new_devices;
+            last_reenumerate = loop_now;
+            last_mouse_event = loop_now;
+        }
+
+        if loop_now.duration_since(last_reenumerate) >= REENUMERATE_INTERVAL {
+            let new_devices = enumerate_input_devices();
+            if new_devices.len() != devices.len() {
+                eprintln!(
+                    "Re-enumerated (periodic): {} -> {} devices",
+                    devices.len(),
+                    new_devices.len()
+                );
+            }
+            devices = new_devices;
+            last_reenumerate = loop_now;
+        }
+
+        if loop_now.duration_since(last_keyboard_event) < Duration::from_secs(5)
+            && loop_now.duration_since(last_mouse_event) >= STALE_MOUSE_THRESHOLD
+            && loop_now.duration_since(last_reenumerate) >= REENUMERATE_COOLDOWN
+        {
+            eprintln!(
+                "Stale mouse detected (no mouse events for {}s, keyboard active). Re-enumerating...",
+                loop_now.duration_since(last_mouse_event).as_secs()
+            );
+            devices = enumerate_input_devices();
+            last_reenumerate = loop_now;
+            last_mouse_event = loop_now;
+        }
+
+        for device in &mut devices {
+            if let Ok(events) = device.fetch_events() {
+                for ev in events {
+                    let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+                    match ev.event_type() {
+                        evdev::EventType::KEY if ev.value() == 1 => {
+                            let code = ev.code();
+                            if BTN_MOUSE_RANGE.contains(&code) {
+                                mouse_clicks.fetch_add(1, Ordering::Release);
+                                last_activity.store(now, Ordering::Release);
+                                last_meaningful.store(now, Ordering::Release);
+                                last_mouse_event = Instant::now();
+                                if jiggler_enabled {
+                                    mouse_tracker.record(now);
+                                }
+                            } else {
+                                keystrokes.fetch_add(1, Ordering::Release);
+                                last_activity.store(now, Ordering::Release);
+                                last_meaningful.store(now, Ordering::Release);
+                                last_keyboard_event = Instant::now();
+                                last_keyboard_ms.store(now, Ordering::Release);
+                                if jiggler_enabled {
+                                    kb_tracker.record(now);
+                                }
+                            }
+                        }
+                        evdev::EventType::RELATIVE => {
+                            let code = ev.code();
+                            if code == REL_X || code == REL_Y {
+                                let delta = ev.value();
+                                mouse_distance
+                                    .fetch_add(delta.unsigned_abs() as u64, Ordering::Release);
+
+                                if code == REL_X {
+                                    motion_dx = motion_dx.saturating_add(delta as i64);
+                                } else {
+                                    motion_dy = motion_dy.saturating_add(delta as i64);
+                                }
+
+                                let window_expired =
+                                    now.saturating_sub(motion_window_start_ms) > MOTION_WINDOW_MS;
+
+                                let net_sq = (motion_dx.saturating_mul(motion_dx))
+                                    .saturating_add(motion_dy.saturating_mul(motion_dy));
+                                let threshold_i64 =
+                                    i64::try_from(mouse_idle_threshold).unwrap_or(i64::MAX);
+                                let threshold_sq = threshold_i64.saturating_mul(threshold_i64);
+                                let above_threshold = net_sq >= threshold_sq;
+
+                                if window_expired || above_threshold {
+                                    if above_threshold {
+                                        last_activity.store(now, Ordering::Release);
+                                    }
+                                    motion_dx = 0;
+                                    motion_dy = 0;
+                                    motion_window_start_ms = now;
+                                }
+
+                                last_mouse_event = Instant::now();
+                                if jiggler_enabled
+                                    && now.saturating_sub(last_mouse_tracker_ms) >= 1000
+                                {
+                                    mouse_tracker.record(now);
+                                    last_mouse_tracker_ms = now;
+                                }
+                            } else if code == REL_WHEEL_HI_RES {
+                                seen_hires_wheel = true;
+                                hires_wheel_accum += ev.value().unsigned_abs() as i64;
+                                let notches = hires_wheel_accum / HIRES_SCROLL_DIVISOR;
+                                if notches > 0 {
+                                    scroll_events.fetch_add(notches as u64, Ordering::Release);
+                                    hires_wheel_accum -= notches * HIRES_SCROLL_DIVISOR;
+                                }
+                                last_activity.store(now, Ordering::Release);
+                                last_mouse_event = Instant::now();
+                            } else if code == REL_HWHEEL_HI_RES {
+                                seen_hires_hwheel = true;
+                                hires_hwheel_accum += ev.value().unsigned_abs() as i64;
+                                let notches = hires_hwheel_accum / HIRES_SCROLL_DIVISOR;
+                                if notches > 0 {
+                                    scroll_events.fetch_add(notches as u64, Ordering::Release);
+                                    hires_hwheel_accum -= notches * HIRES_SCROLL_DIVISOR;
+                                }
+                                last_activity.store(now, Ordering::Release);
+                                last_mouse_event = Instant::now();
+                            } else if code == REL_WHEEL && !seen_hires_wheel {
+                                scroll_events.fetch_add(1, Ordering::Release);
+                                last_activity.store(now, Ordering::Release);
+                                last_mouse_event = Instant::now();
+                            } else if code == REL_HWHEEL && !seen_hires_hwheel {
+                                scroll_events.fetch_add(1, Ordering::Release);
+                                last_activity.store(now, Ordering::Release);
+                                last_mouse_event = Instant::now();
+                            } else if code == REL_WHEEL || code == REL_HWHEEL {
+                                last_activity.store(now, Ordering::Release);
+                                last_mouse_event = Instant::now();
+                            }
+                        }
+                        evdev::EventType::ABSOLUTE => {
+                            let code = ev.code();
+                            if code == ABS_X
+                                || code == ABS_Y
+                                || code == ABS_MT_POSITION_X
+                                || code == ABS_MT_POSITION_Y
+                            {
+                                last_activity.store(now, Ordering::Release);
+                                last_mouse_event = Instant::now();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if jiggler_enabled && loop_now.duration_since(last_jiggler_check) >= JIGGLER_CHECK_INTERVAL
+        {
+            let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let kb_ms = last_keyboard_ms.load(Ordering::Acquire);
+            let kb_age_ms = now_ms.saturating_sub(kb_ms);
+            let window_ms = jiggler_config.window_secs.saturating_mul(1000);
+
+            let mouse_artificial = mouse_tracker.is_artificial() && kb_age_ms >= window_ms;
+            let artificial = kb_tracker.is_artificial() || mouse_artificial;
+            jiggler_pattern_flag.store(artificial, Ordering::Release);
+            last_jiggler_check = loop_now;
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 pub fn start_idle_monitor(
     start: Instant,
     jiggler_config: JigglerConfig,
@@ -223,6 +461,7 @@ pub fn start_idle_monitor(
         jiggler_process: Arc::new(AtomicBool::new(false)),
         last_keyboard_ms: Arc::new(AtomicU64::new(0)),
         last_meaningful_input_ms: Arc::new(AtomicU64::new(0)),
+        heartbeat: Arc::new(AtomicU64::new(0)),
     };
 
     let last_activity = Arc::clone(&stats.last_activity_ms);
@@ -233,6 +472,7 @@ pub fn start_idle_monitor(
     let jiggler_pattern_flag = Arc::clone(&stats.jiggler_pattern);
     let last_keyboard_ms = Arc::clone(&stats.last_keyboard_ms);
     let last_meaningful = Arc::clone(&stats.last_meaningful_input_ms);
+    let heartbeat = Arc::clone(&stats.heartbeat);
 
     let devices_changed = Arc::new(AtomicBool::new(false));
     let devices_changed_clone = Arc::clone(&devices_changed);
@@ -333,198 +573,85 @@ pub fn start_idle_monitor(
 
     let jiggler_enabled = jiggler_config.enabled;
 
-    // Detached thread: runs for process lifetime polling input devices.
-    // JoinHandle intentionally dropped — thread terminates with process exit.
     if let Err(e) = thread::Builder::new()
         .name("input-poll".into())
         .spawn(move || {
-        let mut devices = enumerate_input_devices();
+            const MAX_RESPAWN_ATTEMPTS: u32 = 10;
+            const MIN_RESPAWN_INTERVAL: Duration = Duration::from_secs(5);
+            const RESPAWN_COUNT_RESET: Duration = Duration::from_secs(300);
 
-        if devices.is_empty() {
-            eprintln!("Warning: No input devices found. Idle detection disabled.");
-            eprintln!("  (May need to add user to 'input' group: sudo usermod -aG input $USER)");
-            return;
-        }
+            let mut respawn_count: u32 = 0;
+            let mut last_respawn = Instant::now();
 
-        eprintln!("Monitoring {} input device(s) for activity", devices.len());
+            loop {
+                let devices_changed_ref = Arc::clone(&devices_changed);
+                let last_activity_ref = Arc::clone(&last_activity);
+                let keystrokes_ref = Arc::clone(&keystrokes);
+                let mouse_clicks_ref = Arc::clone(&mouse_clicks);
+                let scroll_events_ref = Arc::clone(&scroll_events);
+                let mouse_distance_ref = Arc::clone(&mouse_distance);
+                let jiggler_pattern_ref = Arc::clone(&jiggler_pattern_flag);
+                let last_keyboard_ref = Arc::clone(&last_keyboard_ms);
+                let last_meaningful_ref = Arc::clone(&last_meaningful);
+                let heartbeat_ref = Arc::clone(&heartbeat);
+                let jiggler_cfg = jiggler_config.clone();
 
-        let mut last_reenumerate = Instant::now();
-        let mut last_mouse_event = Instant::now();
-        let mut last_keyboard_event = Instant::now();
-
-        let mut kb_tracker = IntervalTracker::new(&jiggler_config);
-        let mut mouse_tracker = IntervalTracker::new(&jiggler_config);
-        let mut last_mouse_tracker_ms: u64 = 0;
-        let mut last_jiggler_check = Instant::now();
-
-        // Track signed displacement per axis so oscillatory tremor
-        // (which cancels out) is distinguished from intentional motion.
-        let mut motion_dx: i64 = 0;
-        let mut motion_dy: i64 = 0;
-        let mut motion_window_start_ms: u64 = 0;
-        const MOTION_WINDOW_MS: u64 = 2000;
-
-        const REENUMERATE_INTERVAL: Duration = Duration::from_mins(1);
-        const STALE_MOUSE_THRESHOLD: Duration = Duration::from_secs(30);
-        const REENUMERATE_COOLDOWN: Duration = Duration::from_secs(10);
-        const JIGGLER_CHECK_INTERVAL: Duration = Duration::from_secs(10);
-
-        loop {
-            let loop_now = Instant::now();
-
-            if devices_changed.swap(false, Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(100));
-                let new_devices = enumerate_input_devices();
-                eprintln!(
-                    "Re-enumerated (hotplug): {} -> {} devices",
-                    devices.len(),
-                    new_devices.len()
-                );
-                devices = new_devices;
-                last_reenumerate = loop_now;
-                last_mouse_event = loop_now;
-            }
-
-            if loop_now.duration_since(last_reenumerate) >= REENUMERATE_INTERVAL {
-                let new_devices = enumerate_input_devices();
-                if new_devices.len() != devices.len() {
-                    eprintln!(
-                        "Re-enumerated (periodic): {} -> {} devices",
-                        devices.len(),
-                        new_devices.len()
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    input_poll_inner(
+                        start,
+                        mouse_idle_threshold,
+                        jiggler_enabled,
+                        &jiggler_cfg,
+                        &devices_changed_ref,
+                        &last_activity_ref,
+                        &keystrokes_ref,
+                        &mouse_clicks_ref,
+                        &scroll_events_ref,
+                        &mouse_distance_ref,
+                        &jiggler_pattern_ref,
+                        &last_keyboard_ref,
+                        &last_meaningful_ref,
+                        &heartbeat_ref,
                     );
-                }
-                devices = new_devices;
-                last_reenumerate = loop_now;
-            }
+                }));
 
-            if loop_now.duration_since(last_keyboard_event) < Duration::from_secs(5)
-                && loop_now.duration_since(last_mouse_event) >= STALE_MOUSE_THRESHOLD
-                && loop_now.duration_since(last_reenumerate) >= REENUMERATE_COOLDOWN
-            {
-                eprintln!(
-                    "Stale mouse detected (no mouse events for {}s, keyboard active). Re-enumerating...",
-                    loop_now.duration_since(last_mouse_event).as_secs()
-                );
-                devices = enumerate_input_devices();
-                last_reenumerate = loop_now;
-                last_mouse_event = loop_now;
-            }
+                match result {
+                    Ok(()) => break,
+                    Err(panic_info) => {
+                        let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        eprintln!(
+                            "CRITICAL: input-poll thread panicked (attempt {}/{}): {}",
+                            respawn_count + 1,
+                            MAX_RESPAWN_ATTEMPTS,
+                            msg,
+                        );
 
-            for device in &mut devices {
-                if let Ok(events) = device.fetch_events() {
-                    for ev in events {
-                        let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-                        match ev.event_type() {
-                            evdev::EventType::KEY
-                                if ev.value() == 1 => {
-                                    let code = ev.code();
-                                    if BTN_MOUSE_RANGE.contains(&code) {
-                                        mouse_clicks.fetch_add(1, Ordering::Release);
-                                        last_activity.store(now, Ordering::Release);
-                                        last_meaningful.store(now, Ordering::Release);
-                                        last_mouse_event = Instant::now();
-                                        if jiggler_enabled {
-                                            mouse_tracker.record(now);
-                                        }
-                                    } else {
-                                        keystrokes.fetch_add(1, Ordering::Release);
-                                        last_activity.store(now, Ordering::Release);
-                                        last_meaningful.store(now, Ordering::Release);
-                                        last_keyboard_event = Instant::now();
-                                        last_keyboard_ms.store(now, Ordering::Release);
-                                        if jiggler_enabled {
-                                            kb_tracker.record(now);
-                                        }
-                                    }
-                                }
-                            evdev::EventType::RELATIVE => {
-                                let code = ev.code();
-                                if code == REL_X || code == REL_Y {
-                                    let delta = ev.value();
-                                    mouse_distance
-                                        .fetch_add(delta.unsigned_abs() as u64, Ordering::Release);
-
-                                    if code == REL_X {
-                                        motion_dx = motion_dx.saturating_add(delta as i64);
-                                    } else {
-                                        motion_dy = motion_dy.saturating_add(delta as i64);
-                                    }
-
-                                    let window_expired = now.saturating_sub(motion_window_start_ms)
-                                        > MOTION_WINDOW_MS;
-
-                                    let net_sq = (motion_dx.saturating_mul(motion_dx))
-                                        .saturating_add(motion_dy.saturating_mul(motion_dy));
-                                    let threshold_i64 = i64::try_from(mouse_idle_threshold).unwrap_or(i64::MAX);
-                                    let threshold_sq = threshold_i64.saturating_mul(threshold_i64);
-                                    let above_threshold = net_sq >= threshold_sq;
-
-                                    if window_expired || above_threshold {
-                                        if above_threshold {
-                                            last_activity.store(now, Ordering::Release);
-                                        }
-                                        motion_dx = 0;
-                                        motion_dy = 0;
-                                        motion_window_start_ms = now;
-                                    }
-
-                                    last_mouse_event = Instant::now();
-                                    if jiggler_enabled
-                                        && now.saturating_sub(last_mouse_tracker_ms) >= 1000
-                                    {
-                                        mouse_tracker.record(now);
-                                        last_mouse_tracker_ms = now;
-                                    }
-                                } else if code == REL_WHEEL || code == REL_HWHEEL {
-                                    // Only count low-res wheel events; high-res
-                                    // (REL_WHEEL_HI_RES / REL_HWHEEL_HI_RES) duplicate
-                                    // the same physical scroll and would double-count.
-                                    scroll_events.fetch_add(1, Ordering::Release);
-                                    last_activity.store(now, Ordering::Release);
-                                    last_mouse_event = Instant::now();
-                                } else if code == REL_WHEEL_HI_RES || code == REL_HWHEEL_HI_RES {
-                                    // Still update activity timestamp for idle detection,
-                                    // but don't increment scroll_events counter.
-                                    last_activity.store(now, Ordering::Release);
-                                    last_mouse_event = Instant::now();
-                                }
-                            }
-                            evdev::EventType::ABSOLUTE => {
-                                let code = ev.code();
-                                if code == ABS_X
-                                    || code == ABS_Y
-                                    || code == ABS_MT_POSITION_X
-                                    || code == ABS_MT_POSITION_Y
-                                {
-                                    last_activity.store(now, Ordering::Release);
-                                    last_mouse_event = Instant::now();
-                                }
-                            }
-                            _ => {}
+                        if Instant::now().duration_since(last_respawn) >= RESPAWN_COUNT_RESET {
+                            respawn_count = 0;
                         }
+                        respawn_count += 1;
+                        if respawn_count >= MAX_RESPAWN_ATTEMPTS {
+                            eprintln!("input-poll thread exceeded max respawn attempts, giving up");
+                            break;
+                        }
+
+                        let since_last = Instant::now().duration_since(last_respawn);
+                        if since_last < MIN_RESPAWN_INTERVAL {
+                            thread::sleep(MIN_RESPAWN_INTERVAL - since_last);
+                        }
+                        last_respawn = Instant::now();
+
+                        eprintln!("Respawning input-poll thread...");
                     }
                 }
-                // Errors silently ignored — periodic re-enumeration handles reconnection
             }
-            if jiggler_enabled
-                && loop_now.duration_since(last_jiggler_check) >= JIGGLER_CHECK_INTERVAL
-            {
-                let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                let kb_ms = last_keyboard_ms.load(Ordering::Acquire);
-                let kb_age_ms = now_ms.saturating_sub(kb_ms);
-                let window_ms = jiggler_config.window_secs.saturating_mul(1000);
-
-                let mouse_artificial = mouse_tracker.is_artificial() && kb_age_ms >= window_ms;
-                let artificial = kb_tracker.is_artificial() || mouse_artificial;
-                jiggler_pattern_flag.store(artificial, Ordering::Release);
-                last_jiggler_check = loop_now;
-            }
-
-            thread::sleep(Duration::from_millis(10));
-        }
-    })
+        })
     {
         eprintln!(
             "CRITICAL: Failed to spawn input-poll thread: {}. Idle detection will not work!",

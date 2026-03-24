@@ -26,7 +26,7 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
         return Err(Error::NiriError("No recipient addresses configured".into()));
     }
 
-    let bounds = range.resolve()?;
+    let bounds = range.resolve(&app.config)?;
     let filename = format!(
         "activity_report_{}_{}.xlsx",
         bounds.start_date.format("%Y%m%d"),

@@ -5,10 +5,10 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-#[cfg(feature = "excel-extra-sheets")]
-use chrono::{Datelike, Local, LocalResult, NaiveDate, Utc};
 #[cfg(not(feature = "excel-extra-sheets"))]
-use chrono::{Local, LocalResult, NaiveDate, Utc};
+use chrono::NaiveDate;
+#[cfg(feature = "excel-extra-sheets")]
+use chrono::{Datelike, NaiveDate};
 use rusqlite::params;
 #[cfg(feature = "excel-extra-sheets")]
 use rust_xlsxwriter::{
@@ -30,28 +30,6 @@ use crate::fmt::fmt_hms;
 /// Convert xlsx errors to our crate error type.
 fn xlsx_err(e: impl std::fmt::Display) -> Error {
     Error::NiriError(e.to_string())
-}
-
-/// Start-of-day in UTC (RFC 3339) for a local date.
-fn local_day_start_utc(date: NaiveDate) -> Result<String, Error> {
-    let day_start = date
-        .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| Error::NiriError("invalid local day start".into()))?;
-    let local_dt = match day_start.and_local_timezone(Local) {
-        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
-        LocalResult::None => {
-            return Err(Error::NiriError(
-                "local day start is not representable".into(),
-            ));
-        }
-    };
-    Ok(local_dt.with_timezone(&Utc).to_rfc3339())
-}
-
-/// End-of-day in UTC (equivalent to start of next day).
-fn local_day_end_utc(date: NaiveDate) -> Result<String, Error> {
-    let next_day = date + chrono::Duration::days(1);
-    local_day_start_utc(next_day)
 }
 
 /// Format a millisecond delta as `+HH:MM` / `-HH:MM`.
@@ -169,7 +147,7 @@ fn aggregate_weeks(daily: &[(NaiveDate, Metrics, bool)]) -> Vec<WeekBucket> {
 
 /// Export an enhanced multi-sheet Excel workbook for the given time range.
 pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), Error> {
-    let bounds: TimeBounds = range.resolve()?;
+    let bounds: TimeBounds = range.resolve(&app.config)?;
     let since_local = bounds.start_date;
     let today_local = bounds.end_date;
 
@@ -242,8 +220,8 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     let mut daily_metrics: Vec<(NaiveDate, Metrics, bool)> = Vec::new();
 
     while date <= today_local {
-        let day_start = local_day_start_utc(date)?;
-        let day_end = local_day_end_utc(date)?;
+        let day_start = super::config_day_start_utc(&app.config, date)?;
+        let day_end = super::config_day_end_utc(&app.config, date)?;
 
         let mut stmt = app.conn.prepare(
             "SELECT category, SUM(active_ms), COALESCE(SUM(passive_ms),0), SUM(idle_ms)
