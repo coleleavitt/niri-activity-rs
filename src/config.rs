@@ -1,11 +1,9 @@
 use std::collections::HashMap;
-use std::fmt;
-use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::{fmt, fs};
 
 use chrono::{DateTime, Datelike, Local, NaiveTime};
-
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
@@ -69,7 +67,8 @@ pub struct JigglerConfig {
     /// Minimum events in the window before detection triggers (default: 5).
     #[serde(default = "default_jiggler_min_events")]
     pub min_events: usize,
-    /// If max_interval - min_interval < this (ms), flag as artificial (default: 100).
+    /// If max_interval - min_interval < this (ms), flag as artificial (default:
+    /// 100).
     #[serde(default = "default_jiggler_variance")]
     pub variance_threshold_ms: u64,
     /// Process names to flag as jiggler software.
@@ -92,7 +91,8 @@ pub struct Schedule {
 }
 
 /// Sleep / gap classification configuration.
-/// Controls how activity gaps are classified as Sleep vs LongBreak vs ShortBreak.
+/// Controls how activity gaps are classified as Sleep vs LongBreak vs
+/// ShortBreak.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SleepConfig {
     /// Earliest hour (24h) that can start a sleep period (default: 18 = 6pm).
@@ -103,7 +103,8 @@ pub struct SleepConfig {
     #[serde(default = "default_sleep_latest_hour")]
     pub latest_hour: u32,
 
-    /// Minimum gap hours to classify as sleep (default: 3.0 - industry standard).
+    /// Minimum gap hours to classify as sleep (default: 3.0 - industry
+    /// standard).
     #[serde(default = "default_sleep_min_hours")]
     pub min_hours: f64,
 
@@ -309,9 +310,10 @@ struct RawConfig {
     mouse_dpi: f64,
     #[serde(default = "default_mouse_idle_threshold")]
     mouse_idle_threshold: u64,
-    /// Seconds of zero meaningful input (keystrokes + clicks) before active time
-    /// is reclassified as passive at flush boundaries. Prevents false-active from
-    /// compositor events (e.g. Firefox video inhibiting idle). Default: 60.
+    /// Seconds of zero meaningful input (keystrokes + clicks) before active
+    /// time is reclassified as passive at flush boundaries. Prevents
+    /// false-active from compositor events (e.g. Firefox video inhibiting
+    /// idle). Default: 60.
     #[serde(default = "default_input_active_secs")]
     input_active_secs: u64,
     #[serde(default = "default_streak_break_tolerance")]
@@ -770,7 +772,11 @@ pub(crate) fn load_env_file() -> Result<(), Error> {
                 // before watch() spawns any threads (signal_hook, input monitor, logind).
                 // std::env::set_var is only unsafe in multi-threaded contexts.
                 // Do NOT move this call to after watcher::watch() or any thread spawn.
-                unsafe { std::env::set_var(key.trim(), value.trim()) };
+                // SAFETY: Called before any threads are spawned (single-threaded context).
+                #[allow(unsafe_code)]
+                unsafe {
+                    std::env::set_var(key.trim(), value.trim())
+                };
             }
         }
     }

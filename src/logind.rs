@@ -8,7 +8,8 @@ use zbus::blocking::Connection;
 
 use crate::error::Error;
 
-/// Monitors logind D-Bus signals for screen lock/unlock and suspend/resume events.
+/// Monitors logind D-Bus signals for screen lock/unlock and suspend/resume
+/// events.
 ///
 /// Replaces the old `is_session_locked()` approach that spawned two `loginctl`
 /// subprocesses every loop iteration. Instead, background threads subscribe to
@@ -35,7 +36,8 @@ impl LogindMonitor {
         self.suspend_resumed.swap(false, Ordering::AcqRel)
     }
 
-    /// Check if any listener thread has died. If true, logind monitoring may be degraded.
+    /// Check if any listener thread has died. If true, logind monitoring may be
+    /// degraded.
     pub fn has_thread_error(&self) -> bool {
         self.thread_error.load(Ordering::Acquire)
     }
@@ -72,7 +74,8 @@ fn find_user_session_path(
 /// 2. Unlock signal → sets `is_locked = false`
 /// 3. PrepareForSleep signal → sets `suspend_resumed = true` on resume
 ///
-/// Also reads the initial `LockedHint` property so we start in the correct state.
+/// Also reads the initial `LockedHint` property so we start in the correct
+/// state.
 pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
     let connection = Connection::system()
         .map_err(|e| Error::Logind(format!("failed to connect to system bus: {e}")))?;
@@ -89,7 +92,8 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
         .build()
         .map_err(|e| Error::Logind(format!("failed to build session proxy: {e}")))?;
 
-    // Read initial LockedHint so we don't miss a lock that happened before we started
+    // Read initial LockedHint so we don't miss a lock that happened before we
+    // started
     let initial_locked = session.locked_hint().unwrap_or_else(|e| {
         eprintln!("[logind] Warning: failed to read initial LockedHint: {e}, assuming unlocked");
         false
@@ -125,7 +129,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
             .spawn(move || {
                 let session = match SessionProxyBlocking::builder(&connection)
                     .path(session_path)
-                    .and_then(|b| b.build())
+                    .and_then(zbus::blocking::proxy::Builder::build)
                 {
                     Ok(s) => s,
                     Err(e) => {
@@ -174,14 +178,12 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                 "failed to connect to system bus (unlock thread): {e}"
             ))
         })?;
-        let session_path = session_path.clone();
-
         thread::Builder::new()
             .name("logind-unlock".into())
             .spawn(move || {
                 let session = match SessionProxyBlocking::builder(&connection)
                     .path(session_path)
-                    .and_then(|b| b.build())
+                    .and_then(zbus::blocking::proxy::Builder::build)
                 {
                     Ok(s) => s,
                     Err(e) => {
@@ -221,7 +223,8 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
             .map_err(|e| Error::Logind(format!("failed to spawn unlock thread: {e}")))?;
     }
 
-    // Thread 3: PrepareForSleep signal → set suspend_resumed on resume (start=false)
+    // Thread 3: PrepareForSleep signal → set suspend_resumed on resume
+    // (start=false)
     {
         let suspend_resumed = Arc::clone(&suspend_resumed);
         let thread_error = Arc::clone(&thread_error);

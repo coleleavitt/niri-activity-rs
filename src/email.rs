@@ -2,7 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use chrono::Local;
-use lettre::message::{Attachment, MultiPart, SinglePart, header::ContentType};
+use lettre::message::header::ContentType;
+use lettre::message::{Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 
@@ -64,7 +65,7 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
     let html_body = build_html_summary(&bounds, period_name);
     let text_body = build_text_summary(&bounds, period_name);
 
-    let attachment = Attachment::new(filename.clone()).body(
+    let attachment = Attachment::new(filename).body(
         xlsx_bytes,
         ContentType::parse("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             .map_err(|e| Error::NiriError(format!("Invalid content type: {}", e)))?,
@@ -274,8 +275,7 @@ pub fn test_email_config(config: &Config) -> Result<(), Error> {
         email_config
             .to_addresses
             .first()
-            .map(|s| s.as_str())
-            .unwrap_or("<none>")
+            .map_or("<none>", String::as_str)
     );
 
     Ok(())

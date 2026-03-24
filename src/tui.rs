@@ -67,7 +67,7 @@ impl TuiApp {
         let report = query_report_range(&app, range.clone()).ok();
         let mouse_dpi = app.config.mouse_dpi;
         let schedule_start = app.config.schedule.start.clone();
-        let schedule_end = app.config.schedule.end.clone();
+        let schedule_end = app.config.schedule.end;
 
         Ok(Self {
             tab: Tab::Dashboard,
@@ -557,13 +557,13 @@ fn render_apps(app: &TuiApp, area: Rect, frame: &mut Frame) {
             for child in &group.children {
                 match child.category {
                     crate::config::Category::Productive => {
-                        prod_ms = prod_ms.saturating_add(child.total_ms)
+                        prod_ms = prod_ms.saturating_add(child.total_ms);
                     }
                     crate::config::Category::Neutral => {
-                        neutral_ms = neutral_ms.saturating_add(child.total_ms)
+                        neutral_ms = neutral_ms.saturating_add(child.total_ms);
                     }
                     crate::config::Category::Unproductive => {
-                        unprod_ms = unprod_ms.saturating_add(child.total_ms)
+                        unprod_ms = unprod_ms.saturating_add(child.total_ms);
                     }
                 }
             }
@@ -836,12 +836,7 @@ fn render_peaks(rpt: &ReportData, area: Rect, frame: &mut Frame) {
         .border_style(THEME.border)
         .title(Line::from(" Peak Hours ").style(THEME.header));
 
-    let max_ms = rpt
-        .peak_hours
-        .first()
-        .map(|h| h.total_ms)
-        .unwrap_or(1)
-        .max(1);
+    let max_ms = rpt.peak_hours.first().map_or(1, |h| h.total_ms).max(1);
 
     let header = Row::new(vec![
         Cell::from("Hour").style(THEME.table_header),

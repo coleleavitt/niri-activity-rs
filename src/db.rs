@@ -371,6 +371,7 @@ pub fn reclassify_with_thresholds(
     let idle_threshold_ms = idle_threshold_secs.saturating_mul(1000);
     let deep_idle_threshold_ms = deep_idle_secs.saturating_mul(1000);
 
+    #[allow(clippy::type_complexity)] // One-shot DB row tuple, not worth a named struct
     let rows: Vec<(i64, Option<Vec<u8>>, i64, i64, i64)> = {
         let mut stmt = conn.prepare(
             "SELECT id, input_offsets, active_ms, passive_ms, idle_ms FROM events WHERE input_offsets IS NOT NULL"

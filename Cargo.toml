@@ -30,3 +30,46 @@ tempfile = "3"
 [features]
 default = []
 excel-extra-sheets = []  # Enables Weekly Summary and App Breakdown sheets in Excel export
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+
+# Specific additional warnings
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+# Allow noisy pedantic/nursery lints
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+similar_names = "allow"
+wildcard_imports = "allow"
+struct_excessive_bools = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+unreadable_literal = "allow"
+uninlined_format_args = "allow"
+missing_const_for_fn = "allow"
+option_if_let_else = "allow"
+redundant_pub_crate = "allow"
+significant_drop_tightening = "allow"
+items_after_statements = "allow"
+cognitive_complexity = "allow"
+needless_pass_by_value = "allow"
+use_self = "allow"
+manual_let_else = "allow"
+print_stdout = "allow"
+print_stderr = "allow"
+unwrap_used = "allow"
+future_not_send = "allow"

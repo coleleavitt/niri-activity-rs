@@ -10,9 +10,19 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use chrono::{Datelike, Local, LocalResult, NaiveDate, Timelike, Utc};
+// Re-export Excel functions
+pub use excel::export_xlsx_range;
 use owo_colors::OwoColorize;
 use rusqlite::{Connection, params};
 use serde::Serialize;
+// Re-export internal types for crate use
+pub(crate) use types::Metrics;
+// Re-export all public types
+pub use types::{
+    AppBreakdown, AppGroup, AwayData, CategoryBreakdown, DailyBreakdown, FocusStreak, GapEntry,
+    GapSummary, GapType, HourBreakdown, MetricsData, ReportData, ScheduleBreakdown, StreakSummary,
+    TimelineBucket, TimelineData, TodayData, TodayRow,
+};
 
 use crate::config::{Category, Config, get_data_dir, load_config};
 use crate::db::{reclassify_all, run_migrations};
@@ -21,19 +31,6 @@ use crate::fmt::{
     cat_bar, cat_bar_fractional, cat_colored, cat_label, colored_bar, fmt_distance, fmt_duration,
     fmt_duration_compact, fmt_hms, pct, section_header, truncate,
 };
-
-// Re-export all public types
-pub use types::{
-    AppBreakdown, AppGroup, AwayData, CategoryBreakdown, DailyBreakdown, FocusStreak, GapEntry,
-    GapSummary, GapType, HourBreakdown, MetricsData, ReportData, ScheduleBreakdown, StreakSummary,
-    TimelineBucket, TimelineData, TodayData, TodayRow,
-};
-
-// Re-export internal types for crate use
-pub(crate) use types::Metrics;
-
-// Re-export Excel functions
-pub use excel::export_xlsx_range;
 
 /// Sentinel value for unbounded upper time range in parameterized queries.
 const UNTIL_SENTINEL: &str = "9999-12-31T23:59:59+00:00";
@@ -225,8 +222,7 @@ fn local_day_start_utc(date: chrono::NaiveDate) -> Result<String, Error> {
         .and_hms_opt(0, 0, 0)
         .ok_or_else(|| Error::NiriError("invalid local day start".into()))?;
     let local_dt = match day_start.and_local_timezone(Local) {
-        LocalResult::Single(dt) => dt,
-        LocalResult::Ambiguous(dt, _) => dt,
+        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
         LocalResult::None => {
             return Err(Error::NiriError(
                 "local day start is not representable".into(),
@@ -416,15 +412,17 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
         match Category::from_str(&ev.category).unwrap_or(Category::Neutral) {
             Category::Productive => b.productive_ms = b.productive_ms.saturating_add(total_ms),
             Category::Unproductive => {
-                b.unproductive_ms = b.unproductive_ms.saturating_add(total_ms)
+                b.unproductive_ms = b.unproductive_ms.saturating_add(total_ms);
             }
             Category::Neutral => b.neutral_ms = b.neutral_ms.saturating_add(total_ms),
         }
-        // Only count actual idle time, not passive (passive is already included in category totals)
+        // Only count actual idle time, not passive (passive is already included in
+        // category totals)
         b.idle_ms = b.idle_ms.saturating_add(ev.idle_ms);
         b.keystrokes = b.keystrokes.saturating_add(ev.keystrokes);
 
-        // Accumulate per-app time so dominant app reflects total time, not single-event max
+        // Accumulate per-app time so dominant app reflects total time, not single-event
+        // max
         let app_entry = b.app_totals.entry(ev.app_id.clone()).or_insert(0);
         *app_entry = app_entry.saturating_add(total_ms);
     }
@@ -792,7 +790,8 @@ fn classify_gap(
         return None;
     }
 
-    // Rule 1: Overnight auto-detect - any gap ≥ overnight_auto_hours spanning midnight = sleep
+    // Rule 1: Overnight auto-detect - any gap ≥ overnight_auto_hours spanning
+    // midnight = sleep
     let spans_midnight = start_hour > end_hour;
     if sleep.overnight_auto_hours > 0.0 && gap_hours >= sleep.overnight_auto_hours && spans_midnight
     {
@@ -888,9 +887,21 @@ fn query_streaks(
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    let away_ms = (config.away_threshold_secs as i64).saturating_mul(1_000);
-    let tolerance_ms = (config.streak_break_tolerance_secs as i64).saturating_mul(1_000);
-    let idle_timeout_ms = (config.streak_idle_timeout_secs as i64).saturating_mul(1_000);
+    #[allow(clippy::cast_possible_wrap)] // Config values are small positive numbers, no wrap risk
+    let away_ms = config
+        .away_threshold_secs
+        .cast_signed()
+        .saturating_mul(1_000);
+    #[allow(clippy::cast_possible_wrap)]
+    let tolerance_ms = config
+        .streak_break_tolerance_secs
+        .cast_signed()
+        .saturating_mul(1_000);
+    #[allow(clippy::cast_possible_wrap)]
+    let idle_timeout_ms = config
+        .streak_idle_timeout_secs
+        .cast_signed()
+        .saturating_mul(1_000);
 
     let mut streaks: Vec<FocusStreak> = Vec::new();
     let mut streak_start: Option<String> = None;
@@ -948,10 +959,8 @@ fn query_streaks(
                     in_streak = false;
                     streak_productive_ms = 0;
                     streak_keys = 0;
-                    pending_unproductive_ms = 0;
-                } else {
-                    pending_unproductive_ms = 0;
                 }
+                pending_unproductive_ms = 0;
             }
 
             if in_streak {
@@ -993,6 +1002,7 @@ fn query_streaks(
 
     streaks.sort_by_key(|s| std::cmp::Reverse(s.duration_ms));
 
+    #[allow(clippy::cast_possible_wrap)] // Streak count will never approach i64::MAX
     let total_streaks = streaks.len() as i64;
     let total_streak_ms: i64 = streaks.iter().map(|s| s.duration_ms).sum();
     let avg_streak_ms = if total_streaks > 0 {
@@ -1002,7 +1012,7 @@ fn query_streaks(
     };
 
     let longest = streaks.first();
-    let longest_ms = longest.map(|s| s.duration_ms).unwrap_or(0);
+    let longest_ms = longest.map_or(0, |s| s.duration_ms);
     let longest_app = longest.map(|s| s.app_id.clone()).unwrap_or_default();
 
     streaks.truncate(5);
@@ -1123,7 +1133,7 @@ fn query_gaps(
         if should_merge {
             // Merge with previous sleep gap
             if let Some(prev) = merged_gaps.last_mut() {
-                prev.gap_end = gap.gap_end.clone();
+                prev.gap_end.clone_from(&gap.gap_end);
                 // Recalculate duration from merged start to new end
                 if let (Some(start), Some(end)) = (
                     parse_timestamp_local(&prev.gap_start),
@@ -1165,12 +1175,12 @@ fn query_gaps(
             }
         }
 
-        let start_local = parse_timestamp_local(&gap.gap_start)
-            .map(|dt| dt.format("%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| gap.gap_start.clone());
+        let start_local = parse_timestamp_local(&gap.gap_start).map_or_else(
+            || gap.gap_start.clone(),
+            |dt| dt.format("%m-%d %H:%M").to_string(),
+        );
         let end_local = parse_timestamp_local(&gap.gap_end)
-            .map(|dt| dt.format("%H:%M").to_string())
-            .unwrap_or_else(|| gap.gap_end.clone());
+            .map_or_else(|| gap.gap_end.clone(), |dt| dt.format("%H:%M").to_string());
 
         entries.push(GapEntry {
             gap_type: gap.gap_type,
@@ -1470,8 +1480,7 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             .categories
             .iter()
             .find(|c| c.category == Category::Productive)
-            .map(|c| c.total_ms)
-            .unwrap_or(0);
+            .map_or(0, |c| c.total_ms);
 
         println!(
             "\n{}",
@@ -1479,6 +1488,7 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
         );
 
         if let Some(daily_goal) = app.config.goals.daily_ms() {
+            #[allow(clippy::cast_possible_wrap)] // Daily count is small
             let days = (data.daily.len() as i64).max(1);
             let daily_avg = productive_ms.checked_div(days).unwrap_or(0);
             let daily_pct = if daily_goal > 0 {
@@ -1573,12 +1583,7 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
     );
 
     const BAR_WIDTH: usize = 20;
-    let max_app_ms = data
-        .top_apps
-        .first()
-        .map(|g| g.total_ms)
-        .unwrap_or(1)
-        .max(1);
+    let max_app_ms = data.top_apps.first().map_or(1, |g| g.total_ms).max(1);
 
     for group in &data.top_apps {
         if group.children.len() == 1 {
@@ -1746,8 +1751,9 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             section_header("── Away Time ─────────────────────────────────────────")
         );
 
-        // Visible col layout: "  X label:  " padded to col 20, then right-aligned duration
-        // Using text symbols (1-col wide) to avoid emoji width inconsistencies
+        // Visible col layout: "  X label:  " padded to col 20, then right-aligned
+        // duration Using text symbols (1-col wide) to avoid emoji width
+        // inconsistencies
         let col_target: usize = 20;
         for summary in &away.summaries {
             let (icon, label_colored, visible_cols) = match summary.gap_type {
@@ -1792,7 +1798,7 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
         section_header("── Peak Hours ────────────────────────────────────────")
     );
 
-    let max_hour_ms = data.peak_hours.first().map(|h| h.total_ms).unwrap_or(1);
+    let max_hour_ms = data.peak_hours.first().map_or(1, |h| h.total_ms);
     for h in &data.peak_hours {
         let bar_len = (h.total_ms as f64 / max_hour_ms as f64 * 20.0).round() as usize;
         println!(
@@ -2131,15 +2137,13 @@ pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
         .categories
         .iter()
         .find(|c| c.category == Category::Productive)
-        .map(|c| c.total_ms)
-        .unwrap_or(0);
+        .map_or(0, |c| c.total_ms);
 
     let unproductive_ms = data
         .categories
         .iter()
         .find(|c| c.category == Category::Unproductive)
-        .map(|c| c.total_ms)
-        .unwrap_or(0);
+        .map_or(0, |c| c.total_ms);
 
     let ratio = if data.total_ms > 0 {
         (productive_ms as f64 / data.total_ms as f64 * 100.0).round() as i64
@@ -2147,11 +2151,7 @@ pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
         0
     };
 
-    let top_app = data
-        .top_apps
-        .first()
-        .map(|a| a.app_id.as_str())
-        .unwrap_or("-");
+    let top_app = data.top_apps.first().map_or("-", |a| a.app_id.as_str());
 
     println!(
         "{}|{}|{}|{}|{}%|{}",
@@ -2203,10 +2203,10 @@ pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
         if let Some(cell) = heatmap.get_mut(&(date.clone(), hour)) {
             match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
                 Category::Productive => {
-                    cell.productive_ms = cell.productive_ms.saturating_add(total_ms)
+                    cell.productive_ms = cell.productive_ms.saturating_add(total_ms);
                 }
                 Category::Unproductive => {
-                    cell.unproductive_ms = cell.unproductive_ms.saturating_add(total_ms)
+                    cell.unproductive_ms = cell.unproductive_ms.saturating_add(total_ms);
                 }
                 Category::Neutral => cell.neutral_ms = cell.neutral_ms.saturating_add(total_ms),
             }

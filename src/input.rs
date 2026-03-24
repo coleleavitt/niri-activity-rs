@@ -281,7 +281,7 @@ pub fn start_idle_monitor(
                             if let Some(name) = event.name {
                                 let name_str = name.to_string_lossy();
                                 if name_str.starts_with("event") {
-                                    eprintln!("Input device changed: {:?}", name);
+                                    eprintln!("Input device changed: {}", name.display());
                                     devices_changed_clone.store(true, Ordering::SeqCst);
                                 }
                             }
@@ -364,7 +364,7 @@ pub fn start_idle_monitor(
         let mut motion_window_start_ms: u64 = 0;
         const MOTION_WINDOW_MS: u64 = 2000;
 
-        const REENUMERATE_INTERVAL: Duration = Duration::from_secs(60);
+        const REENUMERATE_INTERVAL: Duration = Duration::from_mins(1);
         const STALE_MOUSE_THRESHOLD: Duration = Duration::from_secs(30);
         const REENUMERATE_COOLDOWN: Duration = Duration::from_secs(10);
         const JIGGLER_CHECK_INTERVAL: Duration = Duration::from_secs(10);
@@ -411,7 +411,7 @@ pub fn start_idle_monitor(
                 last_mouse_event = loop_now;
             }
 
-            for device in devices.iter_mut() {
+            for device in &mut devices {
                 if let Ok(events) = device.fetch_events() {
                     for ev in events {
                         let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);

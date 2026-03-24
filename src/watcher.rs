@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 
 use backoff::ExponentialBackoff;
 use chrono::{Local, Utc};
-use niri_ipc::{Event, Request, Response, Window, socket::Socket};
+use niri_ipc::socket::Socket;
+use niri_ipc::{Event, Request, Response, Window};
+use owo_colors::OwoColorize;
 use rusqlite::Connection;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
-
-use owo_colors::OwoColorize;
 
 use crate::config::{Category, Config, get_config_path, get_data_dir, load_config};
 use crate::db::{SessionSnapshot, init_db, insert_event, reclassify_all, run_migrations};
@@ -119,6 +119,7 @@ struct SessionAccum<'a> {
 }
 
 /// Post-flush accumulator values, returned so callers can log before reset.
+#[allow(clippy::struct_field_names)] // `_ms` suffix denotes unit
 struct FlushResult {
     active_ms: i64,
     passive_ms: i64,
@@ -222,7 +223,7 @@ pub fn connect_to_niri() -> Result<Socket, Error> {
         initial_interval: Duration::from_millis(100),
         multiplier: 2.0,
         max_interval: Duration::from_secs(30),
-        max_elapsed_time: Some(Duration::from_secs(300)),
+        max_elapsed_time: Some(Duration::from_mins(5)),
         ..Default::default()
     };
 
@@ -323,7 +324,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let mut last_flush = Instant::now();
     let mut is_locked = false;
     let mut current_state = ActivityState::Active;
-    const FLUSH_INTERVAL: Duration = Duration::from_secs(300);
+    const FLUSH_INTERVAL: Duration = Duration::from_mins(5);
     const SUSPEND_JUMP_THRESHOLD_SECS: i64 = 30;
     let mut last_wall_time = Utc::now();
     let mut last_loop_instant = Instant::now();
@@ -590,8 +591,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 last_flush = now_instant;
                 // DO NOT reset input_baseline_ms or session_start_mono_ms here.
                 // The idle timer must keep measuring from the last real input,
-                // otherwise idle_duration_ms resets to ~0 and we immediately exit Away
-                // on the next loop iteration — causing a 30-min Away→Active cycle.
+                // otherwise idle_duration_ms resets to ~0 and we immediately
+                // exit Away on the next loop iteration —
+                // causing a 30-min Away→Active cycle.
             }
 
             if current_state == ActivityState::Away && new_state != ActivityState::Away {
@@ -624,15 +626,15 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             match current_state {
                 ActivityState::Active => {
                     accumulated_active_ms =
-                        accumulated_active_ms.saturating_add(elapsed_since_last_check)
+                        accumulated_active_ms.saturating_add(elapsed_since_last_check);
                 }
                 ActivityState::Passive => {
                     accumulated_passive_ms =
-                        accumulated_passive_ms.saturating_add(elapsed_since_last_check)
+                        accumulated_passive_ms.saturating_add(elapsed_since_last_check);
                 }
                 ActivityState::Idle => {
                     accumulated_idle_ms =
-                        accumulated_idle_ms.saturating_add(elapsed_since_last_check)
+                        accumulated_idle_ms.saturating_add(elapsed_since_last_check);
                 }
                 ActivityState::Locked | ActivityState::Away => {}
             }
@@ -676,9 +678,11 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                             fmt_duration_compact(total).dimmed()
                         );
                     }
-                    // Intentionally preserve input_baseline_ms and session_start_mono_ms:
-                    // resetting them here would zero idle_duration_ms every flush cycle,
-                    // making the Away threshold unreachable without a focus change.
+                    // Intentionally preserve input_baseline_ms and
+                    // session_start_mono_ms: resetting them
+                    // here would zero idle_duration_ms every flush cycle,
+                    // making the Away threshold unreachable without a focus
+                    // change.
                 }
                 last_flush = now_instant;
             }

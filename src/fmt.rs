@@ -111,7 +111,7 @@ pub fn cat_bar_fractional(category: Category, frac_blocks: f64, width: usize) ->
     let full = clamped.floor() as usize;
     let remainder = clamped - full as f64;
     let partial = fractional_block(remainder);
-    let used = full + if partial.is_empty() { 0 } else { 1 };
+    let used = full + usize::from(!partial.is_empty());
     let pad = width.saturating_sub(used);
     let bar = format!("{}{}{}", "█".repeat(full), partial, " ".repeat(pad));
     match category {

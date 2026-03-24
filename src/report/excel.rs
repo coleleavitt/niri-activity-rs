@@ -1,4 +1,5 @@
-//! Enhanced Excel export with conditional formatting, sparklines, and multi-sheet output.
+//! Enhanced Excel export with conditional formatting, sparklines, and
+//! multi-sheet output.
 
 #[cfg(feature = "excel-extra-sheets")]
 use std::collections::HashMap;
@@ -16,12 +17,11 @@ use rust_xlsxwriter::{
 #[cfg(not(feature = "excel-extra-sheets"))]
 use rust_xlsxwriter::{Color, ConditionalFormat3ColorScale, Format, Workbook};
 
+use super::types::Metrics;
+use super::{App, TimeBounds, TimeRange};
 use crate::config::Category;
 use crate::error::Error;
 use crate::fmt::fmt_hms;
-
-use super::types::Metrics;
-use super::{App, TimeBounds, TimeRange};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -38,8 +38,7 @@ fn local_day_start_utc(date: NaiveDate) -> Result<String, Error> {
         .and_hms_opt(0, 0, 0)
         .ok_or_else(|| Error::NiriError("invalid local day start".into()))?;
     let local_dt = match day_start.and_local_timezone(Local) {
-        LocalResult::Single(dt) => dt,
-        LocalResult::Ambiguous(dt, _) => dt,
+        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
         LocalResult::None => {
             return Err(Error::NiriError(
                 "local day start is not representable".into(),

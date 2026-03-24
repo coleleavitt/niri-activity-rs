@@ -105,11 +105,11 @@ pub enum GapType {
 
 impl GapType {
     #[allow(dead_code)]
-    pub fn label(&self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            GapType::Sleep => "Sleep",
-            GapType::LongBreak => "Long Break",
-            GapType::ShortBreak => "Short Break",
+            Self::Sleep => "Sleep",
+            Self::LongBreak => "Long Break",
+            Self::ShortBreak => "Short Break",
         }
     }
 }
@@ -182,6 +182,7 @@ pub struct ReportData {
 }
 
 #[derive(Default)]
+#[allow(clippy::struct_field_names)] // Fields share `_ms` suffix for unit clarity
 pub(crate) struct Metrics {
     pub(crate) total_ms: i64,
     pub(crate) productive_ms: i64,
