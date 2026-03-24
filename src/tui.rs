@@ -435,13 +435,16 @@ fn render_timeline(app: &TuiApp, area: Rect, frame: &mut Frame) {
             };
 
             let bar_width = 20usize;
-            let prod_chars = (b.productive_ms as f64 / total as f64 * bar_width as f64)
+            let prod_chars = ((b.productive_ms as f64 / total as f64 * bar_width as f64)
                 .round()
-                .max(0.0) as usize;
-            let neut_chars = (b.neutral_ms as f64 / total as f64 * bar_width as f64)
+                .max(0.0) as usize)
+                .min(bar_width);
+            let remaining = bar_width.saturating_sub(prod_chars);
+            let neut_chars = ((b.neutral_ms as f64 / total as f64 * bar_width as f64)
                 .round()
-                .max(0.0) as usize;
-            let unp_chars = bar_width.saturating_sub(prod_chars + neut_chars);
+                .max(0.0) as usize)
+                .min(remaining);
+            let unp_chars = remaining.saturating_sub(neut_chars);
 
             let bar_line = Line::from(vec![
                 Span::styled("█".repeat(prod_chars), THEME.bar_productive),

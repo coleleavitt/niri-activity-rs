@@ -191,10 +191,11 @@ pub fn enumerate_input_devices() -> Vec<evdev::Device> {
                     Ok(dev) => {
                         if let Err(e) = dev.set_nonblocking(true) {
                             eprintln!(
-                                "Warning: failed to set nonblocking on {}: {}",
+                                "Warning: failed to set nonblocking on {}: {}, skipping device",
                                 path.display(),
                                 e
                             );
+                            return None;
                         }
                         Some(dev)
                     }
@@ -238,7 +239,7 @@ pub fn start_idle_monitor(
 
     // Detached thread: runs for process lifetime monitoring /dev/input hotplug.
     // JoinHandle intentionally dropped — thread terminates with process exit.
-    let _ = thread::Builder::new()
+    if let Err(e) = thread::Builder::new()
         .name("input-hotplug".into())
         .spawn(move || {
             let mut inotify = match Inotify::init() {
@@ -292,14 +293,20 @@ pub fn start_idle_monitor(
                     }
                 }
             }
-        });
+        })
+    {
+        eprintln!(
+            "Warning: Failed to spawn input-hotplug thread: {}. Device hotplug disabled.",
+            e
+        );
+    }
 
     if jiggler_config.enabled {
         let jiggler_process_flag = Arc::clone(&stats.jiggler_process);
         let blacklist = jiggler_config.process_blacklist.clone();
         // Detached thread: runs for process lifetime scanning for jiggler processes.
         // JoinHandle intentionally dropped — thread terminates with process exit.
-        let _ = thread::Builder::new()
+        if let Err(e) = thread::Builder::new()
             .name("jiggler-scan".into())
             .spawn(move || {
                 // JPL-R11: bounded by process lifetime — sleeps 30s between iterations.
@@ -315,14 +322,20 @@ pub fn start_idle_monitor(
                     jiggler_process_flag.store(found, Ordering::Release);
                     thread::sleep(Duration::from_secs(30));
                 }
-            });
+            })
+        {
+            eprintln!(
+                "Warning: Failed to spawn jiggler-scan thread: {}. Jiggler detection disabled.",
+                e
+            );
+        }
     }
 
     let jiggler_enabled = jiggler_config.enabled;
 
     // Detached thread: runs for process lifetime polling input devices.
     // JoinHandle intentionally dropped — thread terminates with process exit.
-    let _ = thread::Builder::new()
+    if let Err(e) = thread::Builder::new()
         .name("input-poll".into())
         .spawn(move || {
         let mut devices = enumerate_input_devices();
@@ -511,7 +524,13 @@ pub fn start_idle_monitor(
 
             thread::sleep(Duration::from_millis(10));
         }
-    });
+    })
+    {
+        eprintln!(
+            "CRITICAL: Failed to spawn input-poll thread: {}. Idle detection will not work!",
+            e
+        );
+    }
 
     stats
 }
