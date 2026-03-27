@@ -22,6 +22,10 @@ pub const ABS_Y: u16 = 1;
 pub const ABS_MT_POSITION_X: u16 = 53;
 pub const ABS_MT_POSITION_Y: u16 = 54;
 
+// Trackpad touch events (outside BTN_MOUSE_RANGE but should count as clicks)
+pub const BTN_TOUCH: u16 = 330;
+pub const BTN_TOOL_FINGER: u16 = 325;
+
 #[derive(Debug, Clone, Copy)]
 pub struct InputSnapshot {
     pub keystrokes: u64,
@@ -256,6 +260,9 @@ fn input_poll_inner(
     let mut motion_window_start_ms: u64 = 0;
     const MOTION_WINDOW_MS: u64 = 2000;
 
+    let mut last_mt_x: Option<i32> = None;
+    let mut last_mt_y: Option<i32> = None;
+
     // Hi-res scroll accumulators (120 hi-res units = 1 notch).
     // Kernel drivers (hid-input.c, hid-logitech-hidpp.c) may emit only
     // REL_WHEEL_HI_RES without a corresponding REL_WHEEL when the
@@ -322,7 +329,7 @@ fn input_poll_inner(
                     match ev.event_type() {
                         evdev::EventType::KEY if ev.value() == 1 => {
                             let code = ev.code();
-                            if BTN_MOUSE_RANGE.contains(&code) {
+                            if BTN_MOUSE_RANGE.contains(&code) || code == BTN_TOUCH {
                                 mouse_clicks.fetch_add(1, Ordering::Release);
                                 last_activity.store(now, Ordering::Release);
                                 last_meaningful.store(now, Ordering::Release);
@@ -330,7 +337,7 @@ fn input_poll_inner(
                                 if jiggler_enabled {
                                     mouse_tracker.record(now);
                                 }
-                            } else {
+                            } else if code != BTN_TOOL_FINGER {
                                 keystrokes.fetch_add(1, Ordering::Release);
                                 last_activity.store(now, Ordering::Release);
                                 last_meaningful.store(now, Ordering::Release);
@@ -340,6 +347,10 @@ fn input_poll_inner(
                                     kb_tracker.record(now);
                                 }
                             }
+                        }
+                        evdev::EventType::KEY if ev.value() == 0 && ev.code() == BTN_TOUCH => {
+                            last_mt_x = None;
+                            last_mt_y = None;
                         }
                         evdev::EventType::RELATIVE => {
                             let code = ev.code();
@@ -415,11 +426,24 @@ fn input_poll_inner(
                         }
                         evdev::EventType::ABSOLUTE => {
                             let code = ev.code();
-                            if code == ABS_X
-                                || code == ABS_Y
-                                || code == ABS_MT_POSITION_X
-                                || code == ABS_MT_POSITION_Y
-                            {
+                            let val = ev.value();
+                            if code == ABS_MT_POSITION_X {
+                                if let Some(prev) = last_mt_x {
+                                    let delta = u64::from((val - prev).unsigned_abs());
+                                    mouse_distance.fetch_add(delta, Ordering::Release);
+                                }
+                                last_mt_x = Some(val);
+                                last_activity.store(now, Ordering::Release);
+                                last_mouse_event = Instant::now();
+                            } else if code == ABS_MT_POSITION_Y {
+                                if let Some(prev) = last_mt_y {
+                                    let delta = u64::from((val - prev).unsigned_abs());
+                                    mouse_distance.fetch_add(delta, Ordering::Release);
+                                }
+                                last_mt_y = Some(val);
+                                last_activity.store(now, Ordering::Release);
+                                last_mouse_event = Instant::now();
+                            } else if code == ABS_X || code == ABS_Y {
                                 last_activity.store(now, Ordering::Release);
                                 last_mouse_event = Instant::now();
                             }
