@@ -9,7 +9,7 @@ mod types;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use chrono::{Datelike, Local, NaiveDate, Timelike};
+use chrono::{Datelike, NaiveDate, Timelike};
 // Re-export Excel functions
 pub use excel::export_xlsx_range;
 use owo_colors::OwoColorize;
@@ -232,12 +232,6 @@ pub(super) fn config_day_end_utc(
         .ok_or_else(|| Error::NiriError("day end is not representable".into()))
 }
 
-fn parse_timestamp_local(value: &str) -> Option<chrono::DateTime<Local>> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|dt| dt.with_timezone(&Local))
-        .ok()
-}
-
 // ---------------------------------------------------------------------------
 // Query functions
 // ---------------------------------------------------------------------------
@@ -383,7 +377,7 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
         std::collections::BTreeMap::new();
 
     for ev in &events {
-        let Some(ts) = parse_timestamp_local(&ev.timestamp) else {
+        let Some(ts) = app.config.parse_timestamp_to_local(&ev.timestamp) else {
             continue;
         };
 
@@ -585,7 +579,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
     let mut hourly: HashMap<u32, (i64, i64)> = HashMap::new();
 
     for row in &raw_rows {
-        let Some(local_dt) = parse_timestamp_local(&row.timestamp) else {
+        let Some(local_dt) = app.config.parse_timestamp_to_local(&row.timestamp) else {
             continue;
         };
 
@@ -673,7 +667,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         let mut after_keys: i64 = 0;
 
         for row in &raw_rows {
-            let Some(local_dt) = parse_timestamp_local(&row.timestamp) else {
+            let Some(local_dt) = app.config.parse_timestamp_to_local(&row.timestamp) else {
                 continue;
             };
             let total = row
@@ -707,9 +701,15 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         None
     };
 
-    let away = query_gaps(&app.conn, since_utc, until_utc, &app.config.sleep)
-        .map_err(|e| eprintln!("[report] query_gaps failed: {e}"))
-        .ok();
+    let away = query_gaps(
+        &app.conn,
+        &app.config,
+        since_utc,
+        until_utc,
+        &app.config.sleep,
+    )
+    .map_err(|e| eprintln!("[report] query_gaps failed: {e}"))
+    .ok();
     let streaks = query_streaks(&app.conn, &app.config, since_utc, until_utc)
         .map_err(|e| eprintln!("[report] query_streaks failed: {e}"))
         .ok();
@@ -828,10 +828,12 @@ fn flush_streak(
     app_ms: &mut HashMap<String, i64>,
     productive_ms: i64,
     keys: i64,
+    config: &Config,
 ) {
     if productive_ms >= 300_000 {
         let start_str = start.take().unwrap_or_default();
-        let start_local = parse_timestamp_local(&start_str)
+        let start_local = config
+            .parse_timestamp_to_local(&start_str)
             .map(|dt| dt.format("%m-%d %H:%M").to_string())
             .unwrap_or(start_str);
         streaks.push(FocusStreak {
@@ -904,13 +906,13 @@ fn query_streaks(
     let mut streak_keys: i64 = 0;
     let mut pending_unproductive_ms: i64 = 0;
     let mut in_streak = false;
-    let mut last_input_ts: Option<chrono::DateTime<Local>> = None;
+    let mut last_input_ts: Option<chrono::DateTime<chrono::FixedOffset>> = None;
 
     for ev in &events {
         let cat = Category::from_str(&ev.category).unwrap_or(Category::Neutral);
         let is_productive = cat == Category::Productive;
         let has_input = ev.keystrokes > 0 || ev.mouse_clicks > 0;
-        let cur_dt = parse_timestamp_local(&ev.timestamp);
+        let cur_dt = config.parse_timestamp_to_local(&ev.timestamp);
 
         if in_streak {
             let input_idle = match (last_input_ts, cur_dt) {
@@ -932,6 +934,7 @@ fn query_streaks(
                     &mut streak_app_ms,
                     streak_productive_ms,
                     streak_keys,
+                    config,
                 );
                 in_streak = false;
                 streak_productive_ms = 0;
@@ -949,6 +952,7 @@ fn query_streaks(
                         &mut streak_app_ms,
                         streak_productive_ms,
                         streak_keys,
+                        config,
                     );
                     in_streak = false;
                     streak_productive_ms = 0;
@@ -991,6 +995,7 @@ fn query_streaks(
             &mut streak_app_ms,
             streak_productive_ms,
             streak_keys,
+            config,
         );
     }
 
@@ -1022,6 +1027,7 @@ fn query_streaks(
 
 fn query_gaps(
     conn: &Connection,
+    config: &Config,
     since_utc: &str,
     until_utc: &str,
     sleep: &crate::config::SleepConfig,
@@ -1112,10 +1118,10 @@ fn query_gaps(
                     return false;
                 }
                 // Check if time between prev.gap_end and gap.gap_start is < merge_window
-                let Some(prev_end) = parse_timestamp_local(&prev.gap_end) else {
+                let Some(prev_end) = config.parse_timestamp_to_local(&prev.gap_end) else {
                     return false;
                 };
-                let Some(curr_start) = parse_timestamp_local(&gap.gap_start) else {
+                let Some(curr_start) = config.parse_timestamp_to_local(&gap.gap_start) else {
                     return false;
                 };
                 let between_ms = curr_start
@@ -1130,8 +1136,8 @@ fn query_gaps(
                 prev.gap_end.clone_from(&gap.gap_end);
                 // Recalculate duration from merged start to new end
                 if let (Some(start), Some(end)) = (
-                    parse_timestamp_local(&prev.gap_start),
-                    parse_timestamp_local(&gap.gap_end),
+                    config.parse_timestamp_to_local(&prev.gap_start),
+                    config.parse_timestamp_to_local(&gap.gap_end),
                 ) {
                     prev.duration_ms = end.signed_duration_since(start).num_milliseconds();
                 } else {
@@ -1169,11 +1175,12 @@ fn query_gaps(
             }
         }
 
-        let start_local = parse_timestamp_local(&gap.gap_start).map_or_else(
+        let start_local = config.parse_timestamp_to_local(&gap.gap_start).map_or_else(
             || gap.gap_start.clone(),
             |dt| dt.format("%m-%d %H:%M").to_string(),
         );
-        let end_local = parse_timestamp_local(&gap.gap_end)
+        let end_local = config
+            .parse_timestamp_to_local(&gap.gap_end)
             .map_or_else(|| gap.gap_end.clone(), |dt| dt.format("%H:%M").to_string());
 
         entries.push(GapEntry {
@@ -2186,7 +2193,7 @@ pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
 
     for row in rows {
         let (timestamp, category_raw, total_ms, keystrokes) = row?;
-        let Some(local_dt) = parse_timestamp_local(&timestamp) else {
+        let Some(local_dt) = app.config.parse_timestamp_to_local(&timestamp) else {
             continue;
         };
 

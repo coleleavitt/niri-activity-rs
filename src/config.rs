@@ -668,6 +668,18 @@ impl Config {
         self.day_start_utc(next_day)
     }
 
+    pub fn parse_timestamp_to_local(
+        &self,
+        value: &str,
+    ) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+        let utc_dt = chrono::DateTime::parse_from_rfc3339(value).ok()?;
+        if let Some(tz) = self.timezone {
+            Some(utc_dt.with_timezone(&tz).fixed_offset())
+        } else {
+            Some(utc_dt.with_timezone(&Local).fixed_offset())
+        }
+    }
+
     fn app_category(&self, app_id: &str) -> Option<Category> {
         if let Some(&cat) = self.categories.get(app_id) {
             return Some(cat);
@@ -710,7 +722,7 @@ impl Config {
 }
 
 impl Schedule {
-    pub fn is_in_schedule(&self, dt: &DateTime<Local>) -> bool {
+    pub fn is_in_schedule<Tz: chrono::TimeZone>(&self, dt: &DateTime<Tz>) -> bool {
         if !self.enabled {
             return true;
         }
