@@ -1,3 +1,4 @@
+mod agent_activity;
 mod config;
 mod db;
 mod email;

@@ -14,6 +14,7 @@ use rusqlite::Connection;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+use crate::agent_activity::AgentMonitor;
 use crate::config::{Category, Config, get_config_path, get_data_dir, load_config};
 use crate::db::{SessionSnapshot, init_db, insert_event, reclassify_all, run_migrations};
 use crate::error::Error;
@@ -285,6 +286,13 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         config.mouse_idle_threshold,
     );
     let logind = start_logind_monitor()?;
+    let mut agent_monitor = AgentMonitor::new(&config.agent_activity);
+    if config.agent_activity.enabled {
+        println!(
+            "Agent activity detection: enabled ({}s window)",
+            config.agent_activity.activity_window_secs
+        );
+    }
     let idle_threshold_ms = config.idle_threshold_secs.saturating_mul(1000);
     let deep_idle_threshold_ms = config.deep_idle_secs.saturating_mul(1000);
     let away_threshold_ms = config.away_threshold_secs.saturating_mul(1000);
@@ -556,8 +564,12 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 now_ms.saturating_sub(session_start_mono_ms)
             };
 
+            let agent_active = agent_monitor.is_agent_active();
             let new_state = if idle_duration_ms > away_threshold_ms {
                 ActivityState::Away
+            } else if agent_active {
+                // Agent is working (streaming, tool use) — count as engaged even without input
+                ActivityState::Active
             } else if idle_duration_ms > deep_idle_threshold_ms {
                 ActivityState::Idle
             } else if idle_duration_ms > idle_threshold_ms {

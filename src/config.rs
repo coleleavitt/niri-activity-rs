@@ -91,6 +91,57 @@ pub struct Schedule {
     pub holidays: Vec<String>,
 }
 
+/// Agent activity detection configuration.
+/// Treats AI agent activity (streaming, tool use) as "active" time even without
+/// keyboard input.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentActivityConfig {
+    /// Enable agent activity detection (default: true).
+    #[serde(default = "default_agent_enabled")]
+    pub enabled: bool,
+
+    /// How often to poll agent databases in seconds (default: 5).
+    #[serde(default = "default_agent_poll_interval")]
+    pub poll_interval_secs: u64,
+
+    /// How recent a message must be to count as "active" in seconds (default:
+    /// 30).
+    #[serde(default = "default_agent_activity_window")]
+    pub activity_window_secs: u64,
+
+    /// Paths to agent SQLite databases to monitor.
+    /// Supports ~ for home directory.
+    #[serde(default = "default_agent_databases")]
+    pub databases: Vec<String>,
+}
+
+fn default_agent_enabled() -> bool {
+    true
+}
+
+fn default_agent_poll_interval() -> u64 {
+    5
+}
+
+fn default_agent_activity_window() -> u64 {
+    30
+}
+
+fn default_agent_databases() -> Vec<String> {
+    vec!["~/.local/share/opencode/opencode.db".to_string()]
+}
+
+impl Default for AgentActivityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_agent_enabled(),
+            poll_interval_secs: default_agent_poll_interval(),
+            activity_window_secs: default_agent_activity_window(),
+            databases: default_agent_databases(),
+        }
+    }
+}
+
 /// Sleep / gap classification configuration.
 /// Controls how activity gaps are classified as Sleep vs LongBreak vs
 /// ShortBreak.
@@ -334,6 +385,8 @@ struct RawConfig {
     #[serde(default)]
     sleep: SleepConfig,
     #[serde(default)]
+    agent_activity: AgentActivityConfig,
+    #[serde(default)]
     categories: HashMap<String, Category>,
     #[serde(default)]
     title_rules: Vec<RawTitleRule>,
@@ -355,6 +408,7 @@ pub struct Config {
     pub email: Email,
     pub jiggler: JigglerConfig,
     pub sleep: SleepConfig,
+    pub agent_activity: AgentActivityConfig,
     pub categories: HashMap<String, Category>,
     pub title_rules: Vec<TitleRule>,
 }
@@ -529,8 +583,9 @@ impl From<RawConfig> for Config {
             goals: raw.goals,
             email: raw.email,
             jiggler: raw.jiggler,
-            categories: raw.categories,
             sleep: raw.sleep,
+            agent_activity: raw.agent_activity,
+            categories: raw.categories,
             title_rules,
         }
     }
@@ -552,8 +607,9 @@ impl Default for Config {
             goals: Goals::default(),
             email: Email::default(),
             jiggler: JigglerConfig::default(),
-            categories: HashMap::new(),
             sleep: SleepConfig::default(),
+            agent_activity: AgentActivityConfig::default(),
+            categories: HashMap::new(),
             title_rules: Vec::new(),
         }
     }
