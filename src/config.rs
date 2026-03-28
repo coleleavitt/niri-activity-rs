@@ -137,17 +137,30 @@ fn default_agent_databases() -> Vec<String> {
 
 fn default_process_whitelist() -> Vec<String> {
     [
+        // Rust ecosystem
         "cargo",
         "rustc",
         "rustup",
         "clippy-driver",
         "rust-analyzer",
+        "rustfmt",
+        "rls",
+        "rust-gdb",
+        "rust-lldb",
+        "miri",
+        "sccache",
+        // JavaScript/TypeScript
         "npm",
         "node",
         "bun",
         "deno",
         "pnpm",
         "yarn",
+        "tsc",
+        "esbuild",
+        "turbo",
+        "swc",
+        // C/C++ compilers and build systems
         "gcc",
         "g++",
         "clang",
@@ -155,13 +168,68 @@ fn default_process_whitelist() -> Vec<String> {
         "make",
         "cmake",
         "ninja",
+        "meson",
+        "ccache",
+        // Linkers
+        "ld",
+        "lld",
+        "mold",
+        "gold",
+        // Go
         "go",
+        // Python
         "python",
+        "python3",
         "pip",
         "uv",
+        "poetry",
+        "ruff",
+        "hatch",
+        "wheel",
+        "pytest",
+        "mypy",
+        "pyright",
+        // Java/JVM
+        "java",
+        "javac",
+        "gradle",
+        "mvn",
+        // .NET
+        "dotnet",
+        // Ruby
+        "ruby",
+        "gem",
+        "bundle",
+        // Other languages
+        "perl",
+        "php",
+        "composer",
+        "elixir",
+        "mix",
+        "zig",
+        // Containers
         "docker",
         "podman",
+        // Git
         "git",
+        // Debuggers and profilers
+        "gdb",
+        "lldb",
+        "valgrind",
+        "strace",
+        "ltrace",
+        // Binary utilities
+        "as",
+        "ar",
+        "nm",
+        "objdump",
+        "objcopy",
+        "strip",
+        // Gentoo package management
+        "emerge",
+        "portage",
+        "eix",
+        "ebuild",
     ]
     .iter()
     .map(|s| (*s).to_string())
