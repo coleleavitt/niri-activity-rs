@@ -503,9 +503,10 @@ impl From<RawConfig> for Config {
                 }
             })
             .collect();
-        let timezone = raw.timezone.and_then(|tz_str| match tz_str.parse::<Tz>() {
-            Ok(tz) => Some(tz),
-            Err(_) => {
+        let timezone = raw.timezone.and_then(|tz_str| {
+            if let Ok(tz) = tz_str.parse::<Tz>() {
+                Some(tz)
+            } else {
                 eprintln!(
                     "Warning: invalid timezone '{}', using system timezone",
                     tz_str
@@ -842,8 +843,8 @@ pub(crate) fn load_env_file() -> Result<(), Error> {
                 // SAFETY: Called before any threads are spawned (single-threaded context).
                 #[allow(unsafe_code)]
                 unsafe {
-                    std::env::set_var(key.trim(), value.trim())
-                };
+                    std::env::set_var(key.trim(), value.trim());
+                }
             }
         }
     }

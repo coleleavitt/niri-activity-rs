@@ -1,11 +1,19 @@
 use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
 use std::ops::RangeInclusive;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::OwnedFd;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use inotify::{Inotify, WatchMask};
+use input::event::pointer::{Axis, PointerScrollEvent};
+use input::event::{Event, PointerEvent};
+use input::{Libinput, LibinputInterface};
+use libc::{O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY};
 
 use crate::config::JigglerConfig;
 
@@ -25,6 +33,24 @@ pub const ABS_MT_POSITION_Y: u16 = 54;
 // Trackpad touch events (outside BTN_MOUSE_RANGE but should count as clicks)
 pub const BTN_TOUCH: u16 = 330;
 pub const BTN_TOOL_FINGER: u16 = 325;
+
+struct LibinputInterfaceImpl;
+
+impl LibinputInterface for LibinputInterfaceImpl {
+    fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
+        OpenOptions::new()
+            .custom_flags(flags)
+            .read((flags & O_ACCMODE == O_RDONLY) || (flags & O_ACCMODE == O_RDWR))
+            .write((flags & O_ACCMODE == O_WRONLY) || (flags & O_ACCMODE == O_RDWR))
+            .open(path)
+            .map(Into::into)
+            .map_err(|err| err.raw_os_error().unwrap_or(-1))
+    }
+
+    fn close_restricted(&mut self, fd: OwnedFd) {
+        drop(File::from(fd));
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct InputSnapshot {
@@ -187,6 +213,71 @@ pub fn scan_jiggler_processes(blacklist: &[String]) -> bool {
         }
     }
     false
+}
+
+fn libinput_scroll_poll(scroll_events: &AtomicU64, last_activity: &AtomicU64, start: Instant) {
+    let mut libinput = Libinput::new_with_udev(LibinputInterfaceImpl);
+
+    if let Err(e) = libinput.udev_assign_seat("seat0") {
+        eprintln!(
+            "Warning: Failed to assign libinput seat: {:?}. Trackpad scroll disabled.",
+            e
+        );
+        return;
+    }
+
+    eprintln!("Monitoring libinput for trackpad scroll events");
+
+    let mut v_accum: f64 = 0.0;
+    let mut h_accum: f64 = 0.0;
+    const SCROLL_THRESHOLD: f64 = 15.0;
+
+    fn extract_scroll_deltas(scroll: &impl PointerScrollEvent) -> (f64, f64) {
+        let v = if scroll.has_axis(Axis::Vertical) {
+            scroll.scroll_value(Axis::Vertical).abs()
+        } else {
+            0.0
+        };
+        let h = if scroll.has_axis(Axis::Horizontal) {
+            scroll.scroll_value(Axis::Horizontal).abs()
+        } else {
+            0.0
+        };
+        (v, h)
+    }
+
+    loop {
+        if let Err(e) = libinput.dispatch() {
+            eprintln!("libinput dispatch error: {:?}", e);
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
+        for event in &mut libinput {
+            let (v_delta, h_delta) = match &event {
+                Event::Pointer(PointerEvent::ScrollFinger(s)) => extract_scroll_deltas(s),
+                Event::Pointer(PointerEvent::ScrollWheel(s)) => extract_scroll_deltas(s),
+                Event::Pointer(PointerEvent::ScrollContinuous(s)) => extract_scroll_deltas(s),
+                _ => continue,
+            };
+
+            v_accum += v_delta;
+            h_accum += h_delta;
+
+            let v_notches = (v_accum / SCROLL_THRESHOLD) as u64;
+            let h_notches = (h_accum / SCROLL_THRESHOLD) as u64;
+
+            if v_notches > 0 || h_notches > 0 {
+                let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                scroll_events.fetch_add(v_notches + h_notches, Ordering::Release);
+                v_accum = (v_notches as f64).mul_add(-SCROLL_THRESHOLD, v_accum);
+                h_accum = (h_notches as f64).mul_add(-SCROLL_THRESHOLD, h_accum);
+                last_activity.store(now, Ordering::Release);
+            }
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 pub fn enumerate_input_devices() -> Vec<evdev::Device> {
@@ -411,11 +502,9 @@ fn input_poll_inner(
                                 }
                                 last_activity.store(now, Ordering::Release);
                                 last_mouse_event = Instant::now();
-                            } else if code == REL_WHEEL && !seen_hires_wheel {
-                                scroll_events.fetch_add(1, Ordering::Release);
-                                last_activity.store(now, Ordering::Release);
-                                last_mouse_event = Instant::now();
-                            } else if code == REL_HWHEEL && !seen_hires_hwheel {
+                            } else if (code == REL_WHEEL && !seen_hires_wheel)
+                                || (code == REL_HWHEEL && !seen_hires_hwheel)
+                            {
                                 scroll_events.fetch_add(1, Ordering::Release);
                                 last_activity.store(now, Ordering::Release);
                                 last_mouse_event = Instant::now();
@@ -595,6 +684,22 @@ pub fn start_idle_monitor(
         }
     }
 
+    {
+        let scroll_events_clone = Arc::clone(&stats.scroll_events);
+        let last_activity_clone = Arc::clone(&stats.last_activity_ms);
+        if let Err(e) = thread::Builder::new()
+            .name("libinput-scroll".into())
+            .spawn(move || {
+                libinput_scroll_poll(&scroll_events_clone, &last_activity_clone, start);
+            })
+        {
+            eprintln!(
+                "Warning: Failed to spawn libinput-scroll thread: {}. Trackpad scroll disabled.",
+                e
+            );
+        }
+    }
+
     let jiggler_enabled = jiggler_config.enabled;
 
     if let Err(e) = thread::Builder::new()
@@ -602,7 +707,7 @@ pub fn start_idle_monitor(
         .spawn(move || {
             const MAX_RESPAWN_ATTEMPTS: u32 = 10;
             const MIN_RESPAWN_INTERVAL: Duration = Duration::from_secs(5);
-            const RESPAWN_COUNT_RESET: Duration = Duration::from_secs(300);
+            const RESPAWN_COUNT_RESET: Duration = Duration::from_mins(5);
 
             let mut respawn_count: u32 = 0;
             let mut last_respawn = Instant::now();
@@ -666,8 +771,8 @@ pub fn start_idle_monitor(
                         }
 
                         let since_last = Instant::now().duration_since(last_respawn);
-                        if since_last < MIN_RESPAWN_INTERVAL {
-                            thread::sleep(MIN_RESPAWN_INTERVAL - since_last);
+                        if let Some(remaining) = MIN_RESPAWN_INTERVAL.checked_sub(since_last) {
+                            thread::sleep(remaining);
                         }
                         last_respawn = Instant::now();
 
