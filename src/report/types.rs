@@ -159,6 +159,62 @@ pub struct StreakSummary {
 }
 
 #[derive(Serialize)]
+pub struct InputMetrics {
+    pub backspace_count: i64,
+    pub modifier_count: i64,
+    pub left_clicks: i64,
+    pub right_clicks: i64,
+    pub middle_clicks: i64,
+    pub scroll_up: i64,
+    pub scroll_down: i64,
+    pub scroll_horizontal: i64,
+    pub backspace_rate: f64,
+    pub modifier_rate: f64,
+}
+
+#[derive(Serialize)]
+pub struct FlowSession {
+    pub app_id: String,
+    pub start_time: String,
+    pub duration_ms: i64,
+    pub keystrokes: i64,
+    pub keys_per_min: f64,
+}
+
+#[derive(Serialize)]
+pub struct FlowSummary {
+    pub total_flow_ms: i64,
+    pub flow_sessions: i64,
+    pub avg_flow_duration_ms: i64,
+    pub peak_keys_per_min: f64,
+    pub top_sessions: Vec<FlowSession>,
+}
+
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum FatigueTrend {
+    Increasing,
+    Stable,
+    Decreasing,
+    Insufficient,
+}
+
+#[derive(Serialize)]
+pub struct HourlyErrorRate {
+    pub hour: u32,
+    pub backspace_rate: f64,
+    pub keystrokes: i64,
+}
+
+#[derive(Serialize)]
+pub struct FatigueIndicators {
+    pub trend: FatigueTrend,
+    pub early_error_rate: f64,
+    pub late_error_rate: f64,
+    pub hourly_rates: Vec<HourlyErrorRate>,
+    pub recommendation: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct ReportData {
     pub since_str: String,
     pub now_str: String,
@@ -179,6 +235,9 @@ pub struct ReportData {
     pub schedule: Option<ScheduleBreakdown>,
     pub away: Option<AwayData>,
     pub streaks: Option<StreakSummary>,
+    pub input_metrics: Option<InputMetrics>,
+    pub flow: Option<FlowSummary>,
+    pub fatigue: Option<FatigueIndicators>,
 }
 
 #[derive(Default)]

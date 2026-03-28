@@ -19,9 +19,10 @@ use serde::Serialize;
 pub(crate) use types::Metrics;
 // Re-export all public types
 pub use types::{
-    AppBreakdown, AppGroup, AwayData, CategoryBreakdown, DailyBreakdown, FocusStreak, GapEntry,
-    GapSummary, GapType, HourBreakdown, MetricsData, ReportData, ScheduleBreakdown, StreakSummary,
-    TimelineBucket, TimelineData, TodayData, TodayRow,
+    AppBreakdown, AppGroup, AwayData, CategoryBreakdown, DailyBreakdown, FatigueIndicators,
+    FatigueTrend, FlowSession, FlowSummary, FocusStreak, GapEntry, GapSummary, GapType,
+    HourBreakdown, HourlyErrorRate, InputMetrics, MetricsData, ReportData, ScheduleBreakdown,
+    StreakSummary, TimelineBucket, TimelineData, TodayData, TodayRow,
 };
 
 use crate::config::{Category, Config, get_data_dir, load_config};
@@ -714,6 +715,18 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         .map_err(|e| eprintln!("[report] query_streaks failed: {e}"))
         .ok();
 
+    let input_metrics = query_input_metrics(&app.conn, since_utc, until_utc, total_keys)
+        .map_err(|e| eprintln!("[report] query_input_metrics failed: {e}"))
+        .ok();
+
+    let flow = query_flow_sessions(&app.conn, &app.config, since_utc, until_utc)
+        .map_err(|e| eprintln!("[report] query_flow_sessions failed: {e}"))
+        .ok();
+
+    let fatigue = query_fatigue_indicators(&app.conn, &app.config, since_utc, until_utc)
+        .map_err(|e| eprintln!("[report] query_fatigue_indicators failed: {e}"))
+        .ok();
+
     Ok(ReportData {
         since_str,
         now_str,
@@ -734,6 +747,9 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         schedule,
         away,
         streaks,
+        input_metrics,
+        flow,
+        fatigue,
     })
 }
 
@@ -1231,6 +1247,349 @@ fn query_gaps(
         summaries,
         total_away_ms,
         entries,
+    })
+}
+
+fn query_input_metrics(
+    conn: &Connection,
+    since_utc: &str,
+    until_utc: &str,
+    total_keys: i64,
+) -> Result<InputMetrics, Error> {
+    let (
+        backspace_count,
+        modifier_count,
+        left_clicks,
+        right_clicks,
+        middle_clicks,
+        scroll_up,
+        scroll_down,
+        scroll_horizontal,
+    ): (i64, i64, i64, i64, i64, i64, i64, i64) = conn.query_row(
+        "SELECT 
+            COALESCE(SUM(backspace_count), 0),
+            COALESCE(SUM(modifier_count), 0),
+            COALESCE(SUM(left_clicks), 0),
+            COALESCE(SUM(right_clicks), 0),
+            COALESCE(SUM(middle_clicks), 0),
+            COALESCE(SUM(scroll_up), 0),
+            COALESCE(SUM(scroll_down), 0),
+            COALESCE(SUM(scroll_horizontal), 0)
+         FROM events WHERE timestamp >= ?1 AND timestamp < ?2",
+        params![since_utc, until_utc],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
+    )?;
+
+    let backspace_rate = if total_keys > 0 {
+        (backspace_count as f64 / total_keys as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let modifier_rate = if total_keys > 0 {
+        (modifier_count as f64 / total_keys as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(InputMetrics {
+        backspace_count,
+        modifier_count,
+        left_clicks,
+        right_clicks,
+        middle_clicks,
+        scroll_up,
+        scroll_down,
+        scroll_horizontal,
+        backspace_rate,
+        modifier_rate,
+    })
+}
+
+fn query_flow_sessions(
+    conn: &Connection,
+    config: &Config,
+    since_utc: &str,
+    until_utc: &str,
+) -> Result<FlowSummary, Error> {
+    const FLOW_MIN_KEYS_PER_MIN: f64 = 50.0;
+    const FLOW_MIN_DURATION_MS: i64 = 5 * 60 * 1000;
+
+    let mut stmt = conn.prepare(
+        "SELECT app_id, timestamp, active_ms, keystrokes, category
+         FROM events 
+         WHERE timestamp >= ?1 AND timestamp < ?2 AND keystrokes > 0
+         ORDER BY timestamp",
+    )?;
+
+    struct EventRow {
+        app_id: String,
+        timestamp: String,
+        active_ms: i64,
+        keystrokes: i64,
+        category: String,
+    }
+
+    let rows: Vec<EventRow> = stmt
+        .query_map(params![since_utc, until_utc], |row| {
+            Ok(EventRow {
+                app_id: row.get(0)?,
+                timestamp: row.get(1)?,
+                active_ms: row.get(2)?,
+                keystrokes: row.get(3)?,
+                category: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut sessions: Vec<FlowSession> = Vec::new();
+    let mut current_app: Option<String> = None;
+    let mut session_start: Option<String> = None;
+    let mut session_duration_ms: i64 = 0;
+    let mut session_keys: i64 = 0;
+
+    let try_finalize_session = |sessions: &mut Vec<FlowSession>,
+                                current_app: &Option<String>,
+                                session_start: &mut Option<String>,
+                                session_duration_ms: i64,
+                                session_keys: i64| {
+        if session_duration_ms >= FLOW_MIN_DURATION_MS {
+            let keys_per_min = if session_duration_ms > 0 {
+                (session_keys as f64) / (session_duration_ms as f64 / 60_000.0)
+            } else {
+                0.0
+            };
+            if keys_per_min >= FLOW_MIN_KEYS_PER_MIN
+                && let Some(start) = session_start.take()
+            {
+                let start_local = config
+                    .parse_timestamp_to_local(&start)
+                    .map_or_else(|| start.clone(), |dt| dt.format("%m-%d %H:%M").to_string());
+                sessions.push(FlowSession {
+                    app_id: current_app.clone().unwrap_or_default(),
+                    start_time: start_local,
+                    duration_ms: session_duration_ms,
+                    keystrokes: session_keys,
+                    keys_per_min,
+                });
+            }
+        }
+    };
+
+    for row in &rows {
+        if row.category != "productive" {
+            try_finalize_session(
+                &mut sessions,
+                &current_app,
+                &mut session_start,
+                session_duration_ms,
+                session_keys,
+            );
+            current_app = None;
+            session_start = None;
+            session_duration_ms = 0;
+            session_keys = 0;
+            continue;
+        }
+
+        let keys_per_min_current = if row.active_ms > 0 {
+            (row.keystrokes as f64) / (row.active_ms as f64 / 60_000.0)
+        } else {
+            0.0
+        };
+
+        if keys_per_min_current >= FLOW_MIN_KEYS_PER_MIN {
+            if current_app.as_ref() == Some(&row.app_id) || current_app.is_none() {
+                if session_start.is_none() {
+                    session_start = Some(row.timestamp.clone());
+                    current_app = Some(row.app_id.clone());
+                }
+                session_duration_ms += row.active_ms;
+                session_keys += row.keystrokes;
+            } else {
+                try_finalize_session(
+                    &mut sessions,
+                    &current_app,
+                    &mut session_start,
+                    session_duration_ms,
+                    session_keys,
+                );
+                current_app = Some(row.app_id.clone());
+                session_start = Some(row.timestamp.clone());
+                session_duration_ms = row.active_ms;
+                session_keys = row.keystrokes;
+            }
+        } else {
+            try_finalize_session(
+                &mut sessions,
+                &current_app,
+                &mut session_start,
+                session_duration_ms,
+                session_keys,
+            );
+            current_app = None;
+            session_start = None;
+            session_duration_ms = 0;
+            session_keys = 0;
+        }
+    }
+
+    try_finalize_session(
+        &mut sessions,
+        &current_app,
+        &mut session_start,
+        session_duration_ms,
+        session_keys,
+    );
+
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.duration_ms));
+
+    let total_flow_ms: i64 = sessions.iter().map(|s| s.duration_ms).sum();
+    let flow_sessions = i64::try_from(sessions.len()).unwrap_or(i64::MAX);
+    let avg_flow_duration_ms = if flow_sessions > 0 {
+        total_flow_ms / flow_sessions
+    } else {
+        0
+    };
+    let peak_keys_per_min = sessions
+        .iter()
+        .map(|s| s.keys_per_min)
+        .fold(0.0_f64, f64::max);
+
+    let top_sessions: Vec<FlowSession> = sessions.into_iter().take(5).collect();
+
+    Ok(FlowSummary {
+        total_flow_ms,
+        flow_sessions,
+        avg_flow_duration_ms,
+        peak_keys_per_min,
+        top_sessions,
+    })
+}
+
+fn query_fatigue_indicators(
+    conn: &Connection,
+    config: &Config,
+    since_utc: &str,
+    until_utc: &str,
+) -> Result<FatigueIndicators, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT timestamp, keystrokes, backspace_count
+         FROM events 
+         WHERE timestamp >= ?1 AND timestamp < ?2 AND keystrokes > 0
+         ORDER BY timestamp",
+    )?;
+
+    struct Row {
+        timestamp: String,
+        keystrokes: i64,
+        backspace_count: i64,
+    }
+
+    let rows: Vec<Row> = stmt
+        .query_map(params![since_utc, until_utc], |row| {
+            Ok(Row {
+                timestamp: row.get(0)?,
+                keystrokes: row.get(1)?,
+                backspace_count: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut hourly_keys: HashMap<u32, i64> = HashMap::new();
+    let mut hourly_backspaces: HashMap<u32, i64> = HashMap::new();
+
+    for row in &rows {
+        if let Some(dt) = config.parse_timestamp_to_local(&row.timestamp) {
+            let hour = dt.hour();
+            *hourly_keys.entry(hour).or_insert(0) += row.keystrokes;
+            *hourly_backspaces.entry(hour).or_insert(0) += row.backspace_count;
+        }
+    }
+
+    let mut hourly_rates: Vec<HourlyErrorRate> = Vec::new();
+    for hour in 0..24 {
+        let keys = hourly_keys.get(&hour).copied().unwrap_or(0);
+        let backspaces = hourly_backspaces.get(&hour).copied().unwrap_or(0);
+        if keys > 100 {
+            let rate = (backspaces as f64 / keys as f64) * 100.0;
+            hourly_rates.push(HourlyErrorRate {
+                hour,
+                backspace_rate: rate,
+                keystrokes: keys,
+            });
+        }
+    }
+
+    if hourly_rates.len() < 2 {
+        return Ok(FatigueIndicators {
+            trend: FatigueTrend::Insufficient,
+            early_error_rate: 0.0,
+            late_error_rate: 0.0,
+            hourly_rates,
+            recommendation: None,
+        });
+    }
+
+    hourly_rates.sort_by_key(|r| r.hour);
+
+    let mid = hourly_rates.len() / 2;
+    let early_rates: Vec<f64> = hourly_rates[..mid]
+        .iter()
+        .map(|r| r.backspace_rate)
+        .collect();
+    let late_rates: Vec<f64> = hourly_rates[mid..]
+        .iter()
+        .map(|r| r.backspace_rate)
+        .collect();
+
+    let early_avg = if early_rates.is_empty() {
+        0.0
+    } else {
+        early_rates.iter().sum::<f64>() / early_rates.len() as f64
+    };
+
+    let late_avg = if late_rates.is_empty() {
+        0.0
+    } else {
+        late_rates.iter().sum::<f64>() / late_rates.len() as f64
+    };
+
+    let trend = if late_avg > early_avg * 1.3 {
+        FatigueTrend::Increasing
+    } else if late_avg < early_avg * 0.7 {
+        FatigueTrend::Decreasing
+    } else {
+        FatigueTrend::Stable
+    };
+
+    let recommendation = match trend {
+        FatigueTrend::Increasing => {
+            Some("Error rate increasing later in day. Consider more frequent breaks.".to_string())
+        }
+        FatigueTrend::Decreasing => {
+            Some("Strong finish - error rate decreased as day progressed.".to_string())
+        }
+        FatigueTrend::Stable | FatigueTrend::Insufficient => None,
+    };
+
+    Ok(FatigueIndicators {
+        trend,
+        early_error_rate: early_avg,
+        late_error_rate: late_avg,
+        hourly_rates,
+        recommendation,
     })
 }
 
@@ -1846,6 +2205,110 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
                     truncate(&streak.app_id, 20),
                 );
             }
+        }
+    }
+
+    if let Some(input) = &data.input_metrics
+        && (input.backspace_count > 0
+            || input.modifier_count > 0
+            || input.left_clicks > 0
+            || input.scroll_up > 0)
+    {
+        println!(
+            "\n{}",
+            section_header("── Input Metrics ─────────────────────────────────────")
+        );
+
+        println!(
+            "  Backspace/Delete:   {} ({:.2}% of keystrokes)",
+            input.backspace_count.to_string().bold(),
+            input.backspace_rate
+        );
+        println!(
+            "  Modifier Keys:      {} ({:.2}% of keystrokes)",
+            input.modifier_count.to_string().bold(),
+            input.modifier_rate
+        );
+        println!();
+        println!(
+            "  Mouse Clicks:       {} left, {} right, {} middle",
+            input.left_clicks.to_string().bold(),
+            input.right_clicks,
+            input.middle_clicks
+        );
+        println!(
+            "  Scroll Events:      {} up, {} down, {} horizontal",
+            input.scroll_up.to_string().bold(),
+            input.scroll_down,
+            input.scroll_horizontal
+        );
+    }
+
+    if let Some(flow) = &data.flow
+        && flow.flow_sessions > 0
+    {
+        println!(
+            "\n{}",
+            section_header("── Flow State ────────────────────────────────────────")
+        );
+
+        println!(
+            "  Total Flow Time:    {}",
+            fmt_duration(flow.total_flow_ms).green().bold()
+        );
+        println!(
+            "  Flow Sessions:      {} (avg {})",
+            flow.flow_sessions,
+            fmt_duration(flow.avg_flow_duration_ms)
+        );
+        println!(
+            "  Peak Intensity:     {:.0} keys/min",
+            flow.peak_keys_per_min
+        );
+
+        if !flow.top_sessions.is_empty() {
+            println!();
+            for (i, session) in flow.top_sessions.iter().enumerate() {
+                let rank = format!("{}.", i + 1);
+                println!(
+                    "  {:>3} {:>8}  {}  {:.0} keys/min  {}",
+                    rank.dimmed(),
+                    fmt_duration(session.duration_ms).green(),
+                    session.start_time.dimmed(),
+                    session.keys_per_min,
+                    truncate(&session.app_id, 20),
+                );
+            }
+        }
+    }
+
+    if let Some(fatigue) = &data.fatigue
+        && fatigue.trend != FatigueTrend::Insufficient
+    {
+        println!(
+            "\n{}",
+            section_header("── Fatigue Indicators ────────────────────────────────")
+        );
+
+        let trend_str = match fatigue.trend {
+            FatigueTrend::Increasing => "↑ Increasing".red().to_string(),
+            FatigueTrend::Stable => "→ Stable".green().to_string(),
+            FatigueTrend::Decreasing => "↓ Decreasing".green().bold().to_string(),
+            FatigueTrend::Insufficient => "Insufficient data".dimmed().to_string(),
+        };
+        println!("  Error Rate Trend:   {}", trend_str);
+        println!(
+            "  Early Session:      {:.2}% backspace rate",
+            fatigue.early_error_rate
+        );
+        println!(
+            "  Late Session:       {:.2}% backspace rate",
+            fatigue.late_error_rate
+        );
+
+        if let Some(rec) = &fatigue.recommendation {
+            println!();
+            println!("  💡 {}", rec.cyan());
         }
     }
 
