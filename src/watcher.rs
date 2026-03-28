@@ -571,15 +571,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 let (input, jiggler) = if info.is_some() {
                     (input_stats.snapshot(), input_stats.jiggler_detected())
                 } else {
-                    (
-                        InputSnapshot {
-                            keystrokes: 0,
-                            mouse_clicks: 0,
-                            scroll_events: 0,
-                            mouse_distance: 0,
-                        },
-                        false,
-                    )
+                    (InputSnapshot::default(), false)
                 };
                 flush_session(
                     &flush_ctx,

@@ -197,6 +197,48 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         eprintln!("Migration 005: added input_offsets column for retroactive reclassification");
     }
 
+    if !applied.contains(&"006_add_granular_input_metrics".to_string()) {
+        let tx = conn.transaction()?;
+        tx.execute(
+            "ALTER TABLE events ADD COLUMN backspace_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        tx.execute(
+            "ALTER TABLE events ADD COLUMN modifier_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        tx.execute(
+            "ALTER TABLE events ADD COLUMN left_clicks INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        tx.execute(
+            "ALTER TABLE events ADD COLUMN right_clicks INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        tx.execute(
+            "ALTER TABLE events ADD COLUMN middle_clicks INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        tx.execute(
+            "ALTER TABLE events ADD COLUMN scroll_up INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        tx.execute(
+            "ALTER TABLE events ADD COLUMN scroll_down INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        tx.execute(
+            "ALTER TABLE events ADD COLUMN scroll_horizontal INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
+            params!["006_add_granular_input_metrics", Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        eprintln!("Migration 006: added granular input metrics columns");
+    }
+
     Ok(())
 }
 
@@ -268,8 +310,13 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
         .flat_map(|&n| n.to_le_bytes())
         .collect();
     conn.execute(
-        "INSERT INTO events (timestamp, app_id, title, category, active_ms, passive_ms, idle_ms, keystrokes, mouse_clicks, scroll_events, mouse_distance, jiggler_detected, input_offsets) 
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO events (
+            timestamp, app_id, title, category, active_ms, passive_ms, idle_ms,
+            keystrokes, mouse_clicks, scroll_events, mouse_distance,
+            jiggler_detected, input_offsets,
+            backspace_count, modifier_count, left_clicks, right_clicks, middle_clicks,
+            scroll_up, scroll_down, scroll_horizontal
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             snapshot.focus_start.to_rfc3339(),
             &snapshot.window.app_id,
@@ -284,6 +331,14 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
             i64::try_from(snapshot.input.mouse_distance).unwrap_or(i64::MAX),
             snapshot.jiggler_detected as i32,
             offsets_blob,
+            i64::try_from(snapshot.input.backspace_count).unwrap_or(i64::MAX),
+            i64::try_from(snapshot.input.modifier_count).unwrap_or(i64::MAX),
+            i64::try_from(snapshot.input.left_clicks).unwrap_or(i64::MAX),
+            i64::try_from(snapshot.input.right_clicks).unwrap_or(i64::MAX),
+            i64::try_from(snapshot.input.middle_clicks).unwrap_or(i64::MAX),
+            i64::try_from(snapshot.input.scroll_up).unwrap_or(i64::MAX),
+            i64::try_from(snapshot.input.scroll_down).unwrap_or(i64::MAX),
+            i64::try_from(snapshot.input.scroll_horizontal).unwrap_or(i64::MAX),
         ],
     )?;
     Ok(())

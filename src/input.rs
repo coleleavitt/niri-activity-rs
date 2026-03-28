@@ -30,9 +30,22 @@ pub const ABS_Y: u16 = 1;
 pub const ABS_MT_POSITION_X: u16 = 53;
 pub const ABS_MT_POSITION_Y: u16 = 54;
 
-// Trackpad touch events (outside BTN_MOUSE_RANGE but should count as clicks)
 pub const BTN_TOUCH: u16 = 330;
 pub const BTN_TOOL_FINGER: u16 = 325;
+pub const BTN_LEFT: u16 = 272;
+pub const BTN_RIGHT: u16 = 273;
+pub const BTN_MIDDLE: u16 = 274;
+
+pub const KEY_BACKSPACE: u16 = 14;
+pub const KEY_DELETE: u16 = 111;
+pub const KEY_LEFTCTRL: u16 = 29;
+pub const KEY_RIGHTCTRL: u16 = 97;
+pub const KEY_LEFTSHIFT: u16 = 42;
+pub const KEY_RIGHTSHIFT: u16 = 54;
+pub const KEY_LEFTALT: u16 = 56;
+pub const KEY_RIGHTALT: u16 = 100;
+pub const KEY_LEFTMETA: u16 = 125;
+pub const KEY_RIGHTMETA: u16 = 126;
 
 struct LibinputInterfaceImpl;
 
@@ -52,12 +65,20 @@ impl LibinputInterface for LibinputInterfaceImpl {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct InputSnapshot {
     pub keystrokes: u64,
     pub mouse_clicks: u64,
     pub scroll_events: u64,
     pub mouse_distance: u64,
+    pub backspace_count: u64,
+    pub modifier_count: u64,
+    pub left_clicks: u64,
+    pub right_clicks: u64,
+    pub middle_clicks: u64,
+    pub scroll_up: u64,
+    pub scroll_down: u64,
+    pub scroll_horizontal: u64,
 }
 
 pub struct InputStats {
@@ -66,28 +87,36 @@ pub struct InputStats {
     mouse_clicks: Arc<AtomicU64>,
     scroll_events: Arc<AtomicU64>,
     mouse_distance: Arc<AtomicU64>,
+    backspace_count: Arc<AtomicU64>,
+    modifier_count: Arc<AtomicU64>,
+    left_clicks: Arc<AtomicU64>,
+    right_clicks: Arc<AtomicU64>,
+    middle_clicks: Arc<AtomicU64>,
+    scroll_up: Arc<AtomicU64>,
+    scroll_down: Arc<AtomicU64>,
+    scroll_horizontal: Arc<AtomicU64>,
     jiggler_pattern: Arc<AtomicBool>,
     jiggler_process: Arc<AtomicBool>,
     last_keyboard_ms: Arc<AtomicU64>,
     last_meaningful_input_ms: Arc<AtomicU64>,
-    /// Monotonic heartbeat counter incremented every poll iteration.
-    /// If this stops advancing, the input-poll thread has died.
     heartbeat: Arc<AtomicU64>,
 }
 
 impl InputStats {
     pub fn snapshot(&self) -> InputSnapshot {
-        // AcqRel ensures visibility: Release semantics for the store (resetting to 0),
-        // Acquire semantics for the load (reading the accumulated value)
-        let keystrokes = self.keystrokes.swap(0, Ordering::AcqRel);
-        let mouse_clicks = self.mouse_clicks.swap(0, Ordering::AcqRel);
-        let scroll_events = self.scroll_events.swap(0, Ordering::AcqRel);
-        let mouse_distance = self.mouse_distance.swap(0, Ordering::AcqRel);
         InputSnapshot {
-            keystrokes,
-            mouse_clicks,
-            scroll_events,
-            mouse_distance,
+            keystrokes: self.keystrokes.swap(0, Ordering::AcqRel),
+            mouse_clicks: self.mouse_clicks.swap(0, Ordering::AcqRel),
+            scroll_events: self.scroll_events.swap(0, Ordering::AcqRel),
+            mouse_distance: self.mouse_distance.swap(0, Ordering::AcqRel),
+            backspace_count: self.backspace_count.swap(0, Ordering::AcqRel),
+            modifier_count: self.modifier_count.swap(0, Ordering::AcqRel),
+            left_clicks: self.left_clicks.swap(0, Ordering::AcqRel),
+            right_clicks: self.right_clicks.swap(0, Ordering::AcqRel),
+            middle_clicks: self.middle_clicks.swap(0, Ordering::AcqRel),
+            scroll_up: self.scroll_up.swap(0, Ordering::AcqRel),
+            scroll_down: self.scroll_down.swap(0, Ordering::AcqRel),
+            scroll_horizontal: self.scroll_horizontal.swap(0, Ordering::AcqRel),
         }
     }
 
@@ -322,6 +351,14 @@ fn input_poll_inner(
     mouse_clicks: &AtomicU64,
     scroll_events: &AtomicU64,
     mouse_distance: &AtomicU64,
+    backspace_count: &AtomicU64,
+    modifier_count: &AtomicU64,
+    left_clicks: &AtomicU64,
+    right_clicks: &AtomicU64,
+    middle_clicks: &AtomicU64,
+    scroll_up: &AtomicU64,
+    scroll_down: &AtomicU64,
+    scroll_horizontal: &AtomicU64,
     jiggler_pattern_flag: &AtomicBool,
     last_keyboard_ms: &AtomicU64,
     last_meaningful: &AtomicU64,
@@ -422,6 +459,12 @@ fn input_poll_inner(
                             let code = ev.code();
                             if BTN_MOUSE_RANGE.contains(&code) || code == BTN_TOUCH {
                                 mouse_clicks.fetch_add(1, Ordering::Release);
+                                match code {
+                                    BTN_LEFT => left_clicks.fetch_add(1, Ordering::Release),
+                                    BTN_RIGHT => right_clicks.fetch_add(1, Ordering::Release),
+                                    BTN_MIDDLE => middle_clicks.fetch_add(1, Ordering::Release),
+                                    _ => 0,
+                                };
                                 last_activity.store(now, Ordering::Release);
                                 last_meaningful.store(now, Ordering::Release);
                                 last_mouse_event = Instant::now();
@@ -430,6 +473,20 @@ fn input_poll_inner(
                                 }
                             } else if code != BTN_TOOL_FINGER {
                                 keystrokes.fetch_add(1, Ordering::Release);
+                                if code == KEY_BACKSPACE || code == KEY_DELETE {
+                                    backspace_count.fetch_add(1, Ordering::Release);
+                                }
+                                if code == KEY_LEFTCTRL
+                                    || code == KEY_RIGHTCTRL
+                                    || code == KEY_LEFTSHIFT
+                                    || code == KEY_RIGHTSHIFT
+                                    || code == KEY_LEFTALT
+                                    || code == KEY_RIGHTALT
+                                    || code == KEY_LEFTMETA
+                                    || code == KEY_RIGHTMETA
+                                {
+                                    modifier_count.fetch_add(1, Ordering::Release);
+                                }
                                 last_activity.store(now, Ordering::Release);
                                 last_meaningful.store(now, Ordering::Release);
                                 last_keyboard_event = Instant::now();
@@ -484,10 +541,16 @@ fn input_poll_inner(
                                 }
                             } else if code == REL_WHEEL_HI_RES {
                                 seen_hires_wheel = true;
-                                hires_wheel_accum += ev.value().unsigned_abs() as i64;
+                                let raw_value = ev.value();
+                                hires_wheel_accum += raw_value.unsigned_abs() as i64;
                                 let notches = hires_wheel_accum / HIRES_SCROLL_DIVISOR;
                                 if notches > 0 {
                                     scroll_events.fetch_add(notches as u64, Ordering::Release);
+                                    if raw_value > 0 {
+                                        scroll_up.fetch_add(notches as u64, Ordering::Release);
+                                    } else {
+                                        scroll_down.fetch_add(notches as u64, Ordering::Release);
+                                    }
                                     hires_wheel_accum -= notches * HIRES_SCROLL_DIVISOR;
                                 }
                                 last_activity.store(now, Ordering::Release);
@@ -498,6 +561,7 @@ fn input_poll_inner(
                                 let notches = hires_hwheel_accum / HIRES_SCROLL_DIVISOR;
                                 if notches > 0 {
                                     scroll_events.fetch_add(notches as u64, Ordering::Release);
+                                    scroll_horizontal.fetch_add(notches as u64, Ordering::Release);
                                     hires_hwheel_accum -= notches * HIRES_SCROLL_DIVISOR;
                                 }
                                 last_activity.store(now, Ordering::Release);
@@ -506,6 +570,15 @@ fn input_poll_inner(
                                 || (code == REL_HWHEEL && !seen_hires_hwheel)
                             {
                                 scroll_events.fetch_add(1, Ordering::Release);
+                                if code == REL_WHEEL {
+                                    if ev.value() > 0 {
+                                        scroll_up.fetch_add(1, Ordering::Release);
+                                    } else {
+                                        scroll_down.fetch_add(1, Ordering::Release);
+                                    }
+                                } else {
+                                    scroll_horizontal.fetch_add(1, Ordering::Release);
+                                }
                                 last_activity.store(now, Ordering::Release);
                                 last_mouse_event = Instant::now();
                             } else if code == REL_WHEEL || code == REL_HWHEEL {
@@ -570,6 +643,14 @@ pub fn start_idle_monitor(
         mouse_clicks: Arc::new(AtomicU64::new(0)),
         scroll_events: Arc::new(AtomicU64::new(0)),
         mouse_distance: Arc::new(AtomicU64::new(0)),
+        backspace_count: Arc::new(AtomicU64::new(0)),
+        modifier_count: Arc::new(AtomicU64::new(0)),
+        left_clicks: Arc::new(AtomicU64::new(0)),
+        right_clicks: Arc::new(AtomicU64::new(0)),
+        middle_clicks: Arc::new(AtomicU64::new(0)),
+        scroll_up: Arc::new(AtomicU64::new(0)),
+        scroll_down: Arc::new(AtomicU64::new(0)),
+        scroll_horizontal: Arc::new(AtomicU64::new(0)),
         jiggler_pattern: Arc::new(AtomicBool::new(false)),
         jiggler_process: Arc::new(AtomicBool::new(false)),
         last_keyboard_ms: Arc::new(AtomicU64::new(0)),
@@ -582,6 +663,14 @@ pub fn start_idle_monitor(
     let mouse_clicks = Arc::clone(&stats.mouse_clicks);
     let scroll_events = Arc::clone(&stats.scroll_events);
     let mouse_distance = Arc::clone(&stats.mouse_distance);
+    let backspace_count = Arc::clone(&stats.backspace_count);
+    let modifier_count = Arc::clone(&stats.modifier_count);
+    let left_clicks = Arc::clone(&stats.left_clicks);
+    let right_clicks = Arc::clone(&stats.right_clicks);
+    let middle_clicks = Arc::clone(&stats.middle_clicks);
+    let scroll_up = Arc::clone(&stats.scroll_up);
+    let scroll_down = Arc::clone(&stats.scroll_down);
+    let scroll_horizontal = Arc::clone(&stats.scroll_horizontal);
     let jiggler_pattern_flag = Arc::clone(&stats.jiggler_pattern);
     let last_keyboard_ms = Arc::clone(&stats.last_keyboard_ms);
     let last_meaningful = Arc::clone(&stats.last_meaningful_input_ms);
@@ -719,6 +808,14 @@ pub fn start_idle_monitor(
                 let mouse_clicks_ref = Arc::clone(&mouse_clicks);
                 let scroll_events_ref = Arc::clone(&scroll_events);
                 let mouse_distance_ref = Arc::clone(&mouse_distance);
+                let backspace_count_ref = Arc::clone(&backspace_count);
+                let modifier_count_ref = Arc::clone(&modifier_count);
+                let left_clicks_ref = Arc::clone(&left_clicks);
+                let right_clicks_ref = Arc::clone(&right_clicks);
+                let middle_clicks_ref = Arc::clone(&middle_clicks);
+                let scroll_up_ref = Arc::clone(&scroll_up);
+                let scroll_down_ref = Arc::clone(&scroll_down);
+                let scroll_horizontal_ref = Arc::clone(&scroll_horizontal);
                 let jiggler_pattern_ref = Arc::clone(&jiggler_pattern_flag);
                 let last_keyboard_ref = Arc::clone(&last_keyboard_ms);
                 let last_meaningful_ref = Arc::clone(&last_meaningful);
@@ -737,6 +834,14 @@ pub fn start_idle_monitor(
                         &mouse_clicks_ref,
                         &scroll_events_ref,
                         &mouse_distance_ref,
+                        &backspace_count_ref,
+                        &modifier_count_ref,
+                        &left_clicks_ref,
+                        &right_clicks_ref,
+                        &middle_clicks_ref,
+                        &scroll_up_ref,
+                        &scroll_down_ref,
+                        &scroll_horizontal_ref,
                         &jiggler_pattern_ref,
                         &last_keyboard_ref,
                         &last_meaningful_ref,
