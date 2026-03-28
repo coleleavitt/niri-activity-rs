@@ -93,26 +93,30 @@ pub struct Schedule {
 
 /// Agent activity detection configuration.
 /// Treats AI agent activity (streaming, tool use) as "active" time even without
-/// keyboard input.
+/// keyboard input. Also detects build processes (cargo, npm, etc.).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentActivityConfig {
-    /// Enable agent activity detection (default: true).
     #[serde(default = "default_agent_enabled")]
     pub enabled: bool,
 
-    /// How often to poll agent databases in seconds (default: 5).
     #[serde(default = "default_agent_poll_interval")]
     pub poll_interval_secs: u64,
 
-    /// How recent a message must be to count as "active" in seconds (default:
-    /// 30).
     #[serde(default = "default_agent_activity_window")]
     pub activity_window_secs: u64,
 
-    /// Paths to agent SQLite databases to monitor.
-    /// Supports ~ for home directory.
     #[serde(default = "default_agent_databases")]
     pub databases: Vec<String>,
+
+    /// Process names to treat as "active" when running (builds, compiles).
+    #[serde(default = "default_process_whitelist")]
+    pub process_whitelist: Vec<String>,
+
+    /// Only count process activity if user had input within this many seconds.
+    /// Prevents counting background processes when user is away. (default: 300
+    /// = 5 min)
+    #[serde(default = "default_process_recency_secs")]
+    pub process_recency_secs: u64,
 }
 
 fn default_agent_enabled() -> bool {
@@ -131,6 +135,43 @@ fn default_agent_databases() -> Vec<String> {
     vec!["~/.local/share/opencode/opencode.db".to_string()]
 }
 
+fn default_process_whitelist() -> Vec<String> {
+    [
+        "cargo",
+        "rustc",
+        "rustup",
+        "clippy-driver",
+        "rust-analyzer",
+        "npm",
+        "node",
+        "bun",
+        "deno",
+        "pnpm",
+        "yarn",
+        "gcc",
+        "g++",
+        "clang",
+        "clang++",
+        "make",
+        "cmake",
+        "ninja",
+        "go",
+        "python",
+        "pip",
+        "uv",
+        "docker",
+        "podman",
+        "git",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
+fn default_process_recency_secs() -> u64 {
+    5 * 60
+}
+
 impl Default for AgentActivityConfig {
     fn default() -> Self {
         Self {
@@ -138,6 +179,8 @@ impl Default for AgentActivityConfig {
             poll_interval_secs: default_agent_poll_interval(),
             activity_window_secs: default_agent_activity_window(),
             databases: default_agent_databases(),
+            process_whitelist: default_process_whitelist(),
+            process_recency_secs: default_process_recency_secs(),
         }
     }
 }

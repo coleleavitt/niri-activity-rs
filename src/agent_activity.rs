@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -10,8 +12,11 @@ pub struct AgentMonitor {
     poll_interval_ms: u64,
     activity_window_ms: i64,
     databases: Vec<PathBuf>,
+    process_whitelist: HashSet<String>,
+    process_recency_ms: u64,
     last_poll: Instant,
-    cached_active: bool,
+    cached_agent_active: bool,
+    cached_process_active: bool,
 }
 
 impl AgentMonitor {
@@ -23,6 +28,12 @@ impl AgentMonitor {
             .filter(|p| p.exists())
             .collect();
 
+        let process_whitelist = config
+            .process_whitelist
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+
         Self {
             enabled: config.enabled,
             poll_interval_ms: config.poll_interval_secs.saturating_mul(1000),
@@ -30,24 +41,31 @@ impl AgentMonitor {
                 .unwrap_or(30)
                 .saturating_mul(1000),
             databases,
+            process_whitelist,
+            process_recency_ms: config.process_recency_secs.saturating_mul(1000),
             last_poll: Instant::now(),
-            cached_active: false,
+            cached_agent_active: false,
+            cached_process_active: false,
         }
     }
 
-    pub fn is_agent_active(&mut self) -> bool {
-        if !self.enabled || self.databases.is_empty() {
+    pub fn is_active(&mut self, idle_duration_ms: u64) -> bool {
+        if !self.enabled {
             return false;
         }
 
         let now = Instant::now();
         if now.duration_since(self.last_poll).as_millis() < u128::from(self.poll_interval_ms) {
-            return self.cached_active;
+            return self.cached_agent_active
+                || (self.cached_process_active && idle_duration_ms < self.process_recency_ms);
         }
 
         self.last_poll = now;
-        self.cached_active = self.check_databases();
-        self.cached_active
+        self.cached_agent_active = self.check_databases();
+        self.cached_process_active = self.check_processes();
+
+        self.cached_agent_active
+            || (self.cached_process_active && idle_duration_ms < self.process_recency_ms)
     }
 
     fn check_databases(&self) -> bool {
@@ -68,8 +86,6 @@ impl AgentMonitor {
             Err(_) => return false,
         };
 
-        // OpenCode stores message timestamps as milliseconds since epoch
-        // Check if any messages were created within the activity window
         let query =
             "SELECT COUNT(*) FROM message WHERE time_created > (strftime('%s', 'now') * 1000 - ?1)";
 
@@ -78,6 +94,39 @@ impl AgentMonitor {
             .unwrap_or(0);
 
         count > 0
+    }
+
+    fn check_processes(&self) -> bool {
+        if self.process_whitelist.is_empty() {
+            return false;
+        }
+
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return false;
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if !name_str.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+
+            let comm_path = entry.path().join("comm");
+            if let Ok(comm) = fs::read_to_string(&comm_path) {
+                let proc_name = comm.trim();
+                if self.process_whitelist.contains(proc_name) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    pub fn process_whitelist_count(&self) -> usize {
+        self.process_whitelist.len()
     }
 }
 

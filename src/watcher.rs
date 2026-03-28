@@ -289,8 +289,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let mut agent_monitor = AgentMonitor::new(&config.agent_activity);
     if config.agent_activity.enabled {
         println!(
-            "Agent activity detection: enabled ({}s window)",
-            config.agent_activity.activity_window_secs
+            "Agent activity detection: enabled ({}s window, {} build processes)",
+            config.agent_activity.activity_window_secs,
+            agent_monitor.process_whitelist_count()
         );
     }
     let idle_threshold_ms = config.idle_threshold_secs.saturating_mul(1000);
@@ -564,7 +565,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 now_ms.saturating_sub(session_start_mono_ms)
             };
 
-            let agent_active = agent_monitor.is_agent_active();
+            let agent_active = agent_monitor.is_active(idle_duration_ms);
             let new_state = if idle_duration_ms > away_threshold_ms {
                 ActivityState::Away
             } else if agent_active {
