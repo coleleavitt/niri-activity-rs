@@ -20,9 +20,9 @@ pub(crate) use types::Metrics;
 // Re-export all public types
 pub use types::{
     AppBreakdown, AppGroup, AwayData, CategoryBreakdown, DailyBreakdown, FatigueIndicators,
-    FatigueTrend, FlowSession, FlowSummary, FocusStreak, GapEntry, GapSummary, GapType,
-    HourBreakdown, HourlyErrorRate, InputMetrics, MetricsData, ReportData, ScheduleBreakdown,
-    StreakSummary, TimelineBucket, TimelineData, TodayData, TodayRow,
+    FatigueTrend, FlowQuality, FlowSession, FlowSummary, FocusStreak, GapEntry, GapSummary,
+    GapType, HourBreakdown, HourlyErrorRate, InputMetrics, MetricsData, ReportData,
+    ScheduleBreakdown, StreakSummary, TimelineBucket, TimelineData, TodayData, TodayRow,
 };
 
 use crate::config::{Category, Config, get_data_dir, load_config};
@@ -1323,13 +1323,15 @@ fn query_flow_sessions(
     since_utc: &str,
     until_utc: &str,
 ) -> Result<FlowSummary, Error> {
-    const FLOW_MIN_KEYS_PER_MIN: f64 = 50.0;
-    const FLOW_MIN_DURATION_MS: i64 = 5 * 60 * 1000;
+    const GAP_TOLERANCE_MS: i64 = 2 * 60 * 1000;
+    const MIN_SESSION_MS: i64 = 5 * 60 * 1000;
+    const MIN_KEYS_PER_MIN_THRESHOLD: f64 = 30.0;
+    const OPTIMAL_KEYS_PER_MIN: f64 = 80.0;
 
     let mut stmt = conn.prepare(
-        "SELECT app_id, timestamp, active_ms, keystrokes, category
+        "SELECT app_id, timestamp, active_ms, keystrokes, backspace_count, category
          FROM events 
-         WHERE timestamp >= ?1 AND timestamp < ?2 AND keystrokes > 0
+         WHERE timestamp >= ?1 AND timestamp < ?2
          ORDER BY timestamp",
     )?;
 
@@ -1338,6 +1340,7 @@ fn query_flow_sessions(
         timestamp: String,
         active_ms: i64,
         keystrokes: i64,
+        backspace_count: i64,
         category: String,
     }
 
@@ -1348,112 +1351,146 @@ fn query_flow_sessions(
                 timestamp: row.get(1)?,
                 active_ms: row.get(2)?,
                 keystrokes: row.get(3)?,
-                category: row.get(4)?,
+                backspace_count: row.get(4)?,
+                category: row.get(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut sessions: Vec<FlowSession> = Vec::new();
-    let mut current_app: Option<String> = None;
-    let mut session_start: Option<String> = None;
-    let mut session_duration_ms: i64 = 0;
-    let mut session_keys: i64 = 0;
+    struct SessionBuilder {
+        app_id: String,
+        start_ts: String,
+        duration_ms: i64,
+        keystrokes: i64,
+        backspaces: i64,
+        event_rates: Vec<f64>,
+        last_event_ts: Option<chrono::DateTime<chrono::FixedOffset>>,
+    }
 
-    let try_finalize_session = |sessions: &mut Vec<FlowSession>,
-                                current_app: &Option<String>,
-                                session_start: &mut Option<String>,
-                                session_duration_ms: i64,
-                                session_keys: i64| {
-        if session_duration_ms >= FLOW_MIN_DURATION_MS {
-            let keys_per_min = if session_duration_ms > 0 {
-                (session_keys as f64) / (session_duration_ms as f64 / 60_000.0)
+    let mut sessions: Vec<FlowSession> = Vec::new();
+    let mut current: Option<SessionBuilder> = None;
+
+    let finalize_session =
+        |builder: SessionBuilder, config: &Config, sessions: &mut Vec<FlowSession>| {
+            if builder.duration_ms < MIN_SESSION_MS {
+                return;
+            }
+
+            let keys_per_min = if builder.duration_ms > 0 {
+                (builder.keystrokes as f64) / (builder.duration_ms as f64 / 60_000.0)
             } else {
                 0.0
             };
-            if keys_per_min >= FLOW_MIN_KEYS_PER_MIN
-                && let Some(start) = session_start.take()
-            {
-                let start_local = config
-                    .parse_timestamp_to_local(&start)
-                    .map_or_else(|| start.clone(), |dt| dt.format("%m-%d %H:%M").to_string());
-                sessions.push(FlowSession {
-                    app_id: current_app.clone().unwrap_or_default(),
-                    start_time: start_local,
-                    duration_ms: session_duration_ms,
-                    keystrokes: session_keys,
-                    keys_per_min,
-                });
+
+            if keys_per_min < MIN_KEYS_PER_MIN_THRESHOLD {
+                return;
             }
-        }
-    };
+
+            let backspace_rate = if builder.keystrokes > 0 {
+                (builder.backspaces as f64 / builder.keystrokes as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            let consistency_score = compute_consistency_score(&builder.event_rates);
+            let rate_score = compute_rate_score(keys_per_min, OPTIMAL_KEYS_PER_MIN);
+            let duration_score = compute_duration_score(builder.duration_ms);
+            let error_score = compute_error_score(backspace_rate);
+
+            #[allow(clippy::suboptimal_flops)]
+            let flow_score = (rate_score * 0.30
+                + consistency_score as f64 * 0.30
+                + duration_score * 0.20
+                + error_score * 0.20) as u8;
+
+            let start_local = config
+                .parse_timestamp_to_local(&builder.start_ts)
+                .map_or_else(
+                    || builder.start_ts.clone(),
+                    |dt| dt.format("%m-%d %H:%M").to_string(),
+                );
+
+            sessions.push(FlowSession {
+                app_id: builder.app_id,
+                start_time: start_local,
+                duration_ms: builder.duration_ms,
+                keystrokes: builder.keystrokes,
+                keys_per_min,
+                flow_score_0_to_100: flow_score,
+                typing_consistency_0_to_100: consistency_score,
+                backspace_rate_pct: backspace_rate,
+            });
+        };
 
     for row in &rows {
-        if row.category != "productive" {
-            try_finalize_session(
-                &mut sessions,
-                &current_app,
-                &mut session_start,
-                session_duration_ms,
-                session_keys,
-            );
-            current_app = None;
-            session_start = None;
-            session_duration_ms = 0;
-            session_keys = 0;
+        let is_productive = row.category == "productive";
+        let cur_dt = config.parse_timestamp_to_local(&row.timestamp);
+
+        let gap_exceeded = current
+            .as_ref()
+            .is_some_and(|c| match (c.last_event_ts, cur_dt) {
+                (Some(last), Some(cur)) => (cur - last).num_milliseconds() > GAP_TOLERANCE_MS,
+                _ => false,
+            });
+
+        if (gap_exceeded || (!is_productive && current.is_some()))
+            && let Some(builder) = current.take()
+        {
+            finalize_session(builder, config, &mut sessions);
+        }
+
+        if !is_productive || row.keystrokes == 0 {
+            if let Some(ref mut c) = current {
+                c.last_event_ts = cur_dt;
+            }
             continue;
         }
 
-        let keys_per_min_current = if row.active_ms > 0 {
+        let event_rate = if row.active_ms > 0 {
             (row.keystrokes as f64) / (row.active_ms as f64 / 60_000.0)
         } else {
             0.0
         };
 
-        if keys_per_min_current >= FLOW_MIN_KEYS_PER_MIN {
-            if current_app.as_ref() == Some(&row.app_id) || current_app.is_none() {
-                if session_start.is_none() {
-                    session_start = Some(row.timestamp.clone());
-                    current_app = Some(row.app_id.clone());
-                }
-                session_duration_ms += row.active_ms;
-                session_keys += row.keystrokes;
+        if let Some(ref mut c) = current {
+            if c.app_id == row.app_id {
+                c.duration_ms += row.active_ms;
+                c.keystrokes += row.keystrokes;
+                c.backspaces += row.backspace_count;
+                c.event_rates.push(event_rate);
+                c.last_event_ts = cur_dt;
             } else {
-                try_finalize_session(
-                    &mut sessions,
-                    &current_app,
-                    &mut session_start,
-                    session_duration_ms,
-                    session_keys,
-                );
-                current_app = Some(row.app_id.clone());
-                session_start = Some(row.timestamp.clone());
-                session_duration_ms = row.active_ms;
-                session_keys = row.keystrokes;
+                let builder = current.take().unwrap();
+                finalize_session(builder, config, &mut sessions);
+
+                current = Some(SessionBuilder {
+                    app_id: row.app_id.clone(),
+                    start_ts: row.timestamp.clone(),
+                    duration_ms: row.active_ms,
+                    keystrokes: row.keystrokes,
+                    backspaces: row.backspace_count,
+                    event_rates: vec![event_rate],
+                    last_event_ts: cur_dt,
+                });
             }
         } else {
-            try_finalize_session(
-                &mut sessions,
-                &current_app,
-                &mut session_start,
-                session_duration_ms,
-                session_keys,
-            );
-            current_app = None;
-            session_start = None;
-            session_duration_ms = 0;
-            session_keys = 0;
+            current = Some(SessionBuilder {
+                app_id: row.app_id.clone(),
+                start_ts: row.timestamp.clone(),
+                duration_ms: row.active_ms,
+                keystrokes: row.keystrokes,
+                backspaces: row.backspace_count,
+                event_rates: vec![event_rate],
+                last_event_ts: cur_dt,
+            });
         }
     }
 
-    try_finalize_session(
-        &mut sessions,
-        &current_app,
-        &mut session_start,
-        session_duration_ms,
-        session_keys,
-    );
+    if let Some(builder) = current.take() {
+        finalize_session(builder, config, &mut sessions);
+    }
 
-    sessions.sort_by_key(|s| std::cmp::Reverse(s.duration_ms));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.flow_score_0_to_100));
 
     let total_flow_ms: i64 = sessions.iter().map(|s| s.duration_ms).sum();
     let flow_sessions = i64::try_from(sessions.len()).unwrap_or(i64::MAX);
@@ -1467,6 +1504,41 @@ fn query_flow_sessions(
         .map(|s| s.keys_per_min)
         .fold(0.0_f64, f64::max);
 
+    let (mut deep_ms, mut moderate_ms, mut light_ms) = (0i64, 0i64, 0i64);
+    for s in &sessions {
+        match FlowQuality::from_score(s.flow_score_0_to_100) {
+            FlowQuality::Deep => deep_ms += s.duration_ms,
+            FlowQuality::Moderate => moderate_ms += s.duration_ms,
+            FlowQuality::Light => light_ms += s.duration_ms,
+            FlowQuality::Shallow => {}
+        }
+    }
+
+    let overall_score = if sessions.is_empty() {
+        0
+    } else {
+        let weighted_sum: f64 = sessions
+            .iter()
+            .map(|s| s.flow_score_0_to_100 as f64 * s.duration_ms as f64)
+            .sum();
+        let total_dur: f64 = sessions.iter().map(|s| s.duration_ms as f64).sum();
+        if total_dur > 0.0 {
+            (weighted_sum / total_dur) as u8
+        } else {
+            0
+        }
+    };
+
+    let dominant_quality = if deep_ms >= moderate_ms && deep_ms >= light_ms {
+        FlowQuality::Deep
+    } else if moderate_ms >= light_ms {
+        FlowQuality::Moderate
+    } else if light_ms > 0 {
+        FlowQuality::Light
+    } else {
+        FlowQuality::Shallow
+    };
+
     let top_sessions: Vec<FlowSession> = sessions.into_iter().take(5).collect();
 
     Ok(FlowSummary {
@@ -1474,8 +1546,64 @@ fn query_flow_sessions(
         flow_sessions,
         avg_flow_duration_ms,
         peak_keys_per_min,
+        overall_flow_score: overall_score,
+        dominant_quality,
+        deep_flow_ms: deep_ms,
+        moderate_flow_ms: moderate_ms,
+        light_flow_ms: light_ms,
         top_sessions,
     })
+}
+
+fn compute_consistency_score(rates: &[f64]) -> u8 {
+    if rates.len() < 2 {
+        return 50;
+    }
+
+    let mean: f64 = rates.iter().sum::<f64>() / rates.len() as f64;
+    if mean < 1.0 {
+        return 50;
+    }
+
+    let variance: f64 = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rates.len() as f64;
+    let std_dev = variance.sqrt();
+    let cv = std_dev / mean;
+
+    let score = (1.0 - cv.min(1.0)) * 100.0;
+    score.clamp(0.0, 100.0) as u8
+}
+
+fn compute_rate_score(keys_per_min: f64, optimal: f64) -> f64 {
+    if keys_per_min <= 0.0 {
+        return 0.0;
+    }
+
+    let ratio = keys_per_min / optimal;
+    if ratio >= 1.0 {
+        100.0
+    } else {
+        (ratio * 100.0).min(100.0)
+    }
+}
+
+fn compute_duration_score(duration_ms: i64) -> f64 {
+    const OPTIMAL_DURATION_MS: i64 = 30 * 60 * 1000;
+
+    if duration_ms >= OPTIMAL_DURATION_MS {
+        100.0
+    } else {
+        (duration_ms as f64 / OPTIMAL_DURATION_MS as f64 * 100.0).min(100.0)
+    }
+}
+
+fn compute_error_score(backspace_rate: f64) -> f64 {
+    if backspace_rate <= 5.0 {
+        100.0
+    } else if backspace_rate >= 20.0 {
+        0.0
+    } else {
+        ((20.0 - backspace_rate) / 15.0 * 100.0).clamp(0.0, 100.0)
+    }
 }
 
 fn query_fatigue_indicators(
@@ -2252,6 +2380,17 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             section_header("── Flow State ────────────────────────────────────────")
         );
 
+        let quality_str = match flow.dominant_quality {
+            FlowQuality::Deep => flow.dominant_quality.label().green().bold().to_string(),
+            FlowQuality::Moderate => flow.dominant_quality.label().green().to_string(),
+            FlowQuality::Light => flow.dominant_quality.label().yellow().to_string(),
+            FlowQuality::Shallow => flow.dominant_quality.label().dimmed().to_string(),
+        };
+
+        println!(
+            "  Flow Quality:       {} (score: {})",
+            quality_str, flow.overall_flow_score
+        );
         println!(
             "  Total Flow Time:    {}",
             fmt_duration(flow.total_flow_ms).green().bold()
@@ -2266,17 +2405,47 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             flow.peak_keys_per_min
         );
 
+        if flow.deep_flow_ms > 0 || flow.moderate_flow_ms > 0 || flow.light_flow_ms > 0 {
+            println!();
+            if flow.deep_flow_ms > 0 {
+                println!(
+                    "  Deep Flow:          {}",
+                    fmt_duration(flow.deep_flow_ms).green().bold()
+                );
+            }
+            if flow.moderate_flow_ms > 0 {
+                println!(
+                    "  Moderate Flow:      {}",
+                    fmt_duration(flow.moderate_flow_ms).green()
+                );
+            }
+            if flow.light_flow_ms > 0 {
+                println!(
+                    "  Light Flow:         {}",
+                    fmt_duration(flow.light_flow_ms).yellow()
+                );
+            }
+        }
+
         if !flow.top_sessions.is_empty() {
             println!();
             for (i, session) in flow.top_sessions.iter().enumerate() {
                 let rank = format!("{}.", i + 1);
+                let score_str = format!("[{}]", session.flow_score_0_to_100);
+                let score_colored = match FlowQuality::from_score(session.flow_score_0_to_100) {
+                    FlowQuality::Deep => score_str.green().bold().to_string(),
+                    FlowQuality::Moderate => score_str.green().to_string(),
+                    FlowQuality::Light => score_str.yellow().to_string(),
+                    FlowQuality::Shallow => score_str.dimmed().to_string(),
+                };
                 println!(
-                    "  {:>3} {:>8}  {}  {:.0} keys/min  {}",
+                    "  {:>3} {:>8}  {} {}  {:.0} kpm  {}",
                     rank.dimmed(),
                     fmt_duration(session.duration_ms).green(),
                     session.start_time.dimmed(),
+                    score_colored,
                     session.keys_per_min,
-                    truncate(&session.app_id, 20),
+                    truncate(&session.app_id, 18),
                 );
             }
         }

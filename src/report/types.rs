@@ -179,6 +179,37 @@ pub struct FlowSession {
     pub duration_ms: i64,
     pub keystrokes: i64,
     pub keys_per_min: f64,
+    pub flow_score_0_to_100: u8,
+    pub typing_consistency_0_to_100: u8,
+    pub backspace_rate_pct: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum FlowQuality {
+    Deep,
+    Moderate,
+    Light,
+    Shallow,
+}
+
+impl FlowQuality {
+    pub fn from_score(score: u8) -> Self {
+        match score {
+            80..=100 => Self::Deep,
+            60..=79 => Self::Moderate,
+            40..=59 => Self::Light,
+            _ => Self::Shallow,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Deep => "Deep Flow",
+            Self::Moderate => "Moderate Flow",
+            Self::Light => "Light Flow",
+            Self::Shallow => "Shallow",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -187,6 +218,11 @@ pub struct FlowSummary {
     pub flow_sessions: i64,
     pub avg_flow_duration_ms: i64,
     pub peak_keys_per_min: f64,
+    pub overall_flow_score: u8,
+    pub dominant_quality: FlowQuality,
+    pub deep_flow_ms: i64,
+    pub moderate_flow_ms: i64,
+    pub light_flow_ms: i64,
     pub top_sessions: Vec<FlowSession>,
 }
 
