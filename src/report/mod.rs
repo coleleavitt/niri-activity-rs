@@ -2657,7 +2657,7 @@ pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
 
     println!(
         "Date,Screen Time (h:mm:ss),Productive (h:mm:ss),Unproductive (h:mm:ss),\
-         Undefined (h:mm:ss),ProdActive (h:mm:ss),ProdPassive (h:mm:ss),ProdIdle (h:mm:ss),\
+         Undefined (h:mm:ss),ProdActive (h:mm:ss),ProdPassive (h:mm:ss),\
          Productive Ratio,Productive Active %"
     );
 
@@ -2725,7 +2725,7 @@ pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
         };
 
         println!(
-            "{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{}",
             date,
             fmt_hms(m.total_ms),
             fmt_hms(m.productive_ms),
@@ -2733,7 +2733,6 @@ pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
             fmt_hms(m.neutral_ms),
             fmt_hms(m.productive_active_ms),
             fmt_hms(m.productive_passive_ms),
-            fmt_hms(m.productive_idle_ms),
             prod_ratio,
             prod_active_pct,
         );
