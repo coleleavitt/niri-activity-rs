@@ -55,7 +55,7 @@ fn find_user_session_path(
         .map_err(|e| Error::Logind(format!("failed to list sessions: {e}")))?;
 
     if sessions.is_empty() {
-        return Err(Error::Logind("logind returned zero sessions".into()));
+        return Err(Error::LogindSessionNotFound);
     }
 
     for session_info in &sessions {
@@ -64,8 +64,7 @@ fn find_user_session_path(
         }
     }
 
-    // Fallback: first session (shouldn't happen on a normal desktop)
-    eprintln!("[logind] Warning: no session with uid >= 1000, using first session");
+    tracing::warn!("no session with uid >= 1000, using first session");
     Ok(sessions[0].path().clone())
 }
 
@@ -77,8 +76,7 @@ fn find_user_session_path(
 /// Also reads the initial `LockedHint` property so we start in the correct
 /// state.
 pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
-    let connection = Connection::system()
-        .map_err(|e| Error::Logind(format!("failed to connect to system bus: {e}")))?;
+    let connection = Connection::system().map_err(|_| Error::LogindConnectionFailed)?;
 
     let manager = ManagerProxyBlocking::new(&connection)
         .map_err(|e| Error::Logind(format!("failed to create manager proxy: {e}")))?;
@@ -95,7 +93,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
     // Read initial LockedHint so we don't miss a lock that happened before we
     // started
     let initial_locked = session.locked_hint().unwrap_or_else(|e| {
-        eprintln!("[logind] Warning: failed to read initial LockedHint: {e}, assuming unlocked");
+        tracing::warn!("failed to read initial LockedHint: {e}, assuming unlocked");
         false
     });
 
@@ -104,11 +102,11 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
     let thread_error = Arc::new(AtomicBool::new(false));
 
     if initial_locked {
-        eprintln!("[logind] Session already locked at startup");
+        tracing::info!("Session already locked at startup");
     }
 
-    eprintln!(
-        "[logind] Monitoring session {} (locked={})",
+    tracing::info!(
+        "Monitoring session {} (locked={})",
         session_path.as_str(),
         initial_locked,
     );
@@ -133,7 +131,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[logind] Lock listener failed to build proxy: {e}");
+                        tracing::warn!("Lock listener failed to build proxy: {e}");
                         thread_error.store(true, Ordering::Release);
                         return;
                     }
@@ -141,27 +139,24 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
 
                 match session.receive_lock() {
                     Ok(mut signals) => {
-                        // TOCTOU fix: re-check lock state after subscription is active
                         if session.locked_hint().unwrap_or(false) {
                             is_locked.store(true, Ordering::Release);
                         }
-                        // JPL-R11: bounded by process lifetime — blocks on D-Bus I/O.
                         let mut iterations: u64 = 0;
                         while signals.next().is_some() {
                             iterations = iterations.saturating_add(1);
                             if iterations == u64::MAX {
-                                eprintln!("[logind] Lock signal loop reached iteration limit");
+                                tracing::warn!("Lock signal loop reached iteration limit");
                                 break;
                             }
                             is_locked.store(true, Ordering::Release);
-                            eprintln!("[logind] Lock signal received");
+                            tracing::debug!("Lock signal received");
                         }
-                        // Signal iterator ended - thread dying
-                        eprintln!("[logind] Lock signal iterator ended unexpectedly");
+                        tracing::warn!("Lock signal iterator ended unexpectedly");
                         thread_error.store(true, Ordering::Release);
                     }
                     Err(e) => {
-                        eprintln!("[logind] Failed to subscribe to Lock signal: {e}");
+                        tracing::warn!("Failed to subscribe to Lock signal: {e}");
                         thread_error.store(true, Ordering::Release);
                     }
                 }
@@ -187,7 +182,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[logind] Unlock listener failed to build proxy: {e}");
+                        tracing::warn!("Unlock listener failed to build proxy: {e}");
                         thread_error.store(true, Ordering::Release);
                         return;
                     }
@@ -195,27 +190,24 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
 
                 match session.receive_unlock() {
                     Ok(mut signals) => {
-                        // TOCTOU fix: re-check lock state after subscription is active
                         if !session.locked_hint().unwrap_or(true) {
                             is_locked.store(false, Ordering::Release);
                         }
-                        // JPL-R11: bounded by process lifetime — blocks on D-Bus I/O.
                         let mut iterations: u64 = 0;
                         while signals.next().is_some() {
                             iterations = iterations.saturating_add(1);
                             if iterations == u64::MAX {
-                                eprintln!("[logind] Unlock signal loop reached iteration limit");
+                                tracing::warn!("Unlock signal loop reached iteration limit");
                                 break;
                             }
                             is_locked.store(false, Ordering::Release);
-                            eprintln!("[logind] Unlock signal received");
+                            tracing::debug!("Unlock signal received");
                         }
-                        // Signal iterator ended - thread dying
-                        eprintln!("[logind] Unlock signal iterator ended unexpectedly");
+                        tracing::warn!("Unlock signal iterator ended unexpectedly");
                         thread_error.store(true, Ordering::Release);
                     }
                     Err(e) => {
-                        eprintln!("[logind] Failed to subscribe to Unlock signal: {e}");
+                        tracing::warn!("Failed to subscribe to Unlock signal: {e}");
                         thread_error.store(true, Ordering::Release);
                     }
                 }
@@ -240,7 +232,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
                 let manager = match ManagerProxyBlocking::new(&connection) {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("[logind] Sleep listener failed to build proxy: {e}");
+                        tracing::warn!("Sleep listener failed to build proxy: {e}");
                         thread_error.store(true, Ordering::Release);
                         return;
                     }
@@ -248,34 +240,32 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
 
                 match manager.receive_prepare_for_sleep() {
                     Ok(signals) => {
-                        // JPL-R11: bounded by process lifetime — blocks on D-Bus I/O.
                         let mut iterations: u64 = 0;
                         for signal in signals {
                             iterations = iterations.saturating_add(1);
                             if iterations == u64::MAX {
-                                eprintln!("[logind] Sleep signal loop reached iteration limit");
+                                tracing::warn!("Sleep signal loop reached iteration limit");
                                 break;
                             }
                             match signal.args() {
                                 Ok(args) => {
                                     if args.start {
-                                        eprintln!("[logind] PrepareForSleep: suspending");
+                                        tracing::debug!("PrepareForSleep: suspending");
                                     } else {
                                         suspend_resumed.store(true, Ordering::Release);
-                                        eprintln!("[logind] PrepareForSleep: resumed");
+                                        tracing::debug!("PrepareForSleep: resumed");
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("[logind] Failed to parse PrepareForSleep args: {e}");
+                                    tracing::warn!("Failed to parse PrepareForSleep args: {e}");
                                 }
                             }
                         }
-                        // Signal iterator ended - thread dying
-                        eprintln!("[logind] Sleep signal iterator ended unexpectedly");
+                        tracing::warn!("Sleep signal iterator ended unexpectedly");
                         thread_error.store(true, Ordering::Release);
                     }
                     Err(e) => {
-                        eprintln!("[logind] Failed to subscribe to PrepareForSleep signal: {e}");
+                        tracing::warn!("Failed to subscribe to PrepareForSleep signal: {e}");
                         thread_error.store(true, Ordering::Release);
                     }
                 }

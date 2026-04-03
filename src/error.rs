@@ -14,8 +14,16 @@ pub enum Error {
     Database(#[from] rusqlite::Error),
     #[error("config: {0}")]
     Config(#[from] toml::de::Error),
-    #[error("unexpected response from niri")]
-    UnexpectedResponse,
     #[error("logind: {0}")]
     Logind(String),
+    #[error("unexpected response from niri")]
+    UnexpectedResponse,
+    #[error("failed to connect to niri IPC socket")]
+    NiriConnectionFailed,
+    #[error("niri event stream closed unexpectedly")]
+    NiriEventStreamClosed,
+    #[error("failed to connect to logind D-Bus")]
+    LogindConnectionFailed,
+    #[error("logind session not found for current user")]
+    LogindSessionNotFound,
 }
