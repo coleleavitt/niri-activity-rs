@@ -1161,3 +1161,598 @@ fn query_fatigue_indicators(
         recommendation: rec,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::config::SleepConfig;
+    use crate::db::init_db;
+
+    fn setup_test_db() -> rusqlite::Result<Connection> {
+        let conn = Connection::open_in_memory()?;
+        init_db(&conn).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        // Run migrations to add all columns
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN passive_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN jiggler_detected INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute("ALTER TABLE events ADD COLUMN input_offsets BLOB", [])?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN backspace_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN modifier_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN left_clicks INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN right_clicks INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN middle_clicks INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN scroll_up INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN scroll_down INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN scroll_horizontal INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        Ok(conn)
+    }
+
+    /// Inserts a test event with configurable fields.
+    fn insert_test_event(
+        conn: &Connection,
+        timestamp: &str,
+        app_id: &str,
+        category: &str,
+        active_ms: i64,
+        passive_ms: i64,
+        idle_ms: i64,
+        keystrokes: i64,
+        mouse_clicks: i64,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO events (timestamp, app_id, title, category, active_ms, passive_ms, idle_ms, keystrokes, mouse_clicks, scroll_events, mouse_distance, jiggler_detected, backspace_count, modifier_count, left_clicks, right_clicks, middle_clicks, scroll_up, scroll_down, scroll_horizontal)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)",
+            params![timestamp, app_id, "", category, active_ms, passive_ms, idle_ms, keystrokes, mouse_clicks],
+        )?;
+        Ok(())
+    }
+
+    /// Creates a test App with in-memory database and default config.
+    fn create_test_app() -> App {
+        let conn = setup_test_db().expect("failed to create test db");
+        let config = Config::default();
+        App { config, conn }
+    }
+
+    // ==================== classify_gap tests ====================
+
+    #[test]
+    fn classify_gap_short_break() {
+        let sleep = SleepConfig::default();
+        // 1 hour gap during daytime (10am to 11am) = short break
+        let result = classify_gap(10, 11, 1.0, &sleep);
+        assert_eq!(result, Some(GapType::ShortBreak));
+    }
+
+    #[test]
+    fn classify_gap_long_break() {
+        let sleep = SleepConfig::default();
+        // 2.5 hour gap during daytime = long break
+        let result = classify_gap(10, 12, 2.5, &sleep);
+        assert_eq!(result, Some(GapType::LongBreak));
+    }
+
+    #[test]
+    fn classify_gap_sleep_overnight() {
+        let sleep = SleepConfig::default();
+        // 7 hour gap spanning midnight (22:00 to 05:00) = sleep
+        let result = classify_gap(22, 5, 7.0, &sleep);
+        assert_eq!(result, Some(GapType::Sleep));
+    }
+
+    #[test]
+    fn classify_gap_sleep_night_hours() {
+        let sleep = SleepConfig::default();
+        // 4 hour gap starting at night (23:00 to 03:00) = sleep
+        let result = classify_gap(23, 3, 4.0, &sleep);
+        assert_eq!(result, Some(GapType::Sleep));
+    }
+
+    #[test]
+    fn classify_gap_too_short() {
+        let sleep = SleepConfig::default();
+        // 15 minute gap = below minimum, returns None
+        let result = classify_gap(10, 10, 0.25, &sleep);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn classify_gap_too_long() {
+        let sleep = SleepConfig::default();
+        // 30 hour gap = above maximum, returns None
+        let result = classify_gap(10, 16, 30.0, &sleep);
+        assert_eq!(result, None);
+    }
+
+    // ==================== group_apps tests ====================
+
+    #[test]
+    fn group_apps_single_app() {
+        let flat = vec![AppBreakdown {
+            app_id: "firefox".to_string(),
+            category: Category::Productive,
+            total_ms: 3600000,
+            active_ms: 3000000,
+            keys: 1000,
+            clicks: 50,
+        }];
+        let groups = group_apps(flat, 10);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].app_id, "firefox");
+        assert_eq!(groups[0].total_ms, 3600000);
+        assert_eq!(groups[0].children.len(), 1);
+    }
+
+    #[test]
+    fn group_apps_multiple_categories() {
+        // Same app with different categories should be grouped together
+        let flat = vec![
+            AppBreakdown {
+                app_id: "firefox".to_string(),
+                category: Category::Productive,
+                total_ms: 2000000,
+                active_ms: 1800000,
+                keys: 500,
+                clicks: 25,
+            },
+            AppBreakdown {
+                app_id: "firefox".to_string(),
+                category: Category::Unproductive,
+                total_ms: 1000000,
+                active_ms: 900000,
+                keys: 100,
+                clicks: 10,
+            },
+        ];
+        let groups = group_apps(flat, 10);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].app_id, "firefox");
+        assert_eq!(groups[0].total_ms, 3000000);
+        assert_eq!(groups[0].keys, 600);
+        assert_eq!(groups[0].children.len(), 2);
+    }
+
+    #[test]
+    fn group_apps_sorted_by_total() {
+        let flat = vec![
+            AppBreakdown {
+                app_id: "small".to_string(),
+                category: Category::Neutral,
+                total_ms: 100000,
+                active_ms: 90000,
+                keys: 10,
+                clicks: 5,
+            },
+            AppBreakdown {
+                app_id: "large".to_string(),
+                category: Category::Productive,
+                total_ms: 5000000,
+                active_ms: 4500000,
+                keys: 2000,
+                clicks: 100,
+            },
+        ];
+        let groups = group_apps(flat, 10);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].app_id, "large"); // Sorted by total_ms descending
+        assert_eq!(groups[1].app_id, "small");
+    }
+
+    #[test]
+    fn group_apps_respects_limit() {
+        let flat: Vec<AppBreakdown> = (0..20)
+            .map(|i| AppBreakdown {
+                app_id: format!("app{}", i),
+                category: Category::Neutral,
+                total_ms: (20 - i) as i64 * 100000,
+                active_ms: (20 - i) as i64 * 90000,
+                keys: 10,
+                clicks: 5,
+            })
+            .collect();
+        let groups = group_apps(flat, 5);
+        assert_eq!(groups.len(), 5);
+    }
+
+    // ==================== compute_consistency tests ====================
+
+    #[test]
+    fn compute_consistency_empty() {
+        let rates: Vec<f64> = vec![];
+        assert_eq!(compute_consistency(&rates), 50);
+    }
+
+    #[test]
+    fn compute_consistency_single() {
+        let rates = vec![60.0];
+        assert_eq!(compute_consistency(&rates), 50);
+    }
+
+    #[test]
+    fn compute_consistency_uniform() {
+        // All same rate = perfect consistency
+        let rates = vec![60.0, 60.0, 60.0, 60.0];
+        assert_eq!(compute_consistency(&rates), 100);
+    }
+
+    #[test]
+    fn compute_consistency_variable() {
+        // High variance = lower consistency
+        let rates = vec![10.0, 100.0, 20.0, 90.0];
+        let score = compute_consistency(&rates);
+        assert!(
+            score < 80,
+            "Expected low consistency for variable rates, got {}",
+            score
+        );
+    }
+
+    // ==================== query_today tests ====================
+
+    #[test]
+    fn query_today_empty_db() {
+        let app = create_test_app();
+        let result = query_today(&app).expect("query should succeed");
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn query_today_single_event() {
+        let app = create_test_app();
+        let today = app.config.local_date_today();
+        let timestamp = format!("{}T10:00:00+00:00", today);
+
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "firefox",
+            "productive",
+            3600000,
+            0,
+            0,
+            1000,
+            50,
+        )
+        .expect("insert should succeed");
+
+        let result = query_today(&app).expect("query should succeed");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].app_id, "firefox");
+        assert_eq!(result.rows[0].category, Category::Productive);
+        assert_eq!(result.rows[0].total_ms, 3600000);
+    }
+
+    #[test]
+    fn query_today_multiple_apps() {
+        let app = create_test_app();
+        let today = app.config.local_date_today();
+        let timestamp = format!("{}T10:00:00+00:00", today);
+
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "firefox",
+            "productive",
+            3600000,
+            0,
+            0,
+            1000,
+            50,
+        )
+        .expect("insert should succeed");
+        insert_test_event(
+            &app.conn, &timestamp, "slack", "neutral", 1800000, 0, 0, 200, 30,
+        )
+        .expect("insert should succeed");
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "youtube",
+            "unproductive",
+            900000,
+            0,
+            0,
+            10,
+            5,
+        )
+        .expect("insert should succeed");
+
+        let result = query_today(&app).expect("query should succeed");
+        assert_eq!(result.rows.len(), 3);
+        // Should be sorted by total_ms descending
+        assert_eq!(result.rows[0].app_id, "firefox");
+        assert_eq!(result.rows[1].app_id, "slack");
+        assert_eq!(result.rows[2].app_id, "youtube");
+    }
+
+    #[test]
+    fn query_today_excludes_other_days() {
+        let app = create_test_app();
+        let today = app.config.local_date_today();
+        let yesterday = today - chrono::Duration::days(1);
+
+        let today_ts = format!("{}T10:00:00+00:00", today);
+        let yesterday_ts = format!("{}T10:00:00+00:00", yesterday);
+
+        insert_test_event(
+            &app.conn,
+            &today_ts,
+            "today_app",
+            "productive",
+            1000000,
+            0,
+            0,
+            100,
+            10,
+        )
+        .expect("insert should succeed");
+        insert_test_event(
+            &app.conn,
+            &yesterday_ts,
+            "yesterday_app",
+            "productive",
+            2000000,
+            0,
+            0,
+            200,
+            20,
+        )
+        .expect("insert should succeed");
+
+        let result = query_today(&app).expect("query should succeed");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].app_id, "today_app");
+    }
+
+    // ==================== query_metrics_range tests ====================
+
+    #[test]
+    fn query_metrics_range_empty_db() {
+        let app = create_test_app();
+        let result = query_metrics_range(&app, TimeRange::Days(7)).expect("query should succeed");
+        assert_eq!(result.total_ms, 0);
+        assert_eq!(result.productive_ms, 0);
+        assert_eq!(result.unproductive_ms, 0);
+        assert_eq!(result.neutral_ms, 0);
+    }
+
+    #[test]
+    fn query_metrics_range_single_day() {
+        let app = create_test_app();
+        let today = app.config.local_date_today();
+        let timestamp = format!("{}T10:00:00+00:00", today);
+
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "code",
+            "productive",
+            3600000,
+            600000,
+            300000,
+            2000,
+            100,
+        )
+        .expect("insert should succeed");
+
+        let result = query_metrics_range(&app, TimeRange::Days(1)).expect("query should succeed");
+        assert_eq!(result.productive_ms, 4200000); // active + passive
+        assert_eq!(result.productive_active_ms, 3600000);
+        assert_eq!(result.productive_passive_ms, 600000);
+        assert_eq!(result.productive_idle_ms, 300000);
+    }
+
+    #[test]
+    fn query_metrics_range_multi_category() {
+        let app = create_test_app();
+        let today = app.config.local_date_today();
+        let timestamp = format!("{}T10:00:00+00:00", today);
+
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "code",
+            "productive",
+            2000000,
+            0,
+            0,
+            1000,
+            50,
+        )
+        .expect("insert should succeed");
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "youtube",
+            "unproductive",
+            1000000,
+            0,
+            0,
+            10,
+            5,
+        )
+        .expect("insert should succeed");
+        insert_test_event(
+            &app.conn, &timestamp, "slack", "neutral", 500000, 0, 0, 100, 20,
+        )
+        .expect("insert should succeed");
+
+        let result = query_metrics_range(&app, TimeRange::Days(1)).expect("query should succeed");
+        assert_eq!(result.productive_ms, 2000000);
+        assert_eq!(result.unproductive_ms, 1000000);
+        assert_eq!(result.neutral_ms, 500000);
+        assert_eq!(result.total_ms, 3500000);
+    }
+
+    // ==================== query_timeline tests ====================
+
+    #[test]
+    fn query_timeline_empty_db() {
+        let app = create_test_app();
+        let result = query_timeline(&app, 0, 15).expect("query should succeed");
+        assert!(result.buckets.is_empty());
+    }
+
+    #[test]
+    fn query_timeline_zero_bucket_size_error() {
+        let app = create_test_app();
+        let result = query_timeline(&app, 0, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn query_timeline_buckets_events() {
+        let app = create_test_app();
+        let today = app.config.local_date_today();
+
+        // Insert events at different times
+        insert_test_event(
+            &app.conn,
+            &format!("{}T10:00:00+00:00", today),
+            "code",
+            "productive",
+            900000, // 15 min
+            0,
+            0,
+            500,
+            25,
+        )
+        .expect("insert should succeed");
+
+        insert_test_event(
+            &app.conn,
+            &format!("{}T10:30:00+00:00", today),
+            "slack",
+            "neutral",
+            600000, // 10 min
+            0,
+            0,
+            100,
+            10,
+        )
+        .expect("insert should succeed");
+
+        let result = query_timeline(&app, 0, 30).expect("query should succeed");
+        // Should have buckets for the events
+        assert!(!result.buckets.is_empty());
+        assert_eq!(result.bucket_min, 30);
+    }
+
+    // ==================== query_report_range tests ====================
+
+    #[test]
+    fn query_report_range_empty_db() {
+        let app = create_test_app();
+        let result = query_report_range(&app, TimeRange::Days(7)).expect("query should succeed");
+        assert_eq!(result.total_ms, 0);
+        assert_eq!(result.total_events, 0);
+        assert!(result.categories.is_empty());
+        assert!(result.top_apps.is_empty());
+    }
+
+    #[test]
+    fn query_report_range_with_data() {
+        let app = create_test_app();
+        let today = app.config.local_date_today();
+        let timestamp = format!("{}T10:00:00+00:00", today);
+
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "code",
+            "productive",
+            3600000,
+            0,
+            0,
+            2000,
+            100,
+        )
+        .expect("insert should succeed");
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "firefox",
+            "productive",
+            1800000,
+            0,
+            0,
+            500,
+            50,
+        )
+        .expect("insert should succeed");
+
+        let result = query_report_range(&app, TimeRange::Days(1)).expect("query should succeed");
+        assert_eq!(result.total_events, 2);
+        assert_eq!(result.total_ms, 5400000);
+        assert_eq!(result.total_keys, 2500);
+        assert_eq!(result.total_clicks, 150);
+        assert!(!result.categories.is_empty());
+        assert!(!result.top_apps.is_empty());
+    }
+
+    #[test]
+    fn query_report_range_daily_breakdown() {
+        let app = create_test_app();
+        let today = app.config.local_date_today();
+        let yesterday = today - chrono::Duration::days(1);
+
+        insert_test_event(
+            &app.conn,
+            &format!("{}T10:00:00+00:00", today),
+            "code",
+            "productive",
+            2000000,
+            0,
+            0,
+            1000,
+            50,
+        )
+        .expect("insert should succeed");
+        insert_test_event(
+            &app.conn,
+            &format!("{}T10:00:00+00:00", yesterday),
+            "code",
+            "productive",
+            3000000,
+            0,
+            0,
+            1500,
+            75,
+        )
+        .expect("insert should succeed");
+
+        let result = query_report_range(&app, TimeRange::Days(2)).expect("query should succeed");
+        assert_eq!(result.daily.len(), 2);
+    }
+}
