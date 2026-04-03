@@ -39,7 +39,6 @@ const UNTIL_SENTINEL: &str = "9999-12-31T23:59:59+00:00";
 // Time constants (milliseconds)
 const MS_PER_HOUR: i64 = 3_600_000;
 const MS_PER_MIN: i64 = 60_000;
-const MS_PER_DAY: i64 = 86_400_000;
 const MIN_STREAK_MS: i64 = 300_000; // 5 minutes
 
 // ---------------------------------------------------------------------------
