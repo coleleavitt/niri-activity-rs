@@ -14,6 +14,10 @@ use crate::report::{
 };
 use crate::theme::{THEME, category_style};
 
+// Time constants (milliseconds)
+const MS_PER_HOUR: i64 = 3_600_000;
+const MS_PER_MIN: i64 = 60_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Dashboard,
@@ -364,9 +368,9 @@ fn render_today_table(app: &TuiApp, area: Rect, frame: &mut Frame) {
                 THEME.table_row_alt
             };
             let cat_style = category_style(r.category);
-            let h = r.total_ms / 3_600_000;
-            let m = (r.total_ms % 3_600_000) / 60_000;
-            let s = (r.total_ms % 60_000) / 1000;
+            let h = r.total_ms / MS_PER_HOUR;
+            let m = (r.total_ms % MS_PER_HOUR) / MS_PER_MIN;
+            let s = (r.total_ms % MS_PER_MIN) / 1000;
             Row::new(vec![
                 Cell::from(r.app_id.clone()).style(cat_style),
                 Cell::from(format!("{}", r.category)).style(cat_style),

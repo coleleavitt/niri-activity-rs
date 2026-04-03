@@ -22,6 +22,11 @@ use crate::fmt::{cat_colored, cat_label, fmt_duration_compact, truncate};
 use crate::input::{InputSnapshot, start_idle_monitor};
 use crate::logind::start_logind_monitor;
 
+// Duration constants
+const FLUSH_INTERVAL_SECS: u64 = 300; // 5 minutes
+const SUSPEND_DETECTION_THRESHOLD_SECS: u64 = 30;
+const HEARTBEAT_CHECK_INTERVAL_SECS: u64 = 30;
+
 /// Saturating conversion from `Duration::as_millis()` (`u128`) to `u64`.
 /// Avoids silent truncation per JPL Rule 14 — practically unreachable
 /// (would require 500M+ years uptime) but we never silently truncate.
@@ -223,8 +228,8 @@ pub fn connect_to_niri() -> Result<Socket, Error> {
     let backoff = ExponentialBackoff {
         initial_interval: Duration::from_millis(100),
         multiplier: 2.0,
-        max_interval: Duration::from_secs(30),
-        max_elapsed_time: Some(Duration::from_mins(5)),
+        max_interval: Duration::from_secs(SUSPEND_DETECTION_THRESHOLD_SECS),
+        max_elapsed_time: Some(Duration::from_secs(FLUSH_INTERVAL_SECS)),
         ..Default::default()
     };
 
@@ -333,7 +338,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let mut last_flush = Instant::now();
     let mut is_locked = false;
     let mut current_state = ActivityState::Active;
-    const FLUSH_INTERVAL: Duration = Duration::from_mins(5);
     const SUSPEND_JUMP_THRESHOLD_SECS: i64 = 30;
     let mut last_wall_time = Utc::now();
     let mut last_loop_instant = Instant::now();
@@ -345,7 +349,6 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     let mut last_heartbeat_value: u64 = 0;
     let mut last_heartbeat_check = Instant::now();
     let mut input_thread_warned = false;
-    const HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
     let flush_ctx = FlushContext {
         conn: &conn,
@@ -477,7 +480,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             logind_warned = true;
         }
 
-        if now_instant.duration_since(last_heartbeat_check) >= HEARTBEAT_CHECK_INTERVAL {
+        if now_instant.duration_since(last_heartbeat_check)
+            >= Duration::from_secs(HEARTBEAT_CHECK_INTERVAL_SECS)
+        {
             let current_hb = input_stats.heartbeat();
             if current_hb == last_heartbeat_value && current_hb > 0 && !input_thread_warned {
                 eprintln!(
@@ -666,7 +671,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
 
             if current_state != ActivityState::Away
                 && current_state != ActivityState::Idle
-                && now_instant.duration_since(last_flush) >= FLUSH_INTERVAL
+                && now_instant.duration_since(last_flush)
+                    >= Duration::from_secs(FLUSH_INTERVAL_SECS)
             {
                 if let Some(info) = focused_id.and_then(|id| windows.get(&id)) {
                     let input = input_stats.snapshot();

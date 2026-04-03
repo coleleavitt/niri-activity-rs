@@ -2,6 +2,10 @@ use owo_colors::OwoColorize;
 
 use crate::config::Category;
 
+// Time constants (milliseconds)
+const MS_PER_HOUR: i64 = 3_600_000;
+const MS_PER_MIN: i64 = 60_000;
+
 pub fn fmt_duration_compact(ms: i64) -> String {
     if ms < 0 {
         return "0s".to_string();
@@ -22,10 +26,10 @@ pub fn fmt_duration(ms: i64) -> String {
     if ms < 0 {
         return "0s".to_string();
     }
-    let hours = ms / 3_600_000;
-    let mins = (ms % 3_600_000) / 60_000;
+    let hours = ms / MS_PER_HOUR;
+    let mins = (ms % MS_PER_HOUR) / MS_PER_MIN;
     if hours == 0 && mins == 0 {
-        let secs = (ms % 60_000) / 1000;
+        let secs = (ms % MS_PER_MIN) / 1000;
         format!("{}s", secs)
     } else if hours == 0 {
         format!("{}m", mins)

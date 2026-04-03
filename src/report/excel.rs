@@ -23,6 +23,10 @@ use crate::config::Category;
 use crate::error::Error;
 use crate::fmt::fmt_hms;
 
+// Time constants (milliseconds)
+const MS_PER_HOUR: u64 = 3_600_000;
+const MS_PER_MIN: u64 = 60_000;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -36,8 +40,8 @@ fn xlsx_err(e: impl std::fmt::Display) -> Error {
 fn fmt_delta_hms(delta_ms: i64) -> String {
     let sign = if delta_ms >= 0 { "+" } else { "-" };
     let abs = delta_ms.unsigned_abs();
-    let h = abs / 3_600_000;
-    let m = (abs % 3_600_000) / 60_000;
+    let h = abs / MS_PER_HOUR;
+    let m = (abs % MS_PER_HOUR) / MS_PER_MIN;
     format!("{sign}{h}:{m:02}")
 }
 
@@ -349,17 +353,17 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
 
         // Daily Δ (col 12) - colored based on productive time change
         let delta_fmt = if *is_workday {
-            if delta_productive > 60_000 {
+            if delta_productive > MS_PER_MIN as i64 {
                 &delta_positive_fmt
-            } else if delta_productive < -60_000 {
+            } else if delta_productive < -(MS_PER_MIN as i64) {
                 &delta_negative_fmt
             } else {
                 &workday_fmt
             }
         } else {
-            if delta_productive > 60_000 {
+            if delta_productive > MS_PER_MIN as i64 {
                 &weekend_delta_positive_fmt
-            } else if delta_productive < -60_000 {
+            } else if delta_productive < -(MS_PER_MIN as i64) {
                 &weekend_delta_negative_fmt
             } else {
                 &weekend_fmt

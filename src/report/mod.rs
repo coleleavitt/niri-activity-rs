@@ -36,6 +36,12 @@ use crate::fmt::{
 /// Sentinel value for unbounded upper time range in parameterized queries.
 const UNTIL_SENTINEL: &str = "9999-12-31T23:59:59+00:00";
 
+// Time constants (milliseconds)
+const MS_PER_HOUR: i64 = 3_600_000;
+const MS_PER_MIN: i64 = 60_000;
+const MS_PER_DAY: i64 = 86_400_000;
+const MIN_STREAK_MS: i64 = 300_000; // 5 minutes
+
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
@@ -602,7 +608,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         let second = local_dt.second() as i64;
         let millis = (local_dt.nanosecond() / 1_000_000) as i64;
         let ms_into_hour = (minute * 60 + second) * 1000 + millis;
-        let ms_left_in_hour = 3_600_000_i64.saturating_sub(ms_into_hour).max(1);
+        let ms_left_in_hour = MS_PER_HOUR.saturating_sub(ms_into_hour).max(1);
 
         let mut remaining_ms = total;
         let mut current_hour = local_dt.hour();
@@ -612,7 +618,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
             let chunk_ms = if first_chunk {
                 remaining_ms.min(ms_left_in_hour)
             } else {
-                remaining_ms.min(3_600_000)
+                remaining_ms.min(MS_PER_HOUR)
             };
             if chunk_ms <= 0 {
                 break; // guard against infinite loop if ms_left_in_hour is 0
@@ -846,7 +852,7 @@ fn flush_streak(
     keys: i64,
     config: &Config,
 ) {
-    if productive_ms >= 300_000 {
+    if productive_ms >= MIN_STREAK_MS {
         let start_str = start.take().unwrap_or_default();
         let start_local = config
             .parse_timestamp_to_local(&start_str)
@@ -1106,9 +1112,9 @@ fn query_gaps(
 
         let duration_ms = if gap_hours.is_finite()
             && gap_hours >= 0.0
-            && gap_hours <= (i64::MAX as f64 / 3_600_000.0)
+            && gap_hours <= (i64::MAX as f64 / MS_PER_HOUR as f64)
         {
-            (gap_hours * 3_600_000.0) as i64
+            (gap_hours * MS_PER_HOUR as f64) as i64
         } else {
             i64::MAX
         };
@@ -1123,7 +1129,7 @@ fn query_gaps(
 
     // Second pass: merge consecutive sleep gaps separated by short activity
     // If merge_window_min > 0 and two Sleep gaps are close, combine them
-    let merge_window_ms = i64::from(sleep.merge_window_min).saturating_mul(60_000);
+    let merge_window_ms = i64::from(sleep.merge_window_min).saturating_mul(MS_PER_MIN);
     let mut merged_gaps: Vec<RawGap> = Vec::new();
 
     for gap in raw_gaps {
@@ -1377,7 +1383,7 @@ fn query_flow_sessions(
             }
 
             let keys_per_min = if builder.duration_ms > 0 {
-                (builder.keystrokes as f64) / (builder.duration_ms as f64 / 60_000.0)
+                (builder.keystrokes as f64) / (builder.duration_ms as f64 / MS_PER_MIN as f64)
             } else {
                 0.0
             };
@@ -1447,7 +1453,7 @@ fn query_flow_sessions(
         }
 
         let event_rate = if row.active_ms > 0 {
-            (row.keystrokes as f64) / (row.active_ms as f64 / 60_000.0)
+            (row.keystrokes as f64) / (row.active_ms as f64 / MS_PER_MIN as f64)
         } else {
             0.0
         };
@@ -1741,9 +1747,9 @@ pub fn show_today(app: &App) -> Result<(), Error> {
     println!("{}", "─".repeat(54).dimmed());
 
     for row in &data.rows {
-        let hours = row.total_ms / 3_600_000;
-        let mins = (row.total_ms % 3_600_000) / 60_000;
-        let secs = (row.total_ms % 60_000) / 1000;
+        let hours = row.total_ms / MS_PER_HOUR;
+        let mins = (row.total_ms % MS_PER_HOUR) / MS_PER_MIN;
+        let secs = (row.total_ms % MS_PER_MIN) / 1000;
 
         let time_str = format!("{:>2}h {:>2}m {:>2}s", hours, mins, secs);
         println!(
@@ -2079,7 +2085,7 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             let frac_blocks =
                 (row.total_ms as f64 / max_app_ms as f64 * BAR_WIDTH as f64).max(0.125);
             let bar = cat_bar_fractional(row.category, frac_blocks, BAR_WIDTH);
-            let active_min = row.active_ms as f64 / 60_000.0;
+            let active_min = row.active_ms as f64 / MS_PER_MIN as f64;
             let keys_per_min = if active_min > 0.5 {
                 format!("{:.0}/m", row.keys as f64 / active_min)
             } else {
@@ -2100,7 +2106,7 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             let filled =
                 (group.total_ms as f64 / max_app_ms as f64 * BAR_WIDTH as f64).round() as usize;
             let filled = filled.max(1);
-            let active_min = group.active_ms as f64 / 60_000.0;
+            let active_min = group.active_ms as f64 / MS_PER_MIN as f64;
             let keys_per_min = if active_min > 0.5 {
                 format!("{:.0}/m", group.keys as f64 / active_min)
             } else {
@@ -2146,7 +2152,7 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             let last_idx = group.children.len().saturating_sub(1);
             for (i, child) in group.children.iter().enumerate() {
                 let connector = if i == last_idx { "└─" } else { "├─" };
-                let active_min = child.active_ms as f64 / 60_000.0;
+                let active_min = child.active_ms as f64 / MS_PER_MIN as f64;
                 let keys_per_min = if active_min > 0.5 {
                     format!("{:.0}/m", child.keys as f64 / active_min)
                 } else {

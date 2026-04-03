@@ -36,6 +36,9 @@ pub const BTN_LEFT: u16 = 272;
 pub const BTN_RIGHT: u16 = 273;
 pub const BTN_MIDDLE: u16 = 274;
 
+// Input tracking and scroll thresholds
+const SCROLL_NOTCH_THRESHOLD: f64 = 15.0;
+
 pub const KEY_BACKSPACE: u16 = 14;
 pub const KEY_DELETE: u16 = 111;
 pub const KEY_LEFTCTRL: u16 = 29;
@@ -259,7 +262,6 @@ fn libinput_scroll_poll(scroll_events: &AtomicU64, last_activity: &AtomicU64, st
 
     let mut v_accum: f64 = 0.0;
     let mut h_accum: f64 = 0.0;
-    const SCROLL_THRESHOLD: f64 = 15.0;
 
     fn extract_scroll_deltas(scroll: &impl PointerScrollEvent) -> (f64, f64) {
         let v = if scroll.has_axis(Axis::Vertical) {
@@ -293,14 +295,14 @@ fn libinput_scroll_poll(scroll_events: &AtomicU64, last_activity: &AtomicU64, st
             v_accum += v_delta;
             h_accum += h_delta;
 
-            let v_notches = (v_accum / SCROLL_THRESHOLD) as u64;
-            let h_notches = (h_accum / SCROLL_THRESHOLD) as u64;
+            let v_notches = (v_accum / SCROLL_NOTCH_THRESHOLD) as u64;
+            let h_notches = (h_accum / SCROLL_NOTCH_THRESHOLD) as u64;
 
             if v_notches > 0 || h_notches > 0 {
                 let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                 scroll_events.fetch_add(v_notches + h_notches, Ordering::Release);
-                v_accum = (v_notches as f64).mul_add(-SCROLL_THRESHOLD, v_accum);
-                h_accum = (h_notches as f64).mul_add(-SCROLL_THRESHOLD, h_accum);
+                v_accum = (v_notches as f64).mul_add(-SCROLL_NOTCH_THRESHOLD, v_accum);
+                h_accum = (h_notches as f64).mul_add(-SCROLL_NOTCH_THRESHOLD, h_accum);
                 last_activity.store(now, Ordering::Release);
             }
         }

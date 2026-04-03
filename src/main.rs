@@ -16,6 +16,10 @@ use clap::{Parser, Subcommand};
 
 use crate::error::Error;
 
+// Time constants
+const MS_PER_HOUR: i64 = 3_600_000;
+const MS_PER_MIN: i64 = 60_000;
+
 /// Shared time-range arguments flattened into subcommands that need them.
 #[derive(Debug, Clone, clap::Args)]
 struct TimeRangeArgs {
@@ -286,8 +290,8 @@ fn main() {
                     rusqlite::params![i64::try_from(input_active_ms).unwrap_or(i64::MAX)],
                     |row| row.get(0),
                 )?;
-                let hours = total_ms / 3_600_000;
-                let mins = (total_ms % 3_600_000) / 60_000;
+                let hours = total_ms / MS_PER_HOUR;
+                let mins = (total_ms % MS_PER_HOUR) / MS_PER_MIN;
                 println!(
                     "[dry-run] Would reclassify {} events ({} false-active → passive, {}h {}m total)",
                     count, count, hours, mins
