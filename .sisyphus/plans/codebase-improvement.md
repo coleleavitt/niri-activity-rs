@@ -630,7 +630,7 @@ Max Concurrent: 3 (Waves 1 & 2)
   - Files: `Cargo.toml`, `src/main.rs`, `src/watcher.rs`, `src/input.rs`, `src/logind.rs`, `src/agent_activity.rs`
   - Pre-commit: `cargo build && cargo clippy && cargo test`
 
-- [ ] 7. Eliminate Unnecessary .clone() Calls
+- [x] 7. Eliminate Unnecessary .clone() Calls
 
   **What to do**:
   - Target ONLY the ~8-10 verified unnecessary clones. Use `ast_grep_search` to find all `.clone()` sites first, then assess each individually:
@@ -688,7 +688,7 @@ Max Concurrent: 3 (Waves 1 & 2)
   - Files: `src/report/*.rs`, `src/tui.rs`, `src/watcher.rs`
   - Pre-commit: `cargo build && cargo clippy && cargo test`
 
-- [ ] 8. Expand Error Enum with Specific Variants
+- [x] 8. Expand Error Enum with Specific Variants
 
   **What to do**:
   - Add 3-6 specific error variants to `src/error.rs`:
@@ -762,7 +762,7 @@ Max Concurrent: 3 (Waves 1 & 2)
   - Files: `src/error.rs`, `src/watcher.rs`, `src/logind.rs`
   - Pre-commit: `cargo build && cargo clippy && cargo test`
 
-- [ ] 9. Add Doc Comments to Public Functions
+- [x] 9. Add Doc Comments to Public Functions
 
   **What to do**:
   - Add one-liner `///` doc comments to all undocumented `pub fn` across the codebase (~25 functions)
@@ -819,7 +819,7 @@ Max Concurrent: 3 (Waves 1 & 2)
   - Files: `src/*.rs`, `src/report/*.rs`
   - Pre-commit: `cargo doc`
 
-- [ ] 10. Add Unit Tests for Report Query Functions
+- [x] 10. Add Unit Tests for Report Query Functions
 
   **What to do**:
   - Add `#[cfg(test)] mod tests` sections in the appropriate report submodules (from task 4)
@@ -886,7 +886,7 @@ Max Concurrent: 3 (Waves 1 & 2)
   - Files: `src/report/query.rs` or `src/report/tests.rs`
   - Pre-commit: `cargo test`
 
-- [ ] 11. Add CI/CD Workflow
+- [x] 11. Add CI/CD Workflow
 
   **What to do**:
   - Create `.github/workflows/ci.yml` with a single job:
@@ -950,19 +950,19 @@ Max Concurrent: 3 (Waves 1 & 2)
 >
 > **Do NOT auto-proceed after verification. Wait for user's explicit approval.**
 
-- [ ] F1. **Plan Compliance Audit** — `oracle`
+- [x] F1. **Plan Compliance Audit** — `oracle`
   Read the plan end-to-end. For each "Must Have": verify implementation exists (read file, run command). For each "Must NOT Have": search codebase for forbidden patterns — reject with file:line if found. Check evidence files exist in .sisyphus/evidence/. Compare deliverables against plan.
   Output: `Must Have [N/N] | Must NOT Have [N/N] | Tasks [N/N] | VERDICT: APPROVE/REJECT`
 
-- [ ] F2. **Code Quality Review** — `unspecified-high`
+- [x] F2. **Code Quality Review** — `unspecified-high`
   Run `cargo build --release`, `cargo clippy -- -D warnings`, `cargo test`. Review all changed files for: `as any`, empty catches, println in non-report code, commented-out code, unused imports. Check AI slop: excessive comments, over-abstraction, generic names.
   Output: `Build [PASS/FAIL] | Clippy [PASS/FAIL] | Tests [N pass/N fail] | Files [N clean/N issues] | VERDICT`
 
-- [ ] F3. **Real Manual QA** — `unspecified-high`
+- [x] F3. **Real Manual QA** — `unspecified-high`
   Start from clean state. Run `cargo run -- today`, `cargo run -- metrics --today`, `cargo run -- timeline --today`, `cargo run -- report --today`. Verify output looks correct. Run `cargo run -- export --today --format csv` and check output. Save evidence.
   Output: `Scenarios [N/N pass] | Integration [N/N] | VERDICT`
 
-- [ ] F4. **Scope Fidelity Check** — `deep`
+- [x] F4. **Scope Fidelity Check** — `deep`
   For each task: read "What to do", read actual diff (git log/diff). Verify 1:1 — everything in spec was built, nothing beyond spec was built. Check "Must NOT do" compliance. Detect cross-task contamination. Flag unaccounted changes.
   Output: `Tasks [N/N compliant] | Contamination [CLEAN/N issues] | Unaccounted [CLEAN/N files] | VERDICT`
 

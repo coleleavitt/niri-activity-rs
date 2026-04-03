@@ -28,3 +28,30 @@
 - **query_report_range**: 3 tests (empty db, with data, daily breakdown)
 
 **Total: 27 new tests added (38 total, was 11)**
+
+## Task 7: Eliminate Unnecessary .clone() Calls
+
+### Clones Eliminated (12 total)
+
+1. **`tui.rs`** - `app.config.schedule.start.clone()` → moved directly (consistent with `schedule_end` which was already moved)
+2. **`query.rs`** - `bounds.since_str.clone()` + `bounds.now_str.clone()` → moved by extracting before creating borrows from `bounds`
+3. **`query.rs` `group_apps`** - Two `entry.app_id.clone()` → one `clone()` for index key, then `entry.app_id` moved into struct (net -1)
+4. **`watcher.rs` `From<&Window>`** - `w.app_id.clone().unwrap_or_else(...)` → `w.app_id.as_deref().unwrap_or(...)` (avoids cloning the Option)
+5. **`watcher.rs` `From<&Window>`** - `w.title.clone().unwrap_or_default()` → `w.title.as_deref().unwrap_or_default()`
+6. **`tui.rs` Cell rendering** - 5× `x.clone()` → `x.as_str()` (Cell accepts `&str` via `Into<Text<'_>>`)
+7. **`export.rs`** - `date.clone()` in if-branch → eliminated via `entry` API (clone only for key, move into struct on insert)
+
+### Key Patterns
+
+- **`Cell::from`** accepts `T: Into<Text<'a>>`, which includes `&str` — no need to clone `String` fields
+- **`Option<String>.as_deref()`** avoids cloning the Option when you only need `Option<&str>`
+- **Partial moves**: Can't move a field out of a struct if the struct is later moved — need to clone for the key and move for the value, or restructure
+- **`entry` API**: Avoids double-lookup and can eliminate clones in the existing-entry path
+- **Field ordering matters**: Extract owned fields before creating borrows from the same struct to avoid clone
+
+### Clones That Are Necessary (kept)
+- HashMap insertions where key must be owned
+- `info.clone()` in `flush_session` — `SessionSnapshot.window` takes `WindowInfo` by value
+- `range.clone()` in `tui.rs` — `range` is stored in `self.range` and functions take `TimeRange` by value
+- `config.jiggler.clone()` — can't move out of borrowed `config`
+- `gap.gap_start.clone()` / `gap.gap_end.clone()` in `map_or_else` fallback closures — borrowed by outer call
