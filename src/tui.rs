@@ -373,7 +373,7 @@ fn render_today_table(app: &TuiApp, area: Rect, frame: &mut Frame) {
             let m = (r.total_ms % MS_PER_HOUR) / MS_PER_MIN;
             let s = (r.total_ms % MS_PER_MIN) / 1000;
             Row::new(vec![
-                Cell::from(r.app_id.clone()).style(cat_style),
+                Cell::from(r.app_id.as_str()).style(cat_style),
                 Cell::from(format!("{}", r.category)).style(cat_style),
                 Cell::from(format!("{}h {:02}m {:02}s", h, m, s)).style(THEME.value),
             ])
@@ -470,7 +470,7 @@ fn render_timeline(app: &TuiApp, area: Rect, frame: &mut Frame) {
                 Cell::from(bar_line),
                 Cell::from(fmt_duration_compact(total)).style(THEME.value),
                 Cell::from(format!("{}", b.keystrokes)).style(THEME.value_dim),
-                Cell::from(b.dominant_app.clone()).style(THEME.accent),
+                Cell::from(b.dominant_app.as_str()).style(THEME.accent),
                 status,
             ])
         })
@@ -539,7 +539,7 @@ fn render_apps(app: &TuiApp, area: Rect, frame: &mut Frame) {
 
             rows.push(
                 Row::new(vec![
-                    Cell::from(a.app_id.clone()).style(category_style(a.category)),
+                    Cell::from(a.app_id.as_str()).style(category_style(a.category)),
                     Cell::from(Line::from(bar_span)),
                     Cell::from(fmt_duration(a.total_ms)).style(THEME.value),
                     Cell::from(format!("{}", a.keys)).style(THEME.value_dim),
@@ -600,7 +600,7 @@ fn render_apps(app: &TuiApp, area: Rect, frame: &mut Frame) {
 
             rows.push(
                 Row::new(vec![
-                    Cell::from(group.app_id.clone()).style(THEME.value),
+                    Cell::from(group.app_id.as_str()).style(THEME.value),
                     Cell::from(bar_line),
                     Cell::from(fmt_duration(group.total_ms)).style(THEME.value),
                     Cell::from(format!("{}", group.keys)).style(THEME.value_dim),
@@ -812,7 +812,7 @@ fn render_daily(rpt: &ReportData, area: Rect, frame: &mut Frame) {
             };
 
             Row::new(vec![
-                Cell::from(d.date.clone()).style(THEME.value_dim),
+                Cell::from(d.date.as_str()).style(THEME.value_dim),
                 Cell::from(fmt_duration(d.total_ms)).style(THEME.value),
                 Cell::from(pct(d.active_ms, d.total_ms)).style(active_style),
                 Cell::from(format!("{}", d.keystrokes)).style(THEME.value_dim),

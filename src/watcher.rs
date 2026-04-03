@@ -98,8 +98,8 @@ pub struct WindowInfo {
 impl From<&Window> for WindowInfo {
     fn from(w: &Window) -> Self {
         Self {
-            app_id: w.app_id.clone().unwrap_or_else(|| "unknown".into()),
-            title: w.title.clone().unwrap_or_default(),
+            app_id: w.app_id.as_deref().unwrap_or("unknown").to_owned(),
+            title: w.title.as_deref().unwrap_or_default().to_owned(),
         }
     }
 }

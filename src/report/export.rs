@@ -157,31 +157,25 @@ pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
         };
         let date = dt.format("%Y-%m-%d").to_string();
         let hour = dt.hour();
-        if let Some(cell) = heatmap.get_mut(&(date.clone(), hour)) {
-            match Category::from_str(&cat_raw).unwrap_or(Category::Neutral) {
-                Category::Productive => cell.productive_ms += total_ms,
-                Category::Unproductive => cell.unproductive_ms += total_ms,
-                Category::Neutral => cell.neutral_ms += total_ms,
-            }
-            cell.total_ms += total_ms;
-            cell.keystrokes += keystrokes;
-        } else {
-            let mut cell = HeatmapCell {
-                date: date.clone(),
+        let cat = Category::from_str(&cat_raw).unwrap_or(Category::Neutral);
+        let cell = heatmap
+            .entry((date.clone(), hour))
+            .or_insert_with(|| HeatmapCell {
+                date,
                 hour,
                 productive_ms: 0,
                 unproductive_ms: 0,
                 neutral_ms: 0,
-                total_ms,
-                keystrokes,
-            };
-            match Category::from_str(&cat_raw).unwrap_or(Category::Neutral) {
-                Category::Productive => cell.productive_ms = total_ms,
-                Category::Unproductive => cell.unproductive_ms = total_ms,
-                Category::Neutral => cell.neutral_ms = total_ms,
-            }
-            heatmap.insert((date, hour), cell);
+                total_ms: 0,
+                keystrokes: 0,
+            });
+        match cat {
+            Category::Productive => cell.productive_ms += total_ms,
+            Category::Unproductive => cell.unproductive_ms += total_ms,
+            Category::Neutral => cell.neutral_ms += total_ms,
         }
+        cell.total_ms += total_ms;
+        cell.keystrokes += keystrokes;
     }
     let json = serde_json::to_string_pretty(&heatmap.into_values().collect::<Vec<_>>())
         .map_err(|e| Error::NiriError(format!("JSON serialization failed: {}", e)))?;
