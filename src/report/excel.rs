@@ -223,8 +223,8 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     let mut daily_metrics: Vec<(NaiveDate, Metrics, bool)> = Vec::new();
 
     while date <= today_local {
-        let day_start = super::config_day_start_utc(&app.config, date)?;
-        let day_end = super::config_day_end_utc(&app.config, date)?;
+        let day_start = super::day_start_utc(&app.config, date)?;
+        let day_end = super::day_end_utc(&app.config, date)?;
 
         let mut stmt = app.conn.prepare(
             "SELECT category, SUM(active_ms), COALESCE(SUM(passive_ms),0), SUM(idle_ms)
