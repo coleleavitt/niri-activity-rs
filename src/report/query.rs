@@ -19,6 +19,7 @@ use super::{
 use crate::config::{Category, Config};
 use crate::error::Error;
 
+/// Query today's activity breakdown by application.
 pub fn query_today(app: &App) -> Result<TodayData, Error> {
     let date = app.config.local_date_today();
     let start = day_start_utc(&app.config, date)?;
@@ -47,6 +48,7 @@ pub fn query_today(app: &App) -> Result<TodayData, Error> {
     Ok(TodayData { date, rows })
 }
 
+/// Query productivity metrics for a date range.
 pub fn query_metrics_range(
     app: &App,
     range: TimeRange,
@@ -95,6 +97,8 @@ pub fn query_metrics_range(
     Ok(m)
 }
 
+/// Query hourly activity timeline for the past N days, bucketed by minute
+/// intervals.
 pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<TimelineData, Error> {
     if bucket_min == 0 {
         return Err(Error::NiriError("bucket size must be positive".into()));
@@ -196,11 +200,13 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
     })
 }
 
+/// Query comprehensive report data for a date range including metrics, apps,
+/// and gaps.
 pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Error> {
     let bounds = range.resolve(&app.config)?;
+    let since_str = bounds.since_str;
+    let now_str = bounds.now_str;
     let since_utc = &bounds.since_utc;
-    let since_str = bounds.since_str.clone();
-    let now_str = bounds.now_str.clone();
     let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
 
     let (total_ms, active_ms, passive_ms, idle_ms, total_keys, total_clicks, total_scroll, total_distance, total_events, jiggler_count): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = app.conn.query_row(
@@ -441,9 +447,10 @@ fn group_apps(flat: Vec<AppBreakdown>, limit: usize) -> Vec<AppGroup> {
             g.children.push(entry);
         } else {
             let idx = groups.len();
-            index.insert(entry.app_id.clone(), idx);
+            let app_id = entry.app_id.clone();
+            index.insert(app_id.clone(), idx);
             groups.push(AppGroup {
-                app_id: entry.app_id.clone(),
+                app_id,
                 total_ms: entry.total_ms,
                 active_ms: entry.active_ms,
                 keys: entry.keys,

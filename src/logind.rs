@@ -75,6 +75,7 @@ fn find_user_session_path(
 ///
 /// Also reads the initial `LockedHint` property so we start in the correct
 /// state.
+/// Start D-Bus monitor for screen lock/unlock and suspend/resume events.
 pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
     let connection = Connection::system().map_err(|_| Error::LogindConnectionFailed)?;
 

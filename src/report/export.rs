@@ -13,6 +13,7 @@ use crate::config::Category;
 use crate::error::Error;
 use crate::fmt::fmt_hms;
 
+/// Export activity data as CSV for a date range.
 pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
     let bounds = range.resolve(&app.config)?;
     println!(
@@ -81,6 +82,7 @@ pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
     Ok(())
 }
 
+/// Export activity data as JSON for a date range.
 pub fn export_json_range(app: &App, range: TimeRange) -> Result<(), Error> {
     let data = query_report_range(app, range)?;
     let json = serde_json::to_string_pretty(&data)
@@ -100,6 +102,7 @@ struct HeatmapCell {
     keystrokes: i64,
 }
 
+/// Export a cron-friendly summary of productivity metrics for a date range.
 pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
     let data = query_report_range(app, range)?;
     let productive_ms = data
@@ -133,6 +136,7 @@ pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
     Ok(())
 }
 
+/// Export hourly activity heatmap as JSON for a date range.
 pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
     let bounds = range.resolve(&app.config)?;
     let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);

@@ -11,6 +11,7 @@ use crate::config::{Config, Email};
 use crate::error::Error;
 use crate::report::{self, App, TimeRange};
 
+/// Send an activity report via email for the specified date range.
 pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(), Error> {
     let email_config = &app.config.email;
 
@@ -229,14 +230,17 @@ fn build_text_summary(bounds: &report::TimeBounds, period_name: &str) -> String 
     )
 }
 
+/// Send a weekly activity report via email.
 pub fn send_weekly_report(app: &App) -> Result<(), Error> {
     send_report(app, TimeRange::LastWeek, "Weekly")
 }
 
+/// Send a monthly activity report via email.
 pub fn send_monthly_report(app: &App) -> Result<(), Error> {
     send_report(app, TimeRange::LastMonth, "Monthly")
 }
 
+/// Test email configuration by sending a test message.
 pub fn test_email_config(config: &Config) -> Result<(), Error> {
     let email_config = &config.email;
 
@@ -281,6 +285,7 @@ pub fn test_email_config(config: &Config) -> Result<(), Error> {
     Ok(())
 }
 
+/// Restrict config file permissions to owner-only for security.
 pub fn secure_config_permissions(config_path: &Path) -> Result<(), Error> {
     #[cfg(unix)]
     {

@@ -77,6 +77,7 @@ pub const THEME: Theme = Theme {
 
 use crate::config::Category;
 
+/// Get the theme style for a category.
 pub fn category_style(cat: Category) -> Style {
     match cat {
         Category::Productive => THEME.productive,

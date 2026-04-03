@@ -30,6 +30,8 @@ zbus = { version = "5.14.0", default-features = false, features = ["blocking-api
 rust_xlsxwriter = { git = "https://github.com/coleleavitt/rust_xlsxwriter.git", rev = "1970a524c01b54b5cf7d194d8e970f540f3457ad" }
 lettre = "0.11.20"
 tempfile = "3.27.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [features]
 default = []
@@ -74,7 +76,6 @@ needless_pass_by_value = "allow"
 use_self = "allow"
 manual_let_else = "allow"
 print_stdout = "allow"
-print_stderr = "allow"
 unwrap_used = "allow"
 future_not_send = "allow"
 incompatible_msrv = "allow"  # Edition 2024 requires 1.85+, all APIs are covered

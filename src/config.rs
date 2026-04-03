@@ -653,7 +653,7 @@ impl From<RawConfig> for Config {
                     {
                         Ok(re) => Some(re),
                         Err(e) => {
-                            eprintln!("Warning: invalid regex pattern '{}': {}", r.pattern, e);
+                            tracing::warn!("Warning: invalid regex pattern '{}': {}", r.pattern, e);
                             None
                         }
                     }
@@ -672,7 +672,7 @@ impl From<RawConfig> for Config {
             if let Ok(tz) = tz_str.parse::<Tz>() {
                 Some(tz)
             } else {
-                eprintln!(
+                tracing::warn!(
                     "Warning: invalid timezone '{}', using system timezone",
                     tz_str
                 );
@@ -973,6 +973,7 @@ impl Schedule {
     }
 }
 
+/// Get the data directory path, creating it if necessary.
 pub fn get_data_dir() -> Result<PathBuf, Error> {
     let dirs = directories::ProjectDirs::from("", "", "niri-activity-rs")
         .ok_or_else(|| Error::NiriError("Could not determine data directory".into()))?;
@@ -981,6 +982,7 @@ pub fn get_data_dir() -> Result<PathBuf, Error> {
     Ok(data_dir)
 }
 
+/// Get the configuration file path, creating the config directory if necessary.
 pub fn get_config_path() -> Result<PathBuf, Error> {
     let dirs = directories::ProjectDirs::from("", "", "niri-activity-rs")
         .ok_or_else(|| Error::NiriError("Could not determine config directory".into()))?;
@@ -1017,6 +1019,7 @@ pub(crate) fn load_env_file() -> Result<(), Error> {
     }
     Ok(())
 }
+/// Load configuration from file, or return defaults if file does not exist.
 pub fn load_config() -> Result<Config, Error> {
     let config_path = get_config_path()?;
     if config_path.exists() {
@@ -1028,6 +1031,7 @@ pub fn load_config() -> Result<Config, Error> {
     }
 }
 
+/// Create a default configuration file if one does not already exist.
 pub fn init_config() -> Result<(), Error> {
     let config_path = get_config_path()?;
 

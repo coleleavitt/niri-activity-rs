@@ -18,6 +18,7 @@ pub struct SessionSnapshot<'a> {
     pub input_offsets: Vec<u32>,
 }
 
+/// Initialize the database schema and pragmas for optimal performance.
 pub fn init_db(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
@@ -52,6 +53,7 @@ pub fn init_db(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
+/// Run all pending database migrations and apply category reclassifications.
 pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Error> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS migrations (
@@ -84,7 +86,7 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         )?;
         tx.commit()?;
         if updated > 0 {
-            eprintln!(
+            tracing::info!(
                 "Migration 001: fixed {} events with stale categories",
                 updated
             );
@@ -121,7 +123,7 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         )?;
         tx.commit()?;
         if updated > 0 {
-            eprintln!(
+            tracing::info!(
                 "Migration 002: reclassified {} events with title rules",
                 updated
             );
@@ -161,7 +163,7 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         )?;
         tx.commit()?;
         if updated > 0 {
-            eprintln!(
+            tracing::info!(
                 "Migration 003: reclassified {} events with app-scoped title rules",
                 updated
             );
@@ -183,7 +185,7 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
             params!["004_add_passive_and_jiggler", Utc::now().to_rfc3339()],
         )?;
         tx.commit()?;
-        eprintln!("Migration 004: added passive_ms and jiggler_detected columns");
+        tracing::info!("Migration 004: added passive_ms and jiggler_detected columns");
     }
 
     if !applied.contains(&"005_add_input_offsets".to_string()) {
@@ -194,7 +196,9 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
             params!["005_add_input_offsets", Utc::now().to_rfc3339()],
         )?;
         tx.commit()?;
-        eprintln!("Migration 005: added input_offsets column for retroactive reclassification");
+        tracing::info!(
+            "Migration 005: added input_offsets column for retroactive reclassification"
+        );
     }
 
     if !applied.contains(&"006_add_granular_input_metrics".to_string()) {
@@ -236,21 +240,24 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
             params!["006_add_granular_input_metrics", Utc::now().to_rfc3339()],
         )?;
         tx.commit()?;
-        eprintln!("Migration 006: added granular input metrics columns");
+        tracing::info!("Migration 006: added granular input metrics columns");
     }
 
     Ok(())
 }
 
+/// Reclassify all events in the database according to the current
+/// configuration.
 pub fn reclassify_all(conn: &mut Connection, config: &Config) -> Result<(), Error> {
     // Safety: check row count before loading all rows into memory.
     // For databases with >5M events, this could use significant RAM.
     const MAX_RECLASSIFY_ROWS: i64 = 5_000_000;
     let row_count: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
     if row_count > MAX_RECLASSIFY_ROWS {
-        eprintln!(
-            "Warning: {} events exceeds reclassify limit ({}), skipping bulk reclassify",
-            row_count, MAX_RECLASSIFY_ROWS
+        tracing::warn!(
+            "{} events exceeds reclassify limit ({}), skipping bulk reclassify",
+            row_count,
+            MAX_RECLASSIFY_ROWS
         );
         return Ok(());
     }
@@ -282,11 +289,13 @@ pub fn reclassify_all(conn: &mut Connection, config: &Config) -> Result<(), Erro
     }
     tx.commit()?;
     if updated > 0 {
-        eprintln!("Reclassified {} events to match current config", updated);
+        tracing::info!("Reclassified {} events to match current config", updated);
     }
     Ok(())
 }
 
+/// Reclassify events with zero input as passive instead of active, returning
+/// count updated.
 pub fn fix_false_active(conn: &Connection, input_active_ms: u64) -> Result<i64, Error> {
     let updated = conn.execute(
         "UPDATE events
@@ -300,6 +309,7 @@ pub fn fix_false_active(conn: &Connection, input_active_ms: u64) -> Result<i64, 
     Ok(i64::try_from(updated).unwrap_or(i64::MAX))
 }
 
+/// Insert a session event into the database with all activity metrics.
 pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<(), Error> {
     let category = snapshot
         .config
@@ -418,6 +428,8 @@ fn replay_classification(
     (active_ms, passive_ms, idle_ms)
 }
 
+/// Reclassify active/passive/idle time based on input offset thresholds,
+/// returning (updated, total).
 pub fn reclassify_with_thresholds(
     conn: &mut Connection,
     idle_threshold_secs: u64,

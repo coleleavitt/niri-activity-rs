@@ -150,6 +150,8 @@ fn aggregate_weeks(daily: &[(NaiveDate, Metrics, bool)]) -> Vec<WeekBucket> {
 // ---------------------------------------------------------------------------
 
 /// Export an enhanced multi-sheet Excel workbook for the given time range.
+/// Export activity data as Excel workbook with formatting and conditional
+/// colors.
 pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), Error> {
     let bounds: TimeBounds = range.resolve(&app.config)?;
     let since_local = bounds.start_date;

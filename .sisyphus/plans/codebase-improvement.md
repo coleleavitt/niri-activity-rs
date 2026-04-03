@@ -188,7 +188,7 @@ Max Concurrent: 3 (Waves 1 & 2)
 
 ## TODOs
 
-- [ ] 1. Establish Baseline & Release Profile
+- [x] 1. Establish Baseline & Release Profile
 
   **What to do**:
   - Run `cargo test` to verify all 12 existing tests pass — record output as baseline
@@ -260,7 +260,7 @@ Max Concurrent: 3 (Waves 1 & 2)
   - Files: `Cargo.toml`
   - Pre-commit: `cargo build --release && cargo test`
 
-- [ ] 2. Dependency Version Bumps
+- [x] 2. Dependency Version Bumps
 
   **What to do**:
   - Update all 9 minor/patch dependencies in `Cargo.toml`:
@@ -330,7 +330,7 @@ Max Concurrent: 3 (Waves 1 & 2)
   - Files: `Cargo.toml`, `Cargo.lock`
   - Pre-commit: `cargo build && cargo clippy && cargo test`
 
-- [ ] 3. Extract Magic Numbers to Named Constants
+- [x] 3. Extract Magic Numbers to Named Constants
 
   **What to do**:
   - Search for hardcoded numeric literals that appear 2+ times or whose meaning is non-obvious
@@ -390,7 +390,7 @@ Max Concurrent: 3 (Waves 1 & 2)
   - Files: `src/report/mod.rs`, `src/input.rs`, `src/watcher.rs`
   - Pre-commit: `cargo build && cargo test`
 
-- [ ] 4. Split report/mod.rs into Submodules
+- [x] 4. Split report/mod.rs into Submodules
 
   **What to do**:
   - Extract `src/report/mod.rs` (2871 lines) into 4 new submodules:
@@ -468,7 +468,7 @@ Max Concurrent: 3 (Waves 1 & 2)
   - Files: `src/report/mod.rs`, `src/report/query.rs`, `src/report/display.rs`, `src/report/export.rs`
   - Pre-commit: `cargo build && cargo clippy && cargo test`
 
-- [ ] 5. Extract watcher.rs watch() into Focused Functions
+- [x] 5. Extract watcher.rs watch() into Focused Functions
 
   **What to do**:
   - Break the `watch()` function (lines ~245-948, ~703 lines) into 5-6 focused private functions:
@@ -541,7 +541,7 @@ Max Concurrent: 3 (Waves 1 & 2)
   - Files: `src/watcher.rs`
   - Pre-commit: `cargo build && cargo clippy && cargo test`
 
-- [ ] 6. Migrate eprintln! to tracing
+- [x] 6. Migrate eprintln! to tracing
 
   **What to do**:
   - Add dependencies to `Cargo.toml`:

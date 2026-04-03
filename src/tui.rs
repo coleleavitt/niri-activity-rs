@@ -70,7 +70,7 @@ impl TuiApp {
         let timeline = query_timeline(&app, 0, 15).ok();
         let report = query_report_range(&app, range.clone()).ok();
         let mouse_dpi = app.config.mouse_dpi;
-        let schedule_start = app.config.schedule.start.clone();
+        let schedule_start = app.config.schedule.start;
         let schedule_end = app.config.schedule.end;
 
         Ok(Self {
@@ -96,7 +96,7 @@ impl TuiApp {
                 self.report = query_report_range(&app, self.range.clone()).ok();
             }
             Err(e) => {
-                eprintln!("TUI reload failed: {}", e);
+                tracing::warn!("TUI reload failed: {}", e);
             }
         }
     }
@@ -114,6 +114,7 @@ impl TuiApp {
     }
 }
 
+/// Run interactive terminal UI for viewing activity reports.
 pub fn run_tui_range(range: TimeRange) -> Result<(), Error> {
     let mut app = TuiApp::load(range)?;
     let terminal = ratatui::init();

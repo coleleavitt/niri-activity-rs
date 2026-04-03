@@ -12,6 +12,7 @@ use crate::fmt::{
     fmt_duration_compact, pct, section_header, truncate,
 };
 
+/// Display today's activity breakdown by application in terminal format.
 pub fn show_today(app: &App) -> Result<(), Error> {
     let data = query_today(app)?;
     println!(
@@ -39,6 +40,7 @@ pub fn show_today(app: &App) -> Result<(), Error> {
     Ok(())
 }
 
+/// Display productivity metrics for a date range in terminal format.
 pub fn show_metrics_range(app: &App, range: TimeRange) -> Result<(), Error> {
     let m = query_metrics_range(app, range)?;
     println!(
@@ -89,6 +91,7 @@ pub fn show_metrics_range(app: &App, range: TimeRange) -> Result<(), Error> {
     Ok(())
 }
 
+/// Display hourly activity timeline for the past N days in terminal format.
 pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), Error> {
     let data = query_timeline(app, days_back, bucket_min)?;
     if data.buckets.is_empty() {
@@ -154,6 +157,8 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
     Ok(())
 }
 
+/// Generate and display a comprehensive report for a date range in terminal
+/// format.
 pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
     let data = query_report_range(app, range)?;
     println!(
@@ -684,6 +689,7 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
     Ok(())
 }
 
+/// Display a comparison of productivity metrics across multiple time periods.
 pub fn show_comparison(app: &App, range: TimeRange) -> Result<(), Error> {
     let current_bounds = range.resolve(&app.config)?;
     let current_days = (current_bounds.end_date - current_bounds.start_date)

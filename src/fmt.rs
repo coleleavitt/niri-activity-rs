@@ -6,6 +6,7 @@ use crate::config::Category;
 const MS_PER_HOUR: i64 = 3_600_000;
 const MS_PER_MIN: i64 = 60_000;
 
+/// Format milliseconds as compact duration string (e.g., "2h 30m").
 pub fn fmt_duration_compact(ms: i64) -> String {
     if ms < 0 {
         return "0s".to_string();
@@ -22,6 +23,7 @@ pub fn fmt_duration_compact(ms: i64) -> String {
     }
 }
 
+/// Format milliseconds as human-readable duration string (e.g., "2h 30m").
 pub fn fmt_duration(ms: i64) -> String {
     if ms < 0 {
         return "0s".to_string();
@@ -50,6 +52,7 @@ pub fn fmt_hms(ms: i64) -> String {
     format!("{}:{:02}:{:02}", h, m, s)
 }
 
+/// Format a percentage as a string (e.g., "75.5%").
 pub fn pct(part: i64, total: i64) -> String {
     if total == 0 {
         "0%".to_string()
@@ -58,6 +61,7 @@ pub fn pct(part: i64, total: i64) -> String {
     }
 }
 
+/// Truncate a string to maximum length, adding ellipsis if truncated.
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -102,6 +106,8 @@ fn fractional_block(remainder: f64) -> &'static str {
     }
 }
 
+/// Create a colored progress bar for a category with fractional block
+/// precision.
 pub fn cat_bar_fractional(category: Category, frac_blocks: f64, width: usize) -> String {
     if !frac_blocks.is_finite() || frac_blocks <= 0.0 {
         let pad = " ".repeat(width);
@@ -125,6 +131,8 @@ pub fn cat_bar_fractional(category: Category, frac_blocks: f64, width: usize) ->
     }
 }
 
+/// Create a colored progress bar showing productivity, neutral, and
+/// unproductive fractions.
 pub fn colored_bar(prod_frac: f64, neutral_frac: f64, _unprod_frac: f64, width: usize) -> String {
     let prod_chars = if prod_frac.is_finite() && prod_frac > 0.0 {
         (prod_frac.min(1.0) * width as f64).round() as usize
@@ -154,6 +162,7 @@ pub fn colored_bar(prod_frac: f64, neutral_frac: f64, _unprod_frac: f64, width: 
     )
 }
 
+/// Format text with color based on category (green, red, yellow).
 pub fn cat_colored(category: Category, text: &str) -> String {
     match category {
         Category::Productive => text.green().to_string(),
@@ -162,6 +171,7 @@ pub fn cat_colored(category: Category, text: &str) -> String {
     }
 }
 
+/// Get the label string for a category.
 pub fn cat_label(category: Category) -> String {
     match category {
         Category::Productive => "productive".green().bold().to_string(),
@@ -170,6 +180,7 @@ pub fn cat_label(category: Category) -> String {
     }
 }
 
+/// Create a colored progress bar for a category with specified fill level.
 pub fn cat_bar(category: Category, filled: usize) -> String {
     let segment = "█".repeat(filled);
     match category {
@@ -179,6 +190,7 @@ pub fn cat_bar(category: Category, filled: usize) -> String {
     }
 }
 
+/// Format text as a section header with styling.
 pub fn section_header(text: &str) -> String {
     text.cyan().bold().to_string()
 }

@@ -223,6 +223,7 @@ impl IntervalTracker {
     }
 }
 
+/// Detect if any jiggler/artificial input software is currently running.
 pub fn scan_jiggler_processes(blacklist: &[String]) -> bool {
     let entries = match std::fs::read_dir("/proc") {
         Ok(e) => e,
@@ -251,14 +252,14 @@ fn libinput_scroll_poll(scroll_events: &AtomicU64, last_activity: &AtomicU64, st
     let mut libinput = Libinput::new_with_udev(LibinputInterfaceImpl);
 
     if let Err(e) = libinput.udev_assign_seat("seat0") {
-        eprintln!(
-            "Warning: Failed to assign libinput seat: {:?}. Trackpad scroll disabled.",
+        tracing::warn!(
+            "Failed to assign libinput seat: {:?}. Trackpad scroll disabled.",
             e
         );
         return;
     }
 
-    eprintln!("Monitoring libinput for trackpad scroll events");
+    tracing::info!("Monitoring libinput for trackpad scroll events");
 
     let mut v_accum: f64 = 0.0;
     let mut h_accum: f64 = 0.0;
@@ -279,7 +280,7 @@ fn libinput_scroll_poll(scroll_events: &AtomicU64, last_activity: &AtomicU64, st
 
     loop {
         if let Err(e) = libinput.dispatch() {
-            eprintln!("libinput dispatch error: {:?}", e);
+            tracing::warn!("libinput dispatch error: {:?}", e);
             thread::sleep(Duration::from_secs(1));
             continue;
         }
@@ -311,6 +312,7 @@ fn libinput_scroll_poll(scroll_events: &AtomicU64, last_activity: &AtomicU64, st
     }
 }
 
+/// Enumerate all input devices that support keyboard, mouse, or touch events.
 pub fn enumerate_input_devices() -> Vec<evdev::Device> {
     evdev::enumerate()
         .filter_map(|(path, device)| {
@@ -323,8 +325,8 @@ pub fn enumerate_input_devices() -> Vec<evdev::Device> {
                 match evdev::Device::open(&path) {
                     Ok(dev) => {
                         if let Err(e) = dev.set_nonblocking(true) {
-                            eprintln!(
-                                "Warning: failed to set nonblocking on {}: {}, skipping device",
+                            tracing::warn!(
+                                "failed to set nonblocking on {}: {}, skipping device",
                                 path.display(),
                                 e
                             );
@@ -369,12 +371,12 @@ fn input_poll_inner(
     let mut devices = enumerate_input_devices();
 
     if devices.is_empty() {
-        eprintln!("Warning: No input devices found. Idle detection disabled.");
-        eprintln!("  (May need to add user to 'input' group: sudo usermod -aG input $USER)");
+        tracing::warn!("No input devices found. Idle detection disabled.");
+        tracing::warn!("  (May need to add user to 'input' group: sudo usermod -aG input $USER)");
         return;
     }
 
-    eprintln!("Monitoring {} input device(s) for activity", devices.len());
+    tracing::info!("Monitoring {} input device(s) for activity", devices.len());
 
     let mut last_reenumerate = Instant::now();
     let mut last_mouse_event = Instant::now();
@@ -415,7 +417,7 @@ fn input_poll_inner(
         if devices_changed.swap(false, Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(100));
             let new_devices = enumerate_input_devices();
-            eprintln!(
+            tracing::debug!(
                 "Re-enumerated (hotplug): {} -> {} devices",
                 devices.len(),
                 new_devices.len()
@@ -428,7 +430,7 @@ fn input_poll_inner(
         if loop_now.duration_since(last_reenumerate) >= REENUMERATE_INTERVAL {
             let new_devices = enumerate_input_devices();
             if new_devices.len() != devices.len() {
-                eprintln!(
+                tracing::debug!(
                     "Re-enumerated (periodic): {} -> {} devices",
                     devices.len(),
                     new_devices.len()
@@ -442,7 +444,7 @@ fn input_poll_inner(
             && loop_now.duration_since(last_mouse_event) >= STALE_MOUSE_THRESHOLD
             && loop_now.duration_since(last_reenumerate) >= REENUMERATE_COOLDOWN
         {
-            eprintln!(
+            tracing::debug!(
                 "Stale mouse detected (no mouse events for {}s, keyboard active). Re-enumerating...",
                 loop_now.duration_since(last_mouse_event).as_secs()
             );
@@ -634,6 +636,8 @@ fn input_poll_inner(
     }
 }
 
+/// Start background input monitoring thread, returning stats handle for
+/// polling.
 pub fn start_idle_monitor(
     start: Instant,
     jiggler_config: JigglerConfig,
@@ -689,10 +693,7 @@ pub fn start_idle_monitor(
             let mut inotify = match Inotify::init() {
                 Ok(i) => i,
                 Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to init inotify: {}. Device hotplug disabled.",
-                        e
-                    );
+                    tracing::warn!("Failed to init inotify: {}. Device hotplug disabled.", e);
                     return;
                 }
             };
@@ -701,8 +702,8 @@ pub fn start_idle_monitor(
                 .watches()
                 .add("/dev/input", WatchMask::CREATE | WatchMask::DELETE)
             {
-                eprintln!(
-                    "Warning: Failed to watch /dev/input: {}. Device hotplug disabled.",
+                tracing::warn!(
+                    "Failed to watch /dev/input: {}. Device hotplug disabled.",
                     e
                 );
                 return;
@@ -716,7 +717,7 @@ pub fn start_idle_monitor(
             loop {
                 inotify_iterations = inotify_iterations.saturating_add(1);
                 if inotify_iterations == MAX_INOTIFY_ITERATIONS {
-                    eprintln!("inotify loop reached iteration limit, exiting");
+                    tracing::warn!("inotify loop reached iteration limit, exiting");
                     break;
                 }
                 match inotify.read_events_blocking(&mut buffer) {
@@ -725,22 +726,22 @@ pub fn start_idle_monitor(
                             if let Some(name) = event.name {
                                 let name_str = name.to_string_lossy();
                                 if name_str.starts_with("event") {
-                                    eprintln!("Input device changed: {}", name.display());
+                                    tracing::debug!("Input device changed: {}", name.display());
                                     devices_changed_clone.store(true, Ordering::SeqCst);
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("inotify error: {}", e);
+                        tracing::warn!("inotify error: {}", e);
                         thread::sleep(Duration::from_secs(1));
                     }
                 }
             }
         })
     {
-        eprintln!(
-            "Warning: Failed to spawn input-hotplug thread: {}. Device hotplug disabled.",
+        tracing::warn!(
+            "Failed to spawn input-hotplug thread: {}. Device hotplug disabled.",
             e
         );
     }
@@ -748,18 +749,15 @@ pub fn start_idle_monitor(
     if jiggler_config.enabled {
         let jiggler_process_flag = Arc::clone(&stats.jiggler_process);
         let blacklist = jiggler_config.process_blacklist.clone();
-        // Detached thread: runs for process lifetime scanning for jiggler processes.
-        // JoinHandle intentionally dropped — thread terminates with process exit.
         if let Err(e) = thread::Builder::new()
             .name("jiggler-scan".into())
             .spawn(move || {
-                // JPL-R11: bounded by process lifetime — sleeps 30s between iterations.
                 let mut jiggler_iterations: u64 = 0;
                 const MAX_JIGGLER_ITERATIONS: u64 = u64::MAX;
                 loop {
                     jiggler_iterations = jiggler_iterations.saturating_add(1);
                     if jiggler_iterations == MAX_JIGGLER_ITERATIONS {
-                        eprintln!("jiggler scan loop reached iteration limit, exiting");
+                        tracing::warn!("jiggler scan loop reached iteration limit, exiting");
                         break;
                     }
                     let found = scan_jiggler_processes(&blacklist);
@@ -768,8 +766,8 @@ pub fn start_idle_monitor(
                 }
             })
         {
-            eprintln!(
-                "Warning: Failed to spawn jiggler-scan thread: {}. Jiggler detection disabled.",
+            tracing::warn!(
+                "Failed to spawn jiggler-scan thread: {}. Jiggler detection disabled.",
                 e
             );
         }
@@ -784,8 +782,8 @@ pub fn start_idle_monitor(
                 libinput_scroll_poll(&scroll_events_clone, &last_activity_clone, start);
             })
         {
-            eprintln!(
-                "Warning: Failed to spawn libinput-scroll thread: {}. Trackpad scroll disabled.",
+            tracing::warn!(
+                "Failed to spawn libinput-scroll thread: {}. Trackpad scroll disabled.",
                 e
             );
         }
@@ -861,8 +859,8 @@ pub fn start_idle_monitor(
                         } else {
                             "unknown panic".to_string()
                         };
-                        eprintln!(
-                            "CRITICAL: input-poll thread panicked (attempt {}/{}): {}",
+                        tracing::error!(
+                            "input-poll thread panicked (attempt {}/{}): {}",
                             respawn_count + 1,
                             MAX_RESPAWN_ATTEMPTS,
                             msg,
@@ -873,7 +871,9 @@ pub fn start_idle_monitor(
                         }
                         respawn_count += 1;
                         if respawn_count >= MAX_RESPAWN_ATTEMPTS {
-                            eprintln!("input-poll thread exceeded max respawn attempts, giving up");
+                            tracing::error!(
+                                "input-poll thread exceeded max respawn attempts, giving up"
+                            );
                             break;
                         }
 
@@ -883,14 +883,14 @@ pub fn start_idle_monitor(
                         }
                         last_respawn = Instant::now();
 
-                        eprintln!("Respawning input-poll thread...");
+                        tracing::warn!("Respawning input-poll thread...");
                     }
                 }
             }
         })
     {
-        eprintln!(
-            "CRITICAL: Failed to spawn input-poll thread: {}. Idle detection will not work!",
+        tracing::error!(
+            "Failed to spawn input-poll thread: {}. Idle detection will not work!",
             e
         );
     }

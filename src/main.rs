@@ -13,6 +13,7 @@ mod watcher;
 
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
+use tracing_subscriber::EnvFilter;
 
 use crate::error::Error;
 
@@ -217,9 +218,21 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
+    // TUI mode takes over the terminal; disable tracing to stderr.
+    // For CLI commands, enable tracing with env-filter (RUST_LOG=info default).
+    let is_tui = matches!(cli.command, None | Some(Commands::Tui { .. }));
+    if !is_tui {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
     // Load env file (SMTP creds etc.) before any threads spawn.
     if let Err(e) = config::load_env_file() {
-        eprintln!("Warning: failed to load env file: {e}");
+        tracing::warn!("failed to load env file: {e}");
     }
 
     let result: Result<(), Error> = match cli.command {
@@ -369,10 +382,7 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("Error: {}", e);
-        // Use exit code to signal failure without skipping destructors.
-        // The process is about to exit anyway, so destructors will run on the
-        // main stack. We just need to propagate the error status.
+        tracing::error!("{}", e);
         std::process::exit(1);
     }
 }
