@@ -26,6 +26,7 @@ use crate::fmt::fmt_hms;
 // Time constants (milliseconds)
 const MS_PER_HOUR: u64 = 3_600_000;
 const MS_PER_MIN: u64 = 60_000;
+const MS_PER_MIN_I64: i64 = 60_000;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -355,21 +356,19 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
 
         // Daily Δ (col 12) - colored based on productive time change
         let delta_fmt = if *is_workday {
-            if delta_productive > MS_PER_MIN as i64 {
+            if delta_productive > MS_PER_MIN_I64 {
                 &delta_positive_fmt
-            } else if delta_productive < -(MS_PER_MIN as i64) {
+            } else if delta_productive < -MS_PER_MIN_I64 {
                 &delta_negative_fmt
             } else {
                 &workday_fmt
             }
+        } else if delta_productive > MS_PER_MIN_I64 {
+            &weekend_delta_positive_fmt
+        } else if delta_productive < -MS_PER_MIN_I64 {
+            &weekend_delta_negative_fmt
         } else {
-            if delta_productive > MS_PER_MIN as i64 {
-                &weekend_delta_positive_fmt
-            } else if delta_productive < -(MS_PER_MIN as i64) {
-                &weekend_delta_negative_fmt
-            } else {
-                &weekend_fmt
-            }
+            &weekend_fmt
         };
         daily_sheet
             .write_string_with_format(row, 12, fmt_delta_hms(delta_productive), delta_fmt)

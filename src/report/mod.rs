@@ -14,12 +14,7 @@ pub use excel::export_xlsx_range;
 pub use export::{export_cron_summary, export_csv_range, export_heatmap_range, export_json_range};
 pub use query::{query_metrics_range, query_report_range, query_timeline, query_today};
 use rusqlite::Connection;
-pub use types::{
-    AppBreakdown, AppGroup, AwayData, CategoryBreakdown, DailyBreakdown, FatigueIndicators,
-    FatigueTrend, FlowQuality, FlowSession, FlowSummary, FocusStreak, GapEntry, GapSummary,
-    GapType, HourBreakdown, HourlyErrorRate, InputMetrics, MetricsData, ReportData,
-    ScheduleBreakdown, StreakSummary, TimelineBucket, TimelineData, TodayData, TodayRow,
-};
+pub use types::{MetricsData, ReportData, TimelineData, TodayData};
 
 use crate::config::{Config, get_data_dir, load_config};
 use crate::db::{reclassify_all, run_migrations};

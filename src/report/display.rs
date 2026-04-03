@@ -176,9 +176,10 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
         "║".cyan().bold()
     );
     println!(
-        "{}{}{}",
+        "{}  Period: {} → {}       {}",
         "║".cyan().bold(),
-        format!("  Period: {} → {}       ", data.since_str, data.now_str),
+        data.since_str,
+        data.now_str,
         "║".cyan().bold()
     );
     println!(
@@ -372,14 +373,16 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             } else {
                 (0.0, 0.0, 0.0)
             };
+            let app_name = format!("{:<22}", truncate(&group.app_id, 22));
+            let bar = format!(
+                "{}{}",
+                colored_bar(prod_frac, neutral_frac, unprod_frac, filled),
+                " ".repeat(BAR_WIDTH - filled)
+            );
             println!(
                 "  {} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks",
-                format!("{:<22}", truncate(&group.app_id, 22)).bold(),
-                format!(
-                    "{}{}",
-                    colored_bar(prod_frac, neutral_frac, unprod_frac, filled),
-                    " ".repeat(BAR_WIDTH - filled)
-                ),
+                app_name.bold(),
+                bar,
                 fmt_duration(group.total_ms).bold(),
                 group.keys,
                 keys_per_min.dimmed(),

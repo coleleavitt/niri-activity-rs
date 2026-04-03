@@ -164,7 +164,7 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
         match Category::from_str(&ev.category).unwrap_or(Category::Neutral) {
             Category::Productive => b.productive_ms = b.productive_ms.saturating_add(total_ms),
             Category::Unproductive => {
-                b.unproductive_ms = b.unproductive_ms.saturating_add(total_ms)
+                b.unproductive_ms = b.unproductive_ms.saturating_add(total_ms);
             }
             Category::Neutral => b.neutral_ms = b.neutral_ms.saturating_add(total_ms),
         }
@@ -1008,6 +1008,7 @@ fn query_flow_sessions(
     }
     sessions.sort_by_key(|s| std::cmp::Reverse(s.flow_score_0_to_100));
     let total_flow_ms: i64 = sessions.iter().map(|s| s.duration_ms).sum();
+    #[allow(clippy::cast_possible_wrap)]
     let flow_sessions = sessions.len() as i64;
     let avg_flow_duration_ms = if flow_sessions > 0 {
         total_flow_ms / flow_sessions
