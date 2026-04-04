@@ -678,9 +678,8 @@ fn query_gaps(
 ) -> Result<AwayData, Error> {
     let mut stmt = conn.prepare(
         "WITH ordered AS (SELECT timestamp, LAG(timestamp) OVER (ORDER BY timestamp) as prev_ts FROM events WHERE timestamp >= ?1 AND timestamp < ?2),
-         gaps AS (SELECT prev_ts as gap_start, timestamp as gap_end, CAST(strftime('%H', prev_ts, 'localtime') AS INT) as start_hour,
-                  CAST(strftime('%H', timestamp, 'localtime') AS INT) as end_hour, (julianday(timestamp) - julianday(prev_ts)) * 24.0 as gap_hours FROM ordered WHERE prev_ts IS NOT NULL)
-         SELECT gap_start, gap_end, start_hour, end_hour, gap_hours FROM gaps ORDER BY gap_start")?;
+         gaps AS (SELECT prev_ts as gap_start, timestamp as gap_end, (julianday(timestamp) - julianday(prev_ts)) * 24.0 as gap_hours FROM ordered WHERE prev_ts IS NOT NULL)
+         SELECT gap_start, gap_end, gap_hours FROM gaps ORDER BY gap_start")?;
     struct RawGap {
         gap_start: String,
         gap_end: String,
@@ -692,15 +691,19 @@ fn query_gaps(
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, u32>(2)?,
-            row.get::<_, u32>(3)?,
-            row.get::<_, f64>(4)?,
+            row.get::<_, f64>(2)?,
         ))
     })? {
-        let (gap_start, gap_end, start_hour, end_hour, gap_hours) = row?;
+        let (gap_start, gap_end, gap_hours) = row?;
         if !(sleep.gap_min_hours..=sleep.gap_max_hours).contains(&gap_hours) {
             continue;
         }
+        let start_hour = config
+            .parse_timestamp_to_local(&gap_start)
+            .map_or(0, |dt| dt.hour());
+        let end_hour = config
+            .parse_timestamp_to_local(&gap_end)
+            .map_or(0, |dt| dt.hour());
         let Some(gap_type) = classify_gap(start_hour, end_hour, gap_hours, sleep) else {
             continue;
         };
@@ -1038,14 +1041,14 @@ fn query_flow_sessions(
         let td: f64 = sessions.iter().map(|s| s.duration_ms as f64).sum();
         if td > 0.0 { (ws / td) as u8 } else { 0 }
     };
-    let dom = if deep_ms >= mod_ms && deep_ms >= light_ms {
+    let dom = if deep_ms == 0 && mod_ms == 0 && light_ms == 0 {
+        FlowQuality::Shallow
+    } else if deep_ms >= mod_ms && deep_ms >= light_ms {
         FlowQuality::Deep
     } else if mod_ms >= light_ms {
         FlowQuality::Moderate
-    } else if light_ms > 0 {
-        FlowQuality::Light
     } else {
-        FlowQuality::Shallow
+        FlowQuality::Light
     };
     let top_sessions: Vec<FlowSession> = sessions.into_iter().take(5).collect();
     Ok(FlowSummary {

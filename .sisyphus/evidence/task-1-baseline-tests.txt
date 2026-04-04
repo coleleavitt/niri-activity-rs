@@ -23,4 +23,4 @@ test config::tests::title_rule_app_scoped_regex ... ok
 
 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
-VERIFICATION: ✓ All 12 existing tests pass (baseline verified)
+VERIFICATION: ✓ All 11 existing tests pass (baseline verified)

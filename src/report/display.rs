@@ -86,7 +86,11 @@ pub fn show_metrics_range(app: &App, range: TimeRange) -> Result<(), Error> {
     println!(
         "Productive Idle:         {} {}",
         fmt_duration(m.productive_idle_ms).dimmed(),
-        pct(m.productive_idle_ms, m.productive_ms).dimmed()
+        pct(
+            m.productive_idle_ms,
+            m.productive_ms.saturating_add(m.productive_idle_ms)
+        )
+        .dimmed()
     );
     Ok(())
 }
@@ -558,7 +562,11 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
         && (input.backspace_count > 0
             || input.modifier_count > 0
             || input.left_clicks > 0
-            || input.scroll_up > 0)
+            || input.right_clicks > 0
+            || input.middle_clicks > 0
+            || input.scroll_up > 0
+            || input.scroll_down > 0
+            || input.scroll_horizontal > 0)
     {
         println!(
             "\n{}",

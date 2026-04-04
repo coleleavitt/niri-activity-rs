@@ -6,34 +6,38 @@ on:
   pull_request:
     branches: [master]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      # Clone niri repo to satisfy path dependency
       - name: Clone niri repository
         run: |
           cd ..
           git clone --depth 1 https://github.com/YaLTeR/niri.git
+          cd niri
+          git checkout 15c52bfb4318f3b2452f511d5367b4bfe6335242
 
-      # Install system dependencies for libinput
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libinput-dev libudev-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
+          toolchain: stable
           components: clippy
 
       - name: Build
-        run: cargo build
+        run: cargo build --locked
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --locked -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked

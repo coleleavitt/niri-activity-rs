@@ -24,8 +24,11 @@ use crate::logind::start_logind_monitor;
 
 // Duration constants
 const FLUSH_INTERVAL_SECS: u64 = 300; // 5 minutes
-const SUSPEND_DETECTION_THRESHOLD_SECS: u64 = 30;
 const HEARTBEAT_CHECK_INTERVAL_SECS: u64 = 30;
+
+// Niri connection backoff constants (separate from flush/suspend semantics)
+const NIRI_BACKOFF_MAX_INTERVAL_SECS: u64 = 300;
+const NIRI_BACKOFF_MAX_ELAPSED_SECS: u64 = 300;
 
 /// Saturating conversion from `Duration::as_millis()` (`u128`) to `u64`.
 /// Avoids silent truncation per JPL Rule 14 — practically unreachable
@@ -393,8 +396,9 @@ fn handle_lock_unlock(
                 jiggler,
                 FlushReset::NoReset,
             )?;
+            // Zero accumulators after flush to prevent double-counting
+            state.reset_accumulators();
         }
-        state.reset_accumulators();
         state.is_locked = true;
         state.current_state = ActivityState::Locked;
         if !quiet {
@@ -463,6 +467,7 @@ struct IdleThresholds {
 }
 
 /// Handle idle state transitions (Active→Passive→Idle→Away) and periodic flush.
+#[allow(clippy::too_many_arguments)]
 fn handle_idle_transitions(
     state: &mut WatchState,
     flush_ctx: &FlushContext<'_>,
@@ -1006,8 +1011,8 @@ pub fn connect_to_niri() -> Result<Socket, Error> {
     let backoff = ExponentialBackoff {
         initial_interval: Duration::from_millis(100),
         multiplier: 2.0,
-        max_interval: Duration::from_secs(SUSPEND_DETECTION_THRESHOLD_SECS),
-        max_elapsed_time: Some(Duration::from_secs(FLUSH_INTERVAL_SECS)),
+        max_interval: Duration::from_secs(NIRI_BACKOFF_MAX_INTERVAL_SECS),
+        max_elapsed_time: Some(Duration::from_secs(NIRI_BACKOFF_MAX_ELAPSED_SECS)),
         ..Default::default()
     };
 

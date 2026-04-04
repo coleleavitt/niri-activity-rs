@@ -1,5 +1,5 @@
 {
-  "active_plan": "/home/cole/RustProjects/active/niri-activity-rs/.sisyphus/plans/codebase-improvement.md",
+  "active_plan": ".sisyphus/plans/codebase-improvement.md",
   "started_at": "2026-04-03T00:02:24.150Z",
   "session_ids": [
     "ses_2af6e87ceffepJfTrIZvSVp47M",
@@ -16,7 +16,14 @@
     "ses_2af360b68ffevcBIsNwyknw1bg",
     "ses_2af345bf8ffeJTKs5JRew7a8xl",
     "ses_2af34322affeIADZSi6OQtNHgD",
-    "ses_2af347afaffejpzE7CHKURx6ZZ"
+    "ses_2af347afaffejpzE7CHKURx6ZZ",
+    "ses_2a9456145ffeLatrnJjvudVVH5",
+    "ses_2a943a167ffeuiBnin5K12v6BZ",
+    "ses_2a72a8a1cffeDJ0egtJInySmtZ",
+    "ses_2a72a2834ffeYNZn5JTrWjCvb0",
+    "ses_2a7218affffegHAqa615gPcV2I",
+    "ses_2a70f7248ffeBxwtTFfWqW4ZMj",
+    "ses_2a70c1e6bffeDHT14PIBBCffTp"
   ],
   "plan_name": "codebase-improvement",
   "agent": "atlas",

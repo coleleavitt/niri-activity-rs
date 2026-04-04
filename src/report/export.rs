@@ -140,7 +140,7 @@ pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
 pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
     let bounds = range.resolve(&app.config)?;
     let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
-    let mut stmt = app.conn.prepare("SELECT timestamp, category, active_ms + COALESCE(passive_ms,0) + idle_ms as total_ms, keystrokes FROM events WHERE timestamp >= ?1 AND timestamp < ?2")?;
+    let mut stmt = app.conn.prepare("SELECT timestamp, category, active_ms + COALESCE(passive_ms,0) as total_ms, keystrokes FROM events WHERE timestamp >= ?1 AND timestamp < ?2")?;
     let mut heatmap: std::collections::BTreeMap<(String, u32), HeatmapCell> =
         std::collections::BTreeMap::new();
     for row in stmt.query_map(params![&bounds.since_utc, until_utc], |row| {

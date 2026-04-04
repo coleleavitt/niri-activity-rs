@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
@@ -34,16 +34,20 @@ impl AgentMonitor {
             .cloned()
             .collect::<HashSet<_>>();
 
+        let poll_interval_ms = config.poll_interval_secs.saturating_mul(1000);
+        let poll_duration = Duration::from_millis(poll_interval_ms);
         Self {
             enabled: config.enabled,
-            poll_interval_ms: config.poll_interval_secs.saturating_mul(1000),
+            poll_interval_ms,
             activity_window_ms: i64::try_from(config.activity_window_secs)
                 .unwrap_or(30)
                 .saturating_mul(1000),
             databases,
             process_whitelist,
             process_recency_ms: config.process_recency_secs.saturating_mul(1000),
-            last_poll: Instant::now(),
+            last_poll: Instant::now()
+                .checked_sub(poll_duration)
+                .unwrap_or_else(Instant::now),
             cached_agent_active: false,
             cached_process_active: false,
         }

@@ -137,11 +137,10 @@ fn run_loop(app: &mut TuiApp, mut terminal: DefaultTerminal) -> Result<(), Error
             return Ok(());
         }
         let timeout = Duration::from_millis(250);
-        if event::poll(timeout)? {
-            match event::read() {
-                Ok(crossterm::event::Event::Key(key)) => handle_key(app, key),
-                Ok(_) => {}
-                Err(e) => return Err(Error::Io(e)),
+        if event::poll(timeout).map_err(Error::Io)? {
+            let event = event::read().map_err(Error::Io)?;
+            if let crossterm::event::Event::Key(key) = event {
+                handle_key(app, key);
             }
         }
     }
