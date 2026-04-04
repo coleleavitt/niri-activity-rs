@@ -931,16 +931,18 @@ impl Schedule {
         start_date: chrono::NaiveDate,
         end_date: chrono::NaiveDate,
     ) -> i64 {
+        const MAX_ITERATIONS: i64 = 36_600;
         let holiday_set = self.holiday_set();
         let mut count = 0i64;
+        let mut iterations = 0i64;
         let mut date = start_date;
         while date <= end_date {
             if self.is_workday_with_holidays(date, &holiday_set) {
                 count = count.saturating_add(1);
             }
             date += chrono::Duration::days(1);
-            // Safety bound: max 100 years of days
-            if count > 36_525 {
+            iterations += 1;
+            if iterations >= MAX_ITERATIONS {
                 break;
             }
         }

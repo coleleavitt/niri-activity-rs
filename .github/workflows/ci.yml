@@ -14,11 +14,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
 
       - name: Clone niri repository
         run: |
           cd ..
-          git clone --depth 1 https://github.com/YaLTeR/niri.git
+          git clone --depth 1 --branch v25.11 https://github.com/YaLTeR/niri.git
 
       - name: Install system dependencies
         run: |

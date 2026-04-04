@@ -11,6 +11,20 @@ use crate::config::{Config, Email};
 use crate::error::Error;
 use crate::report::{self, App, TimeRange};
 
+fn mask_email_for_log(email: &str) -> String {
+    match email.split_once('@') {
+        Some((local, domain)) => {
+            let masked_local = if local.is_empty() {
+                String::new()
+            } else {
+                format!("{}***", local.chars().next().unwrap_or('*'))
+            };
+            format!("{}@{}", masked_local, domain)
+        }
+        None => "[invalid]".to_string(),
+    }
+}
+
 /// Send an activity report via email for the specified date range.
 pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(), Error> {
     let email_config = &app.config.email;
@@ -122,20 +136,6 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
     let to_count = email_config.to_addresses.len();
     let cc_count = email_config.cc_addresses.len();
     let total_recipients = to_count + cc_count;
-
-    fn mask_email_for_log(email: &str) -> String {
-        match email.split_once('@') {
-            Some((local, domain)) => {
-                let masked_local = if local.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}***", local.chars().next().unwrap_or('*'))
-                };
-                format!("{}@{}", masked_local, domain)
-            }
-            None => "[invalid]".to_string(),
-        }
-    }
 
     println!(
         "Successfully sent {} report ({} to {}) to {} recipient(s){}{}",
@@ -303,7 +303,7 @@ pub fn test_email_config(config: &Config) -> Result<(), Error> {
         email_config
             .to_addresses
             .first()
-            .map_or("<none>", String::as_str)
+            .map_or_else(|| "<none>".to_string(), |e| mask_email_for_log(e))
     );
 
     Ok(())

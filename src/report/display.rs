@@ -120,8 +120,9 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
         if total == 0 {
             continue;
         }
-        let idle_pct = if total > 0 {
-            b.idle_ms as f64 / total as f64
+        let total_with_idle = total.saturating_add(b.idle_ms);
+        let idle_pct = if total_with_idle > 0 {
+            b.idle_ms as f64 / total_with_idle as f64
         } else {
             0.0
         };

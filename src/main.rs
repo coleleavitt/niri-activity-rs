@@ -82,7 +82,7 @@ fn parse_time_range(days: u32, time: &TimeRangeArgs) -> Result<report::TimeRange
 
     const MAX_DAYS: u32 = 10_000;
     if days > MAX_DAYS {
-        return Err(Error::NiriError(format!(
+        return Err(Error::InvalidArgument(format!(
             "--days {} exceeds maximum of {}",
             days, MAX_DAYS
         )));
@@ -102,7 +102,9 @@ fn parse_time_range(days: u32, time: &TimeRangeArgs) -> Result<report::TimeRange
         report::TimeRange::ThisMonth
     } else if time.aligned {
         if days == 0 {
-            return Err(Error::NiriError("--aligned requires --days >= 1".into()));
+            return Err(Error::InvalidArgument(
+                "--aligned requires --days >= 1".into(),
+            ));
         }
         report::TimeRange::DaysAligned(days)
     } else {
@@ -373,7 +375,7 @@ fn main() {
             } else if monthly {
                 report::App::open().and_then(|app| email::send_monthly_report(&app))?;
             } else if !secure {
-                return Err(Error::NiriError(
+                return Err(Error::InvalidArgument(
                     "Specify --weekly, --monthly, --from/--to, --test, or --secure".into(),
                 ));
             }

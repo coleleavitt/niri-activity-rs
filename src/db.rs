@@ -387,16 +387,19 @@ fn replay_classification(
         } else if gap <= deep_idle_threshold_ms {
             active_ms =
                 active_ms.saturating_add(i64::try_from(idle_threshold_ms).unwrap_or(i64::MAX));
-            passive_ms = passive_ms
-                .saturating_add(i64::try_from(gap - idle_threshold_ms).unwrap_or(i64::MAX));
+            passive_ms = passive_ms.saturating_add(
+                i64::try_from(gap.saturating_sub(idle_threshold_ms)).unwrap_or(i64::MAX),
+            );
         } else {
             active_ms =
                 active_ms.saturating_add(i64::try_from(idle_threshold_ms).unwrap_or(i64::MAX));
             passive_ms = passive_ms.saturating_add(
-                i64::try_from(deep_idle_threshold_ms - idle_threshold_ms).unwrap_or(i64::MAX),
+                i64::try_from(deep_idle_threshold_ms.saturating_sub(idle_threshold_ms))
+                    .unwrap_or(i64::MAX),
             );
-            idle_ms = idle_ms
-                .saturating_add(i64::try_from(gap - deep_idle_threshold_ms).unwrap_or(i64::MAX));
+            idle_ms = idle_ms.saturating_add(
+                i64::try_from(gap.saturating_sub(deep_idle_threshold_ms)).unwrap_or(i64::MAX),
+            );
         }
         prev_offset = offset_u64;
     }

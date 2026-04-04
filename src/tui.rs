@@ -431,9 +431,9 @@ fn render_timeline(app: &TuiApp, area: Rect, frame: &mut Frame) {
                 return Row::new(vec![Cell::from(""); 6]);
             }
 
-            let idle_total = b.idle_ms;
-            let idle_pct = if total > 0 {
-                idle_total as f64 / total as f64
+            let total_with_idle = total.saturating_add(b.idle_ms);
+            let idle_pct = if total_with_idle > 0 {
+                b.idle_ms as f64 / total_with_idle as f64
             } else {
                 0.0
             };

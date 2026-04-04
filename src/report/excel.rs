@@ -63,7 +63,7 @@ fn query_top_apps(
     limit: u32,
 ) -> Result<Vec<TopApp>, Error> {
     let mut stmt = conn.prepare(
-        "SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) AS total
+        "SELECT app_id, MAX(category) AS category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) AS total
          FROM events
          WHERE timestamp >= ?1 AND timestamp < ?2
          GROUP BY app_id

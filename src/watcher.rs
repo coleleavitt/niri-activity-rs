@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use backoff::ExponentialBackoff;
+use backon::{BlockingRetryable, ExponentialBuilder};
 use chrono::{Local, Utc};
 use niri_ipc::socket::Socket;
 use niri_ipc::{Event, Request, Response, Window};
@@ -28,7 +28,6 @@ const HEARTBEAT_CHECK_INTERVAL_SECS: u64 = 30;
 
 // Niri connection backoff constants (separate from flush/suspend semantics)
 const NIRI_BACKOFF_MAX_INTERVAL_SECS: u64 = 300;
-const NIRI_BACKOFF_MAX_ELAPSED_SECS: u64 = 300;
 
 /// Saturating conversion from `Duration::as_millis()` (`u128`) to `u64`.
 /// Avoids silent truncation per JPL Rule 14 — practically unreachable
@@ -746,6 +745,8 @@ fn handle_windows_changed(
             state.last_flush = ctx.now_instant;
             state.input_baseline_ms = ctx.input_stats.last_activity_ms();
             state.session_start_mono_ms = millis_u64(ctx.monitor_start.elapsed());
+            state.last_seen_input_ms = state.input_baseline_ms;
+            state.input_offsets.clear();
         }
     }
 
@@ -1011,21 +1012,20 @@ fn flush_session(
 
 /// Connect to the niri window manager with exponential backoff retry logic.
 pub fn connect_to_niri() -> Result<Socket, Error> {
-    let backoff = ExponentialBackoff {
-        initial_interval: Duration::from_millis(100),
-        multiplier: 2.0,
-        max_interval: Duration::from_secs(NIRI_BACKOFF_MAX_INTERVAL_SECS),
-        max_elapsed_time: Some(Duration::from_secs(NIRI_BACKOFF_MAX_ELAPSED_SECS)),
-        ..Default::default()
-    };
+    let backoff = ExponentialBuilder::default()
+        .with_min_delay(Duration::from_millis(100))
+        .with_max_delay(Duration::from_secs(NIRI_BACKOFF_MAX_INTERVAL_SECS))
+        .with_max_times(20); // ~5 minutes with exponential growth
 
-    backoff::retry(backoff, || match Socket::connect() {
-        Ok(socket) => Ok(socket),
-        Err(e) => {
+    (|| {
+        Socket::connect().map_err(|e| {
             tracing::warn!("Connection to niri failed: {}. Retrying...", e);
-            Err(backoff::Error::transient(e))
-        }
+            e
+        })
     })
+    .retry(backoff)
+    .sleep(std::thread::sleep)
+    .call()
     .map_err(|_| Error::NiriConnectionFailed)
 }
 
