@@ -149,14 +149,13 @@ pub fn colored_bar(prod_frac: f64, neutral_frac: f64, unprod_frac: f64, width: u
     } else {
         0
     };
-    // Clamp total to width, reducing segments proportionally if needed
     let total_used = prod_chars
         .saturating_add(neutral_chars)
         .saturating_add(unprod_chars);
     let (prod_chars, neutral_chars, unprod_chars) = if total_used > width && total_used > 0 {
         let scale = width as f64 / total_used as f64;
-        let p = (prod_chars as f64 * scale).round() as usize;
-        let n = (neutral_chars as f64 * scale).round() as usize;
+        let p = (prod_chars as f64 * scale).floor() as usize;
+        let n = (neutral_chars as f64 * scale).floor() as usize;
         let u = width.saturating_sub(p).saturating_sub(n);
         (p, n, u)
     } else {

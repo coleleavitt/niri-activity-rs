@@ -24,7 +24,9 @@ pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
     while date <= bounds.end_date {
         iterations += 1;
         if iterations > 10_000 {
-            break;
+            return Err(Error::InvalidArgument(
+                "date range exceeds 10,000 day limit".into(),
+            ));
         }
         let start = day_start_utc(&app.config, date)?;
         let end = day_end_utc(&app.config, date)?;

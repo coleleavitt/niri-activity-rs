@@ -285,7 +285,9 @@ fn main() {
             let cfg = config::load_config()?;
             let data_dir = config::get_data_dir()?;
             let db_path = data_dir.join("activity.db");
-            let conn = rusqlite::Connection::open(&db_path)?;
+            let mut conn = rusqlite::Connection::open(&db_path)?;
+            db::init_db(&conn)?;
+            db::run_migrations(&mut conn, &cfg)?;
             let input_active_ms = cfg.input_active_secs.saturating_mul(1000);
 
             if dry_run {

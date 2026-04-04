@@ -94,6 +94,7 @@ impl TuiApp {
                 self.metrics = query_metrics_range(&app, self.range.clone()).ok();
                 self.timeline = query_timeline(&app, 0, 15).ok();
                 self.report = query_report_range(&app, self.range.clone()).ok();
+                self.mouse_dpi = app.config.mouse_dpi;
             }
             Err(e) => {
                 tracing::warn!("TUI reload failed: {}", e);
