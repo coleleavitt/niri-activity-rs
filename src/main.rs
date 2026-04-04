@@ -382,7 +382,9 @@ fn main() {
     };
 
     if let Err(e) = result {
-        tracing::error!("{}", e);
+        // Use eprintln! instead of tracing::error! because TUI mode
+        // doesn't initialize a tracing subscriber, making tracing a no-op
+        eprintln!("Error: {}", e);
         std::process::exit(1);
     }
 }

@@ -171,13 +171,20 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
     }
 
     if !applied.contains(&"004_add_passive_and_jiggler".to_string()) {
-        conn.execute_batch(
-            "BEGIN;
-             ALTER TABLE events ADD COLUMN passive_ms INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE events ADD COLUMN jiggler_detected INTEGER NOT NULL DEFAULT 0;
-             INSERT INTO migrations (name, applied_at) VALUES ('004_add_passive_and_jiggler', datetime('now'));
-             COMMIT;",
+        let tx = conn.transaction()?;
+        tx.execute(
+            "ALTER TABLE events ADD COLUMN passive_ms INTEGER NOT NULL DEFAULT 0",
+            [],
         )?;
+        tx.execute(
+            "ALTER TABLE events ADD COLUMN jiggler_detected INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
+            params!["004_add_passive_and_jiggler", Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
         tracing::info!("Migration 004: added passive_ms and jiggler_detected columns");
     }
 

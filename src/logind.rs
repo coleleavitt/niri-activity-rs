@@ -45,8 +45,8 @@ impl LogindMonitor {
 
 /// Find our graphical session's D-Bus object path via logind.
 ///
-/// Strategy: iterate `ListSessions`, find first session with `uid >= 1000`.
-/// This matches the pattern from `logind-zbus/examples/unlock_signal.rs`.
+/// Strategy: prefer the current user's UID, then fall back to uid >= 1000
+/// heuristic.
 fn find_user_session_path(
     manager: &ManagerProxyBlocking<'_>,
 ) -> Result<zbus::zvariant::OwnedObjectPath, Error> {
@@ -58,8 +58,25 @@ fn find_user_session_path(
         return Err(Error::LogindSessionNotFound);
     }
 
+    // SAFETY: libc::getuid() is always safe to call
+    #[allow(unsafe_code)]
+    let current_uid = unsafe { libc::getuid() };
+
+    // First, try to find a session matching the current user's UID
+    for session_info in &sessions {
+        if session_info.uid() == current_uid {
+            return Ok(session_info.path().clone());
+        }
+    }
+
+    // Fall back to uid >= 1000 heuristic for multi-user systems
     for session_info in &sessions {
         if session_info.uid() >= 1000 {
+            tracing::debug!(
+                "no session for current uid {}, using session with uid {}",
+                current_uid,
+                session_info.uid()
+            );
             return Ok(session_info.path().clone());
         }
     }

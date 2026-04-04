@@ -149,10 +149,9 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
         };
         let mins = ts.hour() * 60 + ts.minute();
         let key = mins / bucket_min * bucket_min;
-        let total_ms = ev
-            .active_ms
-            .saturating_add(ev.passive_ms)
-            .saturating_add(ev.idle_ms);
+        // Exclude idle_ms from total_ms to avoid double-counting
+        // (idle_ms is tracked separately in b.idle_ms)
+        let total_ms = ev.active_ms.saturating_add(ev.passive_ms);
         let b = bucket_map.entry(key).or_insert_with(|| BucketAcc {
             productive_ms: 0,
             neutral_ms: 0,

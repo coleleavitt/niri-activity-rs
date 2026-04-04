@@ -133,7 +133,7 @@ pub fn cat_bar_fractional(category: Category, frac_blocks: f64, width: usize) ->
 
 /// Create a colored progress bar showing productivity, neutral, and
 /// unproductive fractions.
-pub fn colored_bar(prod_frac: f64, neutral_frac: f64, _unprod_frac: f64, width: usize) -> String {
+pub fn colored_bar(prod_frac: f64, neutral_frac: f64, unprod_frac: f64, width: usize) -> String {
     let prod_chars = if prod_frac.is_finite() && prod_frac > 0.0 {
         (prod_frac.min(1.0) * width as f64).round() as usize
     } else {
@@ -144,16 +144,24 @@ pub fn colored_bar(prod_frac: f64, neutral_frac: f64, _unprod_frac: f64, width: 
     } else {
         0
     };
-    let total_used = prod_chars.saturating_add(neutral_chars);
-    let (prod_chars, neutral_chars) = if total_used > width {
-        let excess = total_used.saturating_sub(width);
-        let new_neutral = neutral_chars.saturating_sub(excess);
-        let remaining = excess.saturating_sub(neutral_chars);
-        (prod_chars.saturating_sub(remaining), new_neutral)
+    let unprod_chars = if unprod_frac.is_finite() && unprod_frac > 0.0 {
+        (unprod_frac.min(1.0) * width as f64).round() as usize
     } else {
-        (prod_chars, neutral_chars)
+        0
     };
-    let unprod_chars = width.saturating_sub(prod_chars.saturating_add(neutral_chars));
+    // Clamp total to width, reducing segments proportionally if needed
+    let total_used = prod_chars
+        .saturating_add(neutral_chars)
+        .saturating_add(unprod_chars);
+    let (prod_chars, neutral_chars, unprod_chars) = if total_used > width && total_used > 0 {
+        let scale = width as f64 / total_used as f64;
+        let p = (prod_chars as f64 * scale).round() as usize;
+        let n = (neutral_chars as f64 * scale).round() as usize;
+        let u = width.saturating_sub(p).saturating_sub(n);
+        (p, n, u)
+    } else {
+        (prod_chars, neutral_chars, unprod_chars)
+    };
     format!(
         "{}{}{}",
         "█".repeat(prod_chars).green(),

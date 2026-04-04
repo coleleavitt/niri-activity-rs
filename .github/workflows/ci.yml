@@ -19,8 +19,6 @@ jobs:
         run: |
           cd ..
           git clone --depth 1 https://github.com/YaLTeR/niri.git
-          cd niri
-          git checkout 15c52bfb4318f3b2452f511d5367b4bfe6335242
 
       - name: Install system dependencies
         run: |

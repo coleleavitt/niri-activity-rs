@@ -668,7 +668,15 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
                 .map_err(xlsx_err)?;
         }
 
-        let grand_total_ms: i64 = top_apps.iter().map(|a| a.total_ms).sum();
+        // Query total time from ALL apps, not just top-20, for accurate percentage
+        let grand_total_ms: i64 = {
+            let mut stmt = app.conn.prepare(
+                "SELECT COALESCE(SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), 0)
+                 FROM events
+                 WHERE timestamp >= ?1 AND timestamp < ?2",
+            )?;
+            stmt.query_row(params![&bounds.since_utc, until_utc], |r| r.get(0))?
+        };
 
         for (aidx, app_row) in top_apps.iter().enumerate() {
             let arow = (aidx as u32).saturating_add(1);

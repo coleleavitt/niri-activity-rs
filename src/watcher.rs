@@ -713,15 +713,14 @@ fn handle_windows_changed(
     ctx: &NiriEventContext<'_>,
     win_list: Vec<Window>,
 ) -> Result<(), Error> {
-    tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_windows_changed");
-    let input = ctx.input_stats.snapshot();
-    let jiggler = ctx.input_stats.jiggler_detected();
-
     let info = state
         .focused_id
         .and_then(|id| state.windows.get(&id))
         .cloned();
     if let Some(ref info) = info {
+        tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_windows_changed");
+        let input = ctx.input_stats.snapshot();
+        let jiggler = ctx.input_stats.jiggler_detected();
         flush_session(
             ctx.flush_ctx,
             Some(info),

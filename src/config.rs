@@ -458,6 +458,11 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
         }
     }
 
+    // If there are trailing digits without a unit suffix, the input is malformed
+    if !current_num.is_empty() {
+        return None;
+    }
+
     if total_ms > 0 { Some(total_ms) } else { None }
 }
 

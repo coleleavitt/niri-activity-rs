@@ -91,7 +91,6 @@ pub struct InputCounters {
     pub jiggler_pattern: AtomicBool,
     pub jiggler_process: AtomicBool,
     pub last_keyboard_ms: AtomicU64,
-    pub last_meaningful_input_ms: AtomicU64,
     pub heartbeat: AtomicU64,
 }
 
@@ -114,7 +113,6 @@ impl InputCounters {
             jiggler_pattern: AtomicBool::new(false),
             jiggler_process: AtomicBool::new(false),
             last_keyboard_ms: AtomicU64::new(0),
-            last_meaningful_input_ms: AtomicU64::new(0),
             heartbeat: AtomicU64::new(0),
         }
     }
@@ -450,9 +448,6 @@ fn unified_input_loop(
                                     _ => 0,
                                 };
                                 counters.last_activity_ms.store(now, Ordering::Release);
-                                counters
-                                    .last_meaningful_input_ms
-                                    .store(now, Ordering::Release);
                                 if jiggler_enabled {
                                     mouse_tracker.record(now);
                                 }
@@ -473,9 +468,6 @@ fn unified_input_loop(
                                     counters.modifier_count.fetch_add(1, Ordering::Release);
                                 }
                                 counters.last_activity_ms.store(now, Ordering::Release);
-                                counters
-                                    .last_meaningful_input_ms
-                                    .store(now, Ordering::Release);
                                 counters.last_keyboard_ms.store(now, Ordering::Release);
                                 if jiggler_enabled {
                                     kb_tracker.record(now);
@@ -533,9 +525,6 @@ fn unified_input_loop(
                                 _ => 0,
                             };
                             counters.last_activity_ms.store(now, Ordering::Release);
-                            counters
-                                .last_meaningful_input_ms
-                                .store(now, Ordering::Release);
                         }
 
                         Event::Pointer(PointerEvent::ScrollWheel(s)) => {
@@ -690,7 +679,28 @@ pub fn start_idle_monitor(
                 }));
 
                 match result {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        tracing::warn!(
+                            "unified_input_loop returned normally (attempt {}/{}), retrying...",
+                            respawn_count + 1,
+                            MAX_RESPAWN_ATTEMPTS,
+                        );
+                        if Instant::now().duration_since(last_respawn) >= RESPAWN_COUNT_RESET {
+                            respawn_count = 0;
+                        }
+                        respawn_count += 1;
+                        if respawn_count >= MAX_RESPAWN_ATTEMPTS {
+                            tracing::error!(
+                                "input-poll thread exceeded max respawn attempts, giving up"
+                            );
+                            break;
+                        }
+                        let since_last = Instant::now().duration_since(last_respawn);
+                        if let Some(remaining) = MIN_RESPAWN_INTERVAL.checked_sub(since_last) {
+                            thread::sleep(remaining);
+                        }
+                        last_respawn = Instant::now();
+                    }
                     Err(panic_info) => {
                         let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
                             (*s).to_string()

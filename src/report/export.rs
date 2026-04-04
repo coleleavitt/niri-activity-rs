@@ -40,16 +40,18 @@ pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
         })? {
             let (cat_raw, active_ms, passive_ms, idle_ms) = row?;
             let total = active_ms.saturating_add(passive_ms);
-            m.total_ms += total;
+            m.total_ms = m.total_ms.saturating_add(total);
             match Category::from_str(&cat_raw).unwrap_or(Category::Neutral) {
                 Category::Productive => {
-                    m.productive_ms += total;
-                    m.productive_active_ms += active_ms;
-                    m.productive_passive_ms += passive_ms;
-                    m.productive_idle_ms += idle_ms;
+                    m.productive_ms = m.productive_ms.saturating_add(total);
+                    m.productive_active_ms = m.productive_active_ms.saturating_add(active_ms);
+                    m.productive_passive_ms = m.productive_passive_ms.saturating_add(passive_ms);
+                    m.productive_idle_ms = m.productive_idle_ms.saturating_add(idle_ms);
                 }
-                Category::Unproductive => m.unproductive_ms += total,
-                Category::Neutral => m.neutral_ms += total,
+                Category::Unproductive => {
+                    m.unproductive_ms = m.unproductive_ms.saturating_add(total);
+                }
+                Category::Neutral => m.neutral_ms = m.neutral_ms.saturating_add(total),
             }
         }
         let prod_ratio = if m.total_ms > 0 {
@@ -170,12 +172,16 @@ pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
                 keystrokes: 0,
             });
         match cat {
-            Category::Productive => cell.productive_ms += total_ms,
-            Category::Unproductive => cell.unproductive_ms += total_ms,
-            Category::Neutral => cell.neutral_ms += total_ms,
+            Category::Productive => {
+                cell.productive_ms = cell.productive_ms.saturating_add(total_ms);
+            }
+            Category::Unproductive => {
+                cell.unproductive_ms = cell.unproductive_ms.saturating_add(total_ms);
+            }
+            Category::Neutral => cell.neutral_ms = cell.neutral_ms.saturating_add(total_ms),
         }
-        cell.total_ms += total_ms;
-        cell.keystrokes += keystrokes;
+        cell.total_ms = cell.total_ms.saturating_add(total_ms);
+        cell.keystrokes = cell.keystrokes.saturating_add(keystrokes);
     }
     let json = serde_json::to_string_pretty(&heatmap.into_values().collect::<Vec<_>>())
         .map_err(|e| Error::NiriError(format!("JSON serialization failed: {}", e)))?;

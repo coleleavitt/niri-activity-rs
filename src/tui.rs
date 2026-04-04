@@ -578,9 +578,11 @@ fn render_apps(app: &TuiApp, area: Rect, frame: &mut Frame) {
             let prod_chars = (prod_ms as f64 / total as f64 * bar_len as f64)
                 .round()
                 .max(0.0) as usize;
+            let remaining_after_prod = bar_len.saturating_sub(prod_chars);
             let neutral_chars = (neutral_ms as f64 / total as f64 * bar_len as f64)
                 .round()
                 .max(0.0) as usize;
+            let neutral_chars = neutral_chars.min(remaining_after_prod);
             let unprod_chars = bar_len.saturating_sub(prod_chars + neutral_chars);
             let bar_line = Line::from(vec![
                 Span::styled(
