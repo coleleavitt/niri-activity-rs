@@ -667,7 +667,7 @@ impl From<RawConfig> for Config {
         let title_rules = raw
             .title_rules
             .into_iter()
-            .map(|r| {
+            .filter_map(|r| {
                 let compiled = if r.regex {
                     match regex::RegexBuilder::new(&r.pattern)
                         .case_insensitive(true)
@@ -675,19 +675,19 @@ impl From<RawConfig> for Config {
                     {
                         Ok(re) => Some(re),
                         Err(e) => {
-                            tracing::warn!("Warning: invalid regex pattern '{}': {}", r.pattern, e);
-                            None
+                            tracing::warn!("Skipping title rule with invalid regex: {}", e);
+                            return None;
                         }
                     }
                 } else {
                     None
                 };
-                TitleRule {
+                Some(TitleRule {
                     pattern: r.pattern,
                     category: r.category,
                     app: r.app,
                     compiled,
-                }
+                })
             })
             .collect();
         let timezone = raw.timezone.and_then(|tz_str| {
@@ -1025,6 +1025,15 @@ pub(crate) fn load_env_file() -> Result<(), Error> {
                 continue;
             }
             if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim();
+                let value = value.trim();
+
+                // Validate key before calling set_var
+                if key.is_empty() || key.contains('=') || key.contains('\0') {
+                    tracing::warn!("Skipping invalid environment variable key: {:?}", key);
+                    continue;
+                }
+
                 // SAFETY: This is called from main() immediately after Cli::parse(),
                 // before watch() spawns any threads (signal_hook, input monitor, logind).
                 // std::env::set_var is only unsafe in multi-threaded contexts.
@@ -1032,7 +1041,7 @@ pub(crate) fn load_env_file() -> Result<(), Error> {
                 // SAFETY: Called before any threads are spawned (single-threaded context).
                 #[allow(unsafe_code)]
                 unsafe {
-                    std::env::set_var(key.trim(), value.trim());
+                    std::env::set_var(key, value);
                 }
             }
         }

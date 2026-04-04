@@ -20,7 +20,7 @@ jobs:
       - name: Clone niri repository
         run: |
           cd ..
-          git clone --depth 1 --branch v25.11 https://github.com/YaLTeR/niri.git
+          git clone https://github.com/YaLTeR/niri.git && cd niri && git checkout 15c52bfb4318f3b2452f511d5367b4bfe6335242
 
       - name: Install system dependencies
         run: |
