@@ -954,7 +954,7 @@ fn query_flow_sessions(
         });
     };
     for row in &rows {
-        let is_prod = row.category == "productive";
+        let is_prod = Category::from_str(&row.category) == Ok(Category::Productive);
         let cur_dt = config.parse_timestamp_to_local(&row.timestamp);
         let gap_exceeded = current.as_ref().is_some_and(|c| matches!((c.last_event_ts, cur_dt), (Some(last), Some(cur)) if (cur - last).num_milliseconds() > GAP_TOLERANCE_MS));
         if (gap_exceeded || (!is_prod && current.is_some()))

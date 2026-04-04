@@ -104,7 +104,6 @@ struct WeekBucket {
     total_ms: i64,
     productive_ms: i64,
     unproductive_ms: i64,
-    neutral_ms: i64,
     day_count: u32,
 }
 
@@ -124,7 +123,6 @@ fn aggregate_weeks(daily: &[(NaiveDate, Metrics, bool)]) -> Vec<WeekBucket> {
             total_ms: 0,
             productive_ms: 0,
             unproductive_ms: 0,
-            neutral_ms: 0,
             day_count: 0,
         });
 
@@ -137,7 +135,6 @@ fn aggregate_weeks(daily: &[(NaiveDate, Metrics, bool)]) -> Vec<WeekBucket> {
         bucket.total_ms = bucket.total_ms.saturating_add(m.total_ms);
         bucket.productive_ms = bucket.productive_ms.saturating_add(m.productive_ms);
         bucket.unproductive_ms = bucket.unproductive_ms.saturating_add(m.unproductive_ms);
-        bucket.neutral_ms = bucket.neutral_ms.saturating_add(m.neutral_ms);
         bucket.day_count = bucket.day_count.saturating_add(1);
     }
 
@@ -224,6 +221,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     let mut row: u32 = 1;
     let mut date = since_local;
     let mut daily_metrics: Vec<(NaiveDate, Metrics, bool)> = Vec::new();
+    let holiday_set = app.config.schedule.holiday_set();
 
     while date <= today_local {
         let day_start = super::day_start_utc(&app.config, date)?;
@@ -268,7 +266,10 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
             }
         }
 
-        let is_workday = app.config.schedule.is_workday(date);
+        let is_workday = app
+            .config
+            .schedule
+            .is_workday_with_holidays(date, &holiday_set);
 
         daily_metrics.push((date, m, is_workday));
         date += chrono::Duration::days(1);

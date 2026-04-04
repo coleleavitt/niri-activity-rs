@@ -530,9 +530,9 @@ fn handle_idle_transitions(
         let to = color_state(new_state);
         tracing::debug!("{} {} → {}", "[STATE]".dimmed(), from, to);
     }
-    state.current_state = new_state;
-
     accumulate_state_time(state, now_instant);
+
+    state.current_state = new_state;
 
     if should_periodic_flush(state, now_instant) {
         handle_periodic_flush(state, flush_ctx, input_stats, now_instant, quiet)?;

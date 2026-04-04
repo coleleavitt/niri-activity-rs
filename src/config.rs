@@ -373,18 +373,35 @@ impl Email {
     }
 }
 
-// Manual Debug impl to redact sensitive SMTP credentials
+fn mask_email(addr: &str) -> String {
+    if let Some(at_pos) = addr.find('@') {
+        let local = &addr[..at_pos];
+        let domain = &addr[at_pos + 1..];
+        let masked_local = if local.len() <= 1 {
+            "*".to_string()
+        } else {
+            format!("{}***", &local[..1])
+        };
+        format!("{}@{}", masked_local, domain)
+    } else {
+        "[REDACTED]".to_string()
+    }
+}
+
 impl fmt::Debug for Email {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let masked_from = mask_email(&self.from_address);
+        let masked_to: Vec<String> = self.to_addresses.iter().map(|a| mask_email(a)).collect();
+        let masked_cc: Vec<String> = self.cc_addresses.iter().map(|a| mask_email(a)).collect();
         f.debug_struct("Email")
             .field("enabled", &self.enabled)
             .field("smtp_host", &self.smtp_host)
             .field("smtp_port", &self.smtp_port)
             .field("smtp_user", &"[REDACTED]")
             .field("smtp_password", &"[REDACTED]")
-            .field("from_address", &self.from_address)
-            .field("to_addresses", &self.to_addresses)
-            .field("cc_addresses", &self.cc_addresses)
+            .field("from_address", &masked_from)
+            .field("to_addresses", &masked_to)
+            .field("cc_addresses", &masked_cc)
             .field("subject_prefix", &self.subject_prefix)
             .field("report_name", &self.report_name)
             .finish()
@@ -949,14 +966,14 @@ impl Schedule {
         count
     }
 
-    fn holiday_set(&self) -> std::collections::HashSet<chrono::NaiveDate> {
+    pub(crate) fn holiday_set(&self) -> std::collections::HashSet<chrono::NaiveDate> {
         self.holidays
             .iter()
             .filter_map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
             .collect()
     }
 
-    fn is_workday_with_holidays(
+    pub(crate) fn is_workday_with_holidays(
         &self,
         date: chrono::NaiveDate,
         holiday_set: &std::collections::HashSet<chrono::NaiveDate>,
@@ -973,10 +990,6 @@ impl Schedule {
             let d_lower = d.to_lowercase();
             d_lower == weekday || d_lower == weekday_short
         })
-    }
-    pub fn is_workday(&self, date: chrono::NaiveDate) -> bool {
-        let holiday_set = self.holiday_set();
-        self.is_workday_with_holidays(date, &holiday_set)
     }
 }
 
