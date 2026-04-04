@@ -52,7 +52,7 @@ User requested a full codebase review of niri-activity-rs with recommendations o
 
 - **"Regex → str::contains()" was WRONG**: Production code already branches correctly based on `regex = true/false` config flag. Architecture handles this.
 
-- **"MSRV violations" is a NON-ISSUE**: Edition 2024 requires Rust 1.85+, which covers all used APIs (cast_signed 1.87, is_multiple_of 1.87, Duration::from_mins 1.84). These are clippy false positives given the edition.
+- **"MSRV violations" is a NON-ISSUE**: Edition 2024 requires Rust 1.85+ (MSRV). All used APIs are available in 1.85+. These are clippy false positives given the edition.
 
 - **"LazyLock for regex" is WRONG**: Regex patterns come from user config at runtime, not hardcoded statics. LazyLock is inapplicable.
 

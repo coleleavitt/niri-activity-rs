@@ -274,6 +274,10 @@ pub fn test_email_config(config: &Config) -> Result<(), Error> {
 
     let mailer = build_mailer(email_config)?;
 
+    // Sanitize subject line: strip newlines to prevent header injection
+    let test_subject = format!("{} Test Email", email_config.subject_prefix);
+    let test_subject = test_subject.replace(['\n', '\r'], " ");
+
     let test_email = Message::builder()
         .from(
             email_config
@@ -287,10 +291,7 @@ pub fn test_email_config(config: &Config) -> Result<(), Error> {
             .ok_or_else(|| Error::NiriError("No recipient addresses configured".into()))?
             .parse()
             .map_err(|e| Error::NiriError(format!("Invalid recipient: {}", e)))?)
-        .subject(format!(
-            "{} Test Email",
-            email_config.subject_prefix
-        ))
+        .subject(test_subject)
         .body("This is a test email from niri-activity-rs. If you received this, email is configured correctly.".to_string())
         .map_err(|e| Error::NiriError(format!("Failed to build test email: {}", e)))?;
 

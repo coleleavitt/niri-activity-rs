@@ -377,10 +377,10 @@ fn mask_email(addr: &str) -> String {
     if let Some(at_pos) = addr.find('@') {
         let local = &addr[..at_pos];
         let domain = &addr[at_pos + 1..];
-        let masked_local = if local.len() <= 1 {
+        let masked_local = if local.is_empty() {
             "*".to_string()
         } else {
-            format!("{}***", &local[..1])
+            format!("{}***", local.chars().next().unwrap_or('*'))
         };
         format!("{}@{}", masked_local, domain)
     } else {
