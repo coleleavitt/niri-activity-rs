@@ -63,11 +63,11 @@ enum ExportFormat {
 fn parse_time_range(days: u32, time: &TimeRangeArgs) -> Result<report::TimeRange, Error> {
     if let (Some(from_str), Some(to_str)) = (&time.from, &time.to) {
         let start = NaiveDate::parse_from_str(from_str, "%Y-%m-%d")
-            .map_err(|e| Error::NiriError(format!("invalid --from date: {}", e)))?;
+            .map_err(|e| Error::InvalidArgument(format!("invalid --from date: {}", e)))?;
         let end = NaiveDate::parse_from_str(to_str, "%Y-%m-%d")
-            .map_err(|e| Error::NiriError(format!("invalid --to date: {}", e)))?;
+            .map_err(|e| Error::InvalidArgument(format!("invalid --to date: {}", e)))?;
         if start > end {
-            return Err(Error::NiriError(format!(
+            return Err(Error::InvalidArgument(format!(
                 "--from date ({}) must be on or before --to date ({})",
                 from_str, to_str
             )));
@@ -75,7 +75,7 @@ fn parse_time_range(days: u32, time: &TimeRangeArgs) -> Result<report::TimeRange
         return Ok(report::TimeRange::DateRange(start, end));
     }
     if time.from.is_some() || time.to.is_some() {
-        return Err(Error::NiriError(
+        return Err(Error::InvalidArgument(
             "--from and --to must be used together".into(),
         ));
     }

@@ -123,6 +123,20 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
     let cc_count = email_config.cc_addresses.len();
     let total_recipients = to_count + cc_count;
 
+    fn mask_email_for_log(email: &str) -> String {
+        match email.split_once('@') {
+            Some((local, domain)) => {
+                let masked_local = if local.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}***", local.chars().next().unwrap_or('*'))
+                };
+                format!("{}@{}", masked_local, domain)
+            }
+            None => "[invalid]".to_string(),
+        }
+    }
+
     println!(
         "Successfully sent {} report ({} to {}) to {} recipient(s){}{}",
         period_name,
@@ -130,12 +144,22 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
         bounds.end_date,
         total_recipients,
         if to_count > 0 {
-            format!(" [TO: {}]", email_config.to_addresses.join(", "))
+            let masked: Vec<_> = email_config
+                .to_addresses
+                .iter()
+                .map(|e| mask_email_for_log(e))
+                .collect();
+            format!(" [TO: {}]", masked.join(", "))
         } else {
             String::new()
         },
         if cc_count > 0 {
-            format!(" [CC: {}]", email_config.cc_addresses.join(", "))
+            let masked: Vec<_> = email_config
+                .cc_addresses
+                .iter()
+                .map(|e| mask_email_for_log(e))
+                .collect();
+            format!(" [CC: {}]", masked.join(", "))
         } else {
             String::new()
         },

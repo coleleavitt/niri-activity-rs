@@ -453,7 +453,7 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
                         return None;
                     }
                 }
-                _ => {}
+                _ => return None,
             }
         }
     }

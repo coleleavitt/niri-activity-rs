@@ -231,6 +231,8 @@ impl WatchState {
         self.last_flush = now_instant;
         self.input_baseline_ms = input_baseline;
         self.session_start_mono_ms = session_mono;
+        self.last_seen_input_ms = input_baseline;
+        self.input_offsets.clear();
     }
 }
 
@@ -829,6 +831,8 @@ fn handle_focus_changed(
     state.last_flush = ctx.now_instant;
     state.input_baseline_ms = ctx.input_stats.last_activity_ms();
     state.session_start_mono_ms = millis_u64(ctx.monitor_start.elapsed());
+    state.last_seen_input_ms = state.input_baseline_ms;
+    state.input_offsets.clear();
 
     Ok(())
 }

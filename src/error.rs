@@ -26,4 +26,6 @@ pub enum Error {
     LogindConnectionFailed,
     #[error("logind session not found for current user")]
     LogindSessionNotFound,
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
