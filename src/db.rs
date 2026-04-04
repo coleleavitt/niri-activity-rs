@@ -420,7 +420,8 @@ fn replay_classification(
             active_ms =
                 active_ms.saturating_add(i64::try_from(idle_threshold_ms).unwrap_or(i64::MAX));
             passive_ms = passive_ms.saturating_add(
-                i64::try_from(deep_idle_threshold_ms - idle_threshold_ms).unwrap_or(i64::MAX),
+                i64::try_from(deep_idle_threshold_ms.saturating_sub(idle_threshold_ms))
+                    .unwrap_or(i64::MAX),
             );
             idle_ms = idle_ms.saturating_add(
                 i64::try_from(trailing_gap - deep_idle_threshold_ms).unwrap_or(i64::MAX),

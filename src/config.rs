@@ -1028,9 +1028,16 @@ pub(crate) fn load_env_file() -> Result<(), Error> {
                 let key = key.trim();
                 let value = value.trim();
 
-                // Validate key before calling set_var
+                // Validate key and value before calling set_var
                 if key.is_empty() || key.contains('=') || key.contains('\0') {
                     tracing::warn!("Skipping invalid environment variable key: {:?}", key);
+                    continue;
+                }
+                if value.contains('\0') {
+                    tracing::warn!(
+                        "Skipping environment variable with NUL byte in value: {:?}",
+                        key
+                    );
                     continue;
                 }
 

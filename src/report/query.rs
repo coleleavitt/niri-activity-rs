@@ -25,7 +25,7 @@ pub fn query_today(app: &App) -> Result<TodayData, Error> {
     let start = day_start_utc(&app.config, date)?;
     let end = day_end_utc(&app.config, date)?;
     let mut stmt = app.conn.prepare(
-        "SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) as total_ms 
+        "SELECT app_id, MAX(category) as category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) as total_ms 
          FROM events WHERE timestamp >= ?1 AND timestamp < ?2
          GROUP BY app_id ORDER BY total_ms DESC",
     )?;
@@ -101,7 +101,9 @@ pub fn query_metrics_range(
 /// intervals.
 pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<TimelineData, Error> {
     if bucket_min == 0 {
-        return Err(Error::NiriError("bucket size must be positive".into()));
+        return Err(Error::InvalidArgument(
+            "bucket size must be positive".into(),
+        ));
     }
     let date = app.config.local_date_today() - chrono::Duration::days(days_back as i64);
     let start = day_start_utc(&app.config, date)?;
