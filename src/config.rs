@@ -1271,6 +1271,7 @@ mod tests {
 
     #[test]
     fn title_rule_regex_case_insensitive() {
+        #[allow(clippy::trivial_regex)]
         let re = regex::RegexBuilder::new("GitHub")
             .case_insensitive(true)
             .build()

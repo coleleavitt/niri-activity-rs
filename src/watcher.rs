@@ -236,8 +236,7 @@ fn handle_shutdown(
     shutdown: &AtomicBool,
     state: &mut WatchState,
     flush_ctx: &FlushContext<'_>,
-    input: &InputSnapshot,
-    jiggler: bool,
+    input_stats: &crate::input::InputStats,
 ) -> Result<bool, Error> {
     if !shutdown.load(Ordering::SeqCst) {
         return Ok(false);
@@ -249,11 +248,14 @@ fn handle_shutdown(
         .and_then(|id| state.windows.get(&id))
         .cloned();
     if let Some(ref info) = info {
+        tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_shutdown");
+        let input = input_stats.snapshot();
+        let jiggler = input_stats.jiggler_detected();
         let flushed = flush_session(
             flush_ctx,
             Some(info),
             &mut state.make_accum(),
-            input,
+            &input,
             jiggler,
             FlushReset::NoReset,
         )?;
@@ -307,6 +309,8 @@ fn handle_suspend_resume(
     if !wall_clock_resume && !dbus_resume {
         return Ok(false);
     }
+
+    tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_suspend_resume");
 
     if !quiet {
         let label = if wall_clock_resume {
@@ -378,6 +382,7 @@ fn handle_lock_unlock(
             .and_then(|id| state.windows.get(&id))
             .cloned();
         if let Some(ref info) = info {
+            tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_lock_unlock (lock)");
             let input = input_stats.snapshot();
             let jiggler = input_stats.jiggler_detected();
             flush_session(
@@ -561,6 +566,7 @@ fn handle_enter_away(
         .and_then(|id| state.windows.get(&id))
         .cloned();
     let (input, jiggler) = if info.is_some() {
+        tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_enter_away");
         (input_stats.snapshot(), input_stats.jiggler_detected())
     } else {
         (InputSnapshot::default(), false)
@@ -654,6 +660,7 @@ fn handle_periodic_flush(
         .and_then(|id| state.windows.get(&id))
         .cloned();
     if let Some(ref info) = info {
+        tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_periodic_flush");
         let input = input_stats.snapshot();
         let jiggler = input_stats.jiggler_detected();
         let flushed = flush_session(
@@ -701,6 +708,7 @@ fn handle_windows_changed(
     ctx: &NiriEventContext<'_>,
     win_list: Vec<Window>,
 ) -> Result<(), Error> {
+    tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_windows_changed");
     let input = ctx.input_stats.snapshot();
     let jiggler = ctx.input_stats.jiggler_detected();
 
@@ -749,6 +757,7 @@ fn handle_window_closed(
     id: u64,
 ) -> Result<(), Error> {
     if state.focused_id == Some(id) {
+        tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_window_closed");
         let input = ctx.input_stats.snapshot();
         let jiggler = ctx.input_stats.jiggler_detected();
         let info = state.windows.get(&id).cloned();
@@ -785,6 +794,7 @@ fn handle_focus_changed(
         return Ok(());
     }
 
+    tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_focus_changed");
     let input = ctx.input_stats.snapshot();
     let jiggler = ctx.input_stats.jiggler_detected();
     let focus_start = state.focus_start;
@@ -902,6 +912,7 @@ fn flush_on_disconnect(
         .and_then(|id| state.windows.get(&id))
         .cloned();
     if let Some(ref info) = info {
+        tracing::debug!(target: "input_debug", "SNAPSHOT caller: flush_on_disconnect");
         let input = input_stats.snapshot();
         let jiggler = input_stats.jiggler_detected();
         if let Err(e) = flush_session(
@@ -1105,10 +1116,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     println!("Press Ctrl+C to stop gracefully\n");
 
     loop {
-        let input = input_stats.snapshot();
-        let jiggler = input_stats.jiggler_detected();
-
-        if handle_shutdown(&shutdown, &mut state, &flush_ctx, &input, jiggler)? {
+        if handle_shutdown(&shutdown, &mut state, &flush_ctx, &input_stats)? {
             return Ok(());
         }
 
