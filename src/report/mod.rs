@@ -107,15 +107,21 @@ impl TimeRange {
                 TimeBounds::closed(config, e - chrono::Duration::days(*d as i64 - 1), e)
             }
             TimeRange::LastWeek => {
-                let m =
-                    today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
-                let s = m - chrono::Duration::days(7);
-                TimeBounds::closed(config, s, s + chrono::Duration::days(6))
+                // Week runs Saturday 00:00:00 → Friday 23:59:59 (Josh's reporting schedule)
+                let days_since_saturday = (today.weekday().num_days_from_monday() as i64 + 2) % 7;
+                let this_saturday = today - chrono::Duration::days(days_since_saturday);
+                let last_saturday = this_saturday - chrono::Duration::days(7);
+                TimeBounds::closed(
+                    config,
+                    last_saturday,
+                    last_saturday + chrono::Duration::days(6),
+                )
             }
             TimeRange::ThisWeek => {
-                let m =
-                    today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
-                TimeBounds::open(config, m, today, now_str)
+                // Week runs Saturday 00:00:00 → Friday 23:59:59 (Josh's reporting schedule)
+                let days_since_saturday = (today.weekday().num_days_from_monday() as i64 + 2) % 7;
+                let this_saturday = today - chrono::Duration::days(days_since_saturday);
+                TimeBounds::open(config, this_saturday, today, now_str)
             }
             TimeRange::LastMonth => {
                 let ft = today

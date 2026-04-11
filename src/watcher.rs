@@ -21,6 +21,7 @@ use crate::error::Error;
 use crate::fmt::{cat_colored, cat_label, fmt_duration_compact, truncate};
 use crate::input::{InputSnapshot, start_idle_monitor};
 use crate::logind::start_logind_monitor;
+use crate::scheduler::check_scheduled_reports;
 
 // Duration constants
 const FLUSH_INTERVAL_SECS: u64 = 300; // 5 minutes
@@ -175,6 +176,7 @@ struct WatchState {
     last_heartbeat_value: u64,
     last_heartbeat_check: Instant,
     input_thread_warned: bool,
+    last_schedule_check: Instant,
 }
 
 impl WatchState {
@@ -201,6 +203,7 @@ impl WatchState {
             last_heartbeat_value: 0,
             last_heartbeat_check: now_instant,
             input_thread_warned: false,
+            last_schedule_check: now_instant,
         }
     }
 
@@ -1162,6 +1165,14 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             now_instant,
             quiet,
         )?;
+
+        // Check scheduled reports every 5 minutes (piggybacks on flush interval)
+        if now_instant.duration_since(state.last_schedule_check)
+            >= Duration::from_secs(FLUSH_INTERVAL_SECS)
+        {
+            state.last_schedule_check = now_instant;
+            check_scheduled_reports(&conn, &config, quiet);
+        }
 
         let event = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(ev) => Some(ev),

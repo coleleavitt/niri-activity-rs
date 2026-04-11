@@ -7,6 +7,7 @@ mod fmt;
 mod input;
 mod logind;
 mod report;
+mod scheduler;
 mod theme;
 mod tui;
 mod watcher;

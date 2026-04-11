@@ -201,6 +201,26 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         );
     }
 
+    if !applied.contains(&"007_add_sent_reports".to_string()) {
+        let tx = conn.transaction()?;
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS sent_reports (
+                id INTEGER PRIMARY KEY,
+                period_type TEXT NOT NULL,
+                period_key TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                UNIQUE(period_type, period_key)
+            )",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
+            params!["007_add_sent_reports", Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        tracing::info!("Migration 007: added sent_reports table for automated scheduling");
+    }
+
     if !applied.contains(&"006_add_granular_input_metrics".to_string()) {
         let tx = conn.transaction()?;
         tx.execute(
