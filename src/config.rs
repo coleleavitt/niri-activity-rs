@@ -871,11 +871,15 @@ impl Config {
     }
 
     fn app_category(&self, app_id: &str) -> Option<Category> {
-        if let Some(&cat) = self.categories.get(app_id) {
-            return Some(cat);
-        }
+        // Exact match first (case-insensitive) so specific keys beat globs.
         for (pattern, &cat) in &self.categories {
-            if pattern.contains('*') && glob_match(pattern, app_id) {
+            if !pattern.contains('*') && pattern.eq_ignore_ascii_case(app_id) {
+                return Some(cat);
+            }
+        }
+        let app_id_lower = app_id.to_lowercase();
+        for (pattern, &cat) in &self.categories {
+            if pattern.contains('*') && glob_match(pattern, &app_id_lower) {
                 return Some(cat);
             }
         }
