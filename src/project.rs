@@ -7,7 +7,7 @@
 //! - OpenCode titles: `"OC | task description"` or plain `"OpenCode"`
 //! - Filesystem-based detection by walking up to project root markers
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Project root marker files/directories (inspired by wakatime's approach).
 const PROJECT_MARKERS: &[&str] = &[
@@ -124,6 +124,74 @@ fn try_parse_shell_prompt(title: &str) -> Option<Option<String>> {
     Some(Some(dir.to_string()))
 }
 
+/// Detect project from non-terminal app window titles based on app_id.
+///
+/// Handles:
+/// - JetBrains IDEs: `"project – file.rs"` or `"project [~/path] – file.rs –
+///   IDE Name"`
+/// - VSCode: `"file.rs - project - Visual Studio Code"`
+pub fn detect_project_from_app_title(app_id: &str, title: &str) -> Option<String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return None;
+    }
+
+    match app_id {
+        // JetBrains IDEs: "project – file.rs" or "project [path] – file.rs – IDE Name"
+        s if s.starts_with("jetbrains-") => parse_jetbrains_title(title),
+
+        // VSCode: "file.rs - project - Visual Studio Code"
+        "code" | "Code" | "code-oss" => parse_vscode_title(title),
+
+        _ => None,
+    }
+}
+
+fn parse_jetbrains_title(title: &str) -> Option<String> {
+    // JetBrains uses " – " (en-dash) or " - " as separator
+    // Pattern: "project_name – file.rs" or "project_name [~/path/to/project] – ..."
+    // The project name is always the first segment
+    let separator = if title.contains(" \u{2013} ") {
+        " \u{2013} "
+    } else {
+        " - "
+    };
+    let first = title.split(separator).next()?.trim();
+
+    // Strip any path annotation like "[~/path]"
+    let name = if let Some(bracket) = first.find(" [") {
+        &first[..bracket]
+    } else {
+        first
+    };
+
+    let name = name.trim();
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn parse_vscode_title(title: &str) -> Option<String> {
+    // Pattern: "file.rs - project_name - Visual Studio Code"
+    // Or: "project_name - Visual Studio Code"
+    let parts: Vec<&str> = title.split(" - ").collect();
+    if parts.len() >= 3 {
+        // Second-to-last is project (last is "Visual Studio Code")
+        let project = parts[parts.len() - 2].trim();
+        if !project.is_empty() && !project.contains('/') {
+            return Some(project.to_string());
+        }
+    } else if parts.len() == 2 {
+        // "project_name - Visual Studio Code"
+        let project = parts[0].trim();
+        if !project.is_empty() && !project.contains('/') && !project.contains('.') {
+            return Some(project.to_string());
+        }
+    }
+    None
+}
+
 /// Detect a project by walking up from the given path looking for project root
 /// markers.
 ///
@@ -151,6 +219,70 @@ pub fn detect_project_from_path(path: &Path) -> Option<String> {
         }
     }
 
+    None
+}
+
+/// Detect the current git branch by reading .git/HEAD directly.
+/// Much faster than shelling out to `git rev-parse`.
+pub fn detect_git_branch(path: &Path) -> Option<String> {
+    // Walk up to find .git directory
+    let mut dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+
+    loop {
+        let git_dir = dir.join(".git");
+        if git_dir.exists() {
+            // Read .git/HEAD
+            let head_path = if git_dir.is_file() {
+                // Worktree: .git is a file with "gitdir: /path/to/real/.git/worktrees/name"
+                let content = std::fs::read_to_string(&git_dir).ok()?;
+                let gitdir = content.strip_prefix("gitdir: ")?.trim();
+                PathBuf::from(gitdir).join("HEAD")
+            } else {
+                git_dir.join("HEAD")
+            };
+
+            let head_content = std::fs::read_to_string(&head_path).ok()?;
+            let trimmed = head_content.trim();
+
+            // "ref: refs/heads/branch-name" → "branch-name"
+            if let Some(ref_path) = trimmed.strip_prefix("ref: refs/heads/") {
+                return Some(ref_path.to_string());
+            }
+            // Detached HEAD (commit hash) → first 8 chars
+            if trimmed.len() >= 8 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(trimmed[..8].to_string());
+            }
+            return None;
+        }
+
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Given a short directory basename (e.g. "jfc") and a list of search
+/// directories, try to find the full path and validate it's a real project (has
+/// .git, Cargo.toml, etc). Returns the validated project name (possibly the
+/// basename itself if found).
+pub fn resolve_project_in_search_dirs(basename: &str, search_dirs: &[PathBuf]) -> Option<String> {
+    for dir in search_dirs {
+        let candidate = dir.join(basename);
+        if candidate.is_dir() {
+            // Use detect_project_from_path to validate it's actually a project
+            if let Some(name) = detect_project_from_path(&candidate) {
+                return Some(name);
+            }
+            // Even without markers, if the directory exists in a search_dir, trust it
+            return Some(basename.to_string());
+        }
+    }
     None
 }
 
@@ -249,6 +381,92 @@ mod tests {
         assert_eq!(detect_project_from_title("Firefox"), None);
     }
 
+    // ─── detect_project_from_app_title ───────────────────────────────────
+
+    #[test]
+    fn jetbrains_rustrover_simple_title() {
+        assert_eq!(
+            detect_project_from_app_title(
+                "jetbrains-rustrover",
+                "niri-activity-rs \u{2013} config.rs"
+            ),
+            Some("niri-activity-rs".to_string())
+        );
+    }
+
+    #[test]
+    fn jetbrains_idea_with_path() {
+        assert_eq!(
+            detect_project_from_app_title(
+                "jetbrains-idea",
+                "my-project [~/work/my-project] \u{2013} Main.java \u{2013} IntelliJ IDEA"
+            ),
+            Some("my-project".to_string())
+        );
+    }
+
+    #[test]
+    fn vscode_three_parts() {
+        assert_eq!(
+            detect_project_from_app_title("code", "main.rs - my-project - Visual Studio Code"),
+            Some("my-project".to_string())
+        );
+    }
+
+    #[test]
+    fn vscode_code_oss() {
+        assert_eq!(
+            detect_project_from_app_title(
+                "code-oss",
+                "lib.rs - rust-analyzer - Visual Studio Code"
+            ),
+            Some("rust-analyzer".to_string())
+        );
+    }
+
+    #[test]
+    fn vscode_two_parts_project_only() {
+        assert_eq!(
+            detect_project_from_app_title("code", "my-project - Visual Studio Code"),
+            Some("my-project".to_string())
+        );
+    }
+
+    #[test]
+    fn vscode_two_parts_file_ignored() {
+        // "file.rs - Visual Studio Code" → None (has a dot, looks like a file)
+        assert_eq!(
+            detect_project_from_app_title("code", "file.rs - Visual Studio Code"),
+            None
+        );
+    }
+
+    #[test]
+    fn non_project_app_vesktop() {
+        assert_eq!(
+            detect_project_from_app_title("vesktop", "Discord | Server - Channel"),
+            None
+        );
+    }
+
+    #[test]
+    fn non_project_app_browser() {
+        assert_eq!(
+            detect_project_from_app_title("zen", "GitHub - user/repo"),
+            None
+        );
+    }
+
+    #[test]
+    fn app_title_empty() {
+        assert_eq!(detect_project_from_app_title("code", ""), None);
+    }
+
+    #[test]
+    fn app_title_whitespace() {
+        assert_eq!(detect_project_from_app_title("jetbrains-idea", "   "), None);
+    }
+
     // ─── detect_project_from_path ────────────────────────────────────────
 
     #[test]
@@ -327,5 +545,84 @@ mod tests {
 
         let result = detect_project_from_path(&file_path);
         assert_eq!(result, Some("file-test".to_string()));
+    }
+
+    // ─── detect_git_branch ───────────────────────────────────────────────
+
+    #[test]
+    fn detects_branch_from_git_head() {
+        let tmp = TempDir::new().unwrap();
+        let project_dir = tmp.path().join("branch-test");
+        fs::create_dir_all(project_dir.join(".git")).unwrap();
+        fs::write(project_dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let result = detect_git_branch(&project_dir);
+        assert_eq!(result, Some("main".to_string()));
+    }
+
+    #[test]
+    fn detects_branch_from_subdirectory() {
+        let tmp = TempDir::new().unwrap();
+        let project_dir = tmp.path().join("sub-branch");
+        fs::create_dir_all(project_dir.join(".git")).unwrap();
+        fs::create_dir_all(project_dir.join("src/lib")).unwrap();
+        fs::write(
+            project_dir.join(".git/HEAD"),
+            "ref: refs/heads/feature/my-feature\n",
+        )
+        .unwrap();
+
+        let result = detect_git_branch(&project_dir.join("src/lib"));
+        assert_eq!(result, Some("feature/my-feature".to_string()));
+    }
+
+    #[test]
+    fn detects_detached_head() {
+        let tmp = TempDir::new().unwrap();
+        let project_dir = tmp.path().join("detached-test");
+        fs::create_dir_all(project_dir.join(".git")).unwrap();
+        fs::write(
+            project_dir.join(".git/HEAD"),
+            "a1b2c3d4e5f6789012345678901234567890abcd\n",
+        )
+        .unwrap();
+
+        let result = detect_git_branch(&project_dir);
+        assert_eq!(result, Some("a1b2c3d4".to_string()));
+    }
+
+    #[test]
+    fn detects_branch_from_worktree() {
+        let tmp = TempDir::new().unwrap();
+        // Set up a fake worktree structure
+        let main_git = tmp.path().join("main-repo/.git");
+        fs::create_dir_all(main_git.join("worktrees/my-wt")).unwrap();
+        fs::write(
+            main_git.join("worktrees/my-wt/HEAD"),
+            "ref: refs/heads/worktree-branch\n",
+        )
+        .unwrap();
+
+        // The worktree directory has a .git file pointing to the worktree gitdir
+        let wt_dir = tmp.path().join("worktree-dir");
+        fs::create_dir_all(&wt_dir).unwrap();
+        fs::write(
+            wt_dir.join(".git"),
+            format!("gitdir: {}\n", main_git.join("worktrees/my-wt").display()),
+        )
+        .unwrap();
+
+        let result = detect_git_branch(&wt_dir);
+        assert_eq!(result, Some("worktree-branch".to_string()));
+    }
+
+    #[test]
+    fn returns_none_when_no_git() {
+        let tmp = TempDir::new().unwrap();
+        let project_dir = tmp.path().join("no-git");
+        fs::create_dir_all(project_dir.join("src")).unwrap();
+
+        let result = detect_git_branch(&project_dir.join("src"));
+        assert_eq!(result, None);
     }
 }

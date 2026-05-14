@@ -17,6 +17,7 @@ pub struct SessionSnapshot<'a> {
     pub jiggler_detected: bool,
     pub input_offsets: Vec<u32>,
     pub project: Option<String>,
+    pub git_branch: Option<String>,
 }
 
 /// Initialize the database schema and pragmas for optimal performance.
@@ -279,6 +280,17 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         tracing::info!("Migration 008: added project column and index");
     }
 
+    if !applied.contains(&"009_add_git_branch_column".to_string()) {
+        let tx = conn.transaction()?;
+        tx.execute("ALTER TABLE events ADD COLUMN git_branch TEXT", [])?;
+        tx.execute(
+            "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
+            params!["009_add_git_branch_column", Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        tracing::info!("Migration 009: added git_branch column");
+    }
+
     Ok(())
 }
 
@@ -361,8 +373,8 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
             keystrokes, mouse_clicks, scroll_events, mouse_distance,
             jiggler_detected, input_offsets,
             backspace_count, modifier_count, left_clicks, right_clicks, middle_clicks,
-            scroll_up, scroll_down, scroll_horizontal, project
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+            scroll_up, scroll_down, scroll_horizontal, project, git_branch
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             snapshot.focus_start.to_rfc3339(),
             &snapshot.window.app_id,
@@ -386,6 +398,7 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
             i64::try_from(snapshot.input.scroll_down).unwrap_or(i64::MAX),
             i64::try_from(snapshot.input.scroll_horizontal).unwrap_or(i64::MAX),
             snapshot.project.as_deref(),
+            snapshot.git_branch.as_deref(),
         ],
     )?;
     Ok(())

@@ -98,6 +98,7 @@ fn color_state(state: ActivityState) -> String {
 pub struct WindowInfo {
     pub app_id: String,
     pub title: String,
+    pub pid: Option<i32>,
 }
 
 impl From<&Window> for WindowInfo {
@@ -105,6 +106,7 @@ impl From<&Window> for WindowInfo {
         Self {
             app_id: w.app_id.as_deref().unwrap_or("unknown").to_owned(),
             title: w.title.as_deref().unwrap_or_default().to_owned(),
+            pid: w.pid,
         }
     }
 }
@@ -948,17 +950,80 @@ fn flush_on_disconnect(
 /// stale.
 const PWD_FILE_FRESHNESS_SECS: u64 = 30;
 
-/// Detect the current project by checking the shell pwd file first, then
-/// falling back to window title parsing. Applies project aliases from config.
-fn detect_project(config: &Config, title: &str) -> Option<String> {
-    // 1. Try reading the pwd file written by shell hooks
-    let detected = pwd_file_project().or_else(|| {
-        // 2. Fall back to title-based detection
-        project::detect_project_from_title(title)
-    });
+/// Detect the current project by checking /proc/PID/cwd first, then the shell
+/// pwd file, then window title parsing. Applies project aliases from config.
+fn detect_project(config: &Config, app_id: &str, title: &str, pid: Option<i32>) -> Option<String> {
+    // 1. Try /proc/PID/cwd (most reliable — no shell hook needed, always current)
+    if let Some(project) = proc_cwd_project(pid) {
+        return Some(apply_alias(config, project));
+    }
 
-    // 3. Apply alias mapping if configured
-    detected.map(|name| config.project_aliases.get(&name).cloned().unwrap_or(name))
+    // 2. Try reading the pwd file written by shell hooks
+    if let Some(project) = pwd_file_project() {
+        return Some(apply_alias(config, project));
+    }
+
+    // 3. Title-based detection (terminal patterns)
+    if let Some(name) = project::detect_project_from_title(title) {
+        // If it's a simple basename (no "OC:" prefix, no spaces),
+        // try to resolve via search_dirs for validation
+        if !name.contains(':') && !name.contains(' ') && !config.project_search_dirs.is_empty() {
+            if let Some(resolved) =
+                project::resolve_project_in_search_dirs(&name, &config.project_search_dirs)
+            {
+                return Some(apply_alias(config, resolved));
+            }
+        }
+        return Some(apply_alias(config, name));
+    }
+
+    // 4. Try app-specific title parsing (IDEs, editors)
+    if let Some(name) = project::detect_project_from_app_title(app_id, title) {
+        return Some(apply_alias(config, name));
+    }
+
+    None
+}
+
+/// Apply project alias mapping from config, falling back to the original name.
+fn apply_alias(config: &Config, name: String) -> String {
+    config.project_aliases.get(&name).cloned().unwrap_or(name)
+}
+
+/// Try to detect a project from /proc/PID/cwd of the terminal's child shell.
+/// Walks the process tree to find the deepest child with a project-bearing cwd.
+fn proc_cwd_project(pid: Option<i32>) -> Option<String> {
+    let pid = pid?;
+
+    // Find the deepest child process (terminal → shell → maybe inner process)
+    let leaf_pid = find_leaf_child(pid);
+
+    // Read the child's cwd via /proc
+    let cwd = fs::read_link(format!("/proc/{}/cwd", leaf_pid)).ok()?;
+    project::detect_project_from_path(&cwd)
+}
+
+/// Walk the process tree to find the deepest (leaf) child.
+/// Stops at depth 5 to avoid infinite loops with process forks.
+fn find_leaf_child(pid: i32) -> i32 {
+    let mut current = pid;
+    for _ in 0..5 {
+        let children_path = format!("/proc/{}/task/{}/children", current, current);
+        let children = match fs::read_to_string(&children_path) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        // Take the first child PID
+        match children
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<i32>().ok())
+        {
+            Some(child) => current = child,
+            None => break,
+        }
+    }
+    current
 }
 
 /// Attempt to detect a project from the shell hook's pwd file.
@@ -986,6 +1051,42 @@ fn pwd_file_project() -> Option<String> {
     project::detect_project_from_path(Path::new(trimmed))
 }
 
+/// Detect the git branch from the shell hook's pwd file path.
+/// Uses the same pwd file as project detection for consistency.
+fn detect_branch_from_pwd(pid: Option<i32>) -> Option<String> {
+    // 1. Try /proc/PID/cwd first
+    if let Some(pid) = pid {
+        let leaf = find_leaf_child(pid);
+        if let Ok(cwd) = fs::read_link(format!("/proc/{}/cwd", leaf)) {
+            if let Some(branch) = project::detect_git_branch(&cwd) {
+                return Some(branch);
+            }
+        }
+    }
+
+    // 2. Fall back to pwd file
+    let data_dir = get_data_dir().ok()?;
+    let pwd_path = data_dir.join("current_pwd");
+
+    // Check file freshness (same threshold as project detection)
+    let metadata = fs::metadata(&pwd_path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::from_secs(u64::MAX));
+    if age.as_secs() > PWD_FILE_FRESHNESS_SECS {
+        return None;
+    }
+
+    let contents = fs::read_to_string(&pwd_path).ok()?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    project::detect_git_branch(Path::new(trimmed))
+}
+
 ///
 /// If `info` is `None`, the database insert is skipped but resets still apply
 /// (needed for enter-away when no window is focused).
@@ -1008,7 +1109,8 @@ fn flush_session(
             ctx.quiet,
         );
 
-        let detected_project = detect_project(ctx.config, &info.title);
+        let detected_project = detect_project(ctx.config, &info.app_id, &info.title, info.pid);
+        let git_branch = detect_branch_from_pwd(info.pid);
 
         insert_event(
             ctx.conn,
@@ -1023,6 +1125,7 @@ fn flush_session(
                 jiggler_detected: jiggler,
                 input_offsets: std::mem::take(accum.input_offsets),
                 project: detected_project,
+                git_branch,
             },
         )?;
     }
