@@ -23,6 +23,8 @@ fn bash_hook() -> String {
     r#"# niri-activity-rs shell integration
 __niri_activity_prompt_command() {
     printf '%s\n' "$PWD" > "${XDG_DATA_HOME:-$HOME/.local/share}/niri-activity-rs/current_pwd"
+    # Set terminal title to user@host full_path for accurate project detection
+    printf '\033]0;%s@%s %s\007' "$USER" "${HOSTNAME%%.*}" "$PWD"
 }
 if [[ "$PROMPT_COMMAND" != *"__niri_activity_prompt_command"* ]]; then
     PROMPT_COMMAND="__niri_activity_prompt_command;${PROMPT_COMMAND:+ $PROMPT_COMMAND}"
@@ -35,6 +37,8 @@ fn zsh_hook() -> String {
     r#"# niri-activity-rs shell integration
 __niri_activity_precmd() {
     printf '%s\n' "$PWD" > "${XDG_DATA_HOME:-$HOME/.local/share}/niri-activity-rs/current_pwd"
+    # Set terminal title to user@host full_path for accurate project detection
+    printf '\033]0;%s@%s %s\007' "$USER" "${HOST%%.*}" "$PWD"
 }
 if [[ "$precmd_functions" != *"__niri_activity_precmd"* ]]; then
     precmd_functions+=(__niri_activity_precmd)

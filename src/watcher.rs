@@ -969,19 +969,17 @@ fn detect_project(config: &Config, app_id: &str, title: &str, pid: Option<i32>) 
         if name.contains(':') || name.contains(' ') {
             return Some(apply_alias(config, name));
         }
-        // Simple basenames must resolve in search_dirs (if configured) to avoid
-        // random directories like ~/desktop, ~/extracted being reported as projects
+        // Simple basenames: try to validate via search_dirs if configured
         if !config.project_search_dirs.is_empty() {
             if let Some(resolved) =
                 project::resolve_project_in_search_dirs(&name, &config.project_search_dirs)
             {
                 return Some(apply_alias(config, resolved));
             }
-            // Not found in search_dirs — don't report as project
-        } else {
-            // No search_dirs configured — accept as-is (legacy behavior)
-            return Some(apply_alias(config, name));
         }
+        // Accept the name — it came from detect_project_from_path (full path titles)
+        // or is a legitimate basename from a shell prompt
+        return Some(apply_alias(config, name));
     }
 
     // 4. Try app-specific title parsing (IDEs, editors)

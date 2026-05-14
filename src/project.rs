@@ -102,7 +102,8 @@ fn strip_jfc_status_prefix(title: &str) -> &str {
 /// Try to parse a shell prompt title like "user@host directory".
 ///
 /// Returns `Some(Some(project))` for a valid project directory,
-/// `Some(None)` for home dir `~`, and `None` if the pattern doesn't match.
+/// `Some(None)` for home dir `~` or `/home/user`, and `None` if the pattern
+/// doesn't match.
 fn try_parse_shell_prompt(title: &str) -> Option<Option<String>> {
     // Must contain @ for user@host pattern
     let at_pos = title.find('@')?;
@@ -121,6 +122,20 @@ fn try_parse_shell_prompt(title: &str) -> Option<Option<String>> {
         return Some(None);
     }
 
+    // Full path: try to detect the project from the filesystem
+    if dir.starts_with('/') {
+        let path = Path::new(dir);
+        // Skip if it's the home directory itself
+        if let Some(home) = dirs::home_dir() {
+            if path == home {
+                return Some(None);
+            }
+        }
+        // Use detect_project_from_path for proper git-root walking
+        return Some(detect_project_from_path(path));
+    }
+
+    // Short basename (legacy behavior) — return as-is
     Some(Some(dir.to_string()))
 }
 
@@ -631,6 +646,27 @@ mod tests {
         fs::create_dir_all(project_dir.join("src")).unwrap();
 
         let result = detect_git_branch(&project_dir.join("src"));
+        assert_eq!(result, None);
+    }
+}
+
+#[cfg(test)]
+mod path_title_tests {
+    use super::*;
+
+    #[test]
+    fn shell_prompt_full_path_resolves_project() {
+        // This test only works if the path actually exists on the system
+        let title = "cole@gentoo-thinkpad /home/cole/RustProjects/active/niri-activity-rs";
+        let result = detect_project_from_title(title);
+        // Should resolve to "niri-activity-rs" via detect_project_from_path
+        assert_eq!(result, Some("niri-activity-rs".to_string()));
+    }
+
+    #[test]
+    fn shell_prompt_full_path_home_dir() {
+        let title = "cole@gentoo-thinkpad /home/cole";
+        let result = detect_project_from_title(title);
         assert_eq!(result, None);
     }
 }
