@@ -196,8 +196,9 @@ fn parse_vscode_title(title: &str) -> Option<String> {
 /// markers.
 ///
 /// Returns the directory name of the project root, or `None` if no markers
-/// found.
+/// found. Excludes the user's home directory as a false positive.
 pub fn detect_project_from_path(path: &Path) -> Option<String> {
+    let home = dirs::home_dir();
     let mut dir = if path.is_dir() {
         path.to_path_buf()
     } else {
@@ -205,6 +206,13 @@ pub fn detect_project_from_path(path: &Path) -> Option<String> {
     };
 
     loop {
+        // Skip home directory — it often has stray package.json/.git
+        if let Some(ref h) = home {
+            if dir == *h {
+                break;
+            }
+        }
+
         for marker in PROJECT_MARKERS {
             if dir.join(marker).exists() {
                 return dir.file_name()?.to_str().map(|s| s.to_string());

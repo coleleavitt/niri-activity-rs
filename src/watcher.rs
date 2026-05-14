@@ -965,16 +965,23 @@ fn detect_project(config: &Config, app_id: &str, title: &str, pid: Option<i32>) 
 
     // 3. Title-based detection (terminal patterns)
     if let Some(name) = project::detect_project_from_title(title) {
-        // If it's a simple basename (no "OC:" prefix, no spaces),
-        // try to resolve via search_dirs for validation
-        if !name.contains(':') && !name.contains(' ') && !config.project_search_dirs.is_empty() {
+        // OC sessions and compound names always pass through
+        if name.contains(':') || name.contains(' ') {
+            return Some(apply_alias(config, name));
+        }
+        // Simple basenames must resolve in search_dirs (if configured) to avoid
+        // random directories like ~/desktop, ~/extracted being reported as projects
+        if !config.project_search_dirs.is_empty() {
             if let Some(resolved) =
                 project::resolve_project_in_search_dirs(&name, &config.project_search_dirs)
             {
                 return Some(apply_alias(config, resolved));
             }
+            // Not found in search_dirs — don't report as project
+        } else {
+            // No search_dirs configured — accept as-is (legacy behavior)
+            return Some(apply_alias(config, name));
         }
-        return Some(apply_alias(config, name));
     }
 
     // 4. Try app-specific title parsing (IDEs, editors)
