@@ -16,6 +16,7 @@ pub struct SessionSnapshot<'a> {
     pub input: InputSnapshot,
     pub jiggler_detected: bool,
     pub input_offsets: Vec<u32>,
+    pub project: Option<String>,
 }
 
 /// Initialize the database schema and pragmas for optimal performance.
@@ -263,6 +264,21 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         tracing::info!("Migration 006: added granular input metrics columns");
     }
 
+    if !applied.contains(&"008_add_project_column".to_string()) {
+        let tx = conn.transaction()?;
+        tx.execute("ALTER TABLE events ADD COLUMN project TEXT", [])?;
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_project ON events(project)",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
+            params!["008_add_project_column", Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        tracing::info!("Migration 008: added project column and index");
+    }
+
     Ok(())
 }
 
@@ -345,8 +361,8 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
             keystrokes, mouse_clicks, scroll_events, mouse_distance,
             jiggler_detected, input_offsets,
             backspace_count, modifier_count, left_clicks, right_clicks, middle_clicks,
-            scroll_up, scroll_down, scroll_horizontal
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            scroll_up, scroll_down, scroll_horizontal, project
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
         params![
             snapshot.focus_start.to_rfc3339(),
             &snapshot.window.app_id,
@@ -369,6 +385,7 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
             i64::try_from(snapshot.input.scroll_up).unwrap_or(i64::MAX),
             i64::try_from(snapshot.input.scroll_down).unwrap_or(i64::MAX),
             i64::try_from(snapshot.input.scroll_horizontal).unwrap_or(i64::MAX),
+            snapshot.project.as_deref(),
         ],
     )?;
     Ok(())
@@ -508,4 +525,108 @@ pub fn reclassify_with_thresholds(
     tx.commit()?;
 
     Ok((updated, total_rows))
+}
+
+/// Terminal app IDs that may contain project info in their window titles.
+const TERMINAL_APP_IDS: &[&str] = &[
+    "Alacritty",
+    "kitty",
+    "foot",
+    "org.wezfurlong.wezterm",
+    "wezterm",
+    "alacritty",
+    "org.codeberg.dnkl.foot",
+];
+
+/// Backfill the `project` column for terminal events that have NULL project.
+///
+/// Processes rows in batches for performance, applying
+/// `detect_project_from_title` and optional project aliases. Returns
+/// (total_candidates, detected_count).
+pub fn backfill_projects(
+    conn: &mut Connection,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Result<(i64, i64), Error> {
+    use crate::project::detect_project_from_title;
+
+    // Build the IN clause for terminal apps
+    let placeholders: String = TERMINAL_APP_IDS
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM events WHERE project IS NULL AND app_id IN ({})",
+        placeholders
+    );
+
+    let total: i64 = {
+        let mut stmt = conn.prepare(&count_sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = TERMINAL_APP_IDS
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+        stmt.query_row(params.as_slice(), |row| row.get(0))?
+    };
+
+    if total == 0 {
+        println!("No terminal events with NULL project found. Nothing to backfill.");
+        return Ok((0, 0));
+    }
+
+    println!("Found {} terminal events with NULL project", total);
+
+    let select_sql = format!(
+        "SELECT id, title FROM events WHERE project IS NULL AND app_id IN ({}) ORDER BY id",
+        placeholders
+    );
+
+    // Read all candidate rows (id, title)
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(&select_sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = TERMINAL_APP_IDS
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+        stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut detected: i64 = 0;
+    let mut processed: i64 = 0;
+    let batch_size = 1000;
+
+    for chunk in rows.chunks(batch_size) {
+        let tx = conn.transaction()?;
+        for (id, title) in chunk {
+            if let Some(mut project) = detect_project_from_title(title) {
+                // Apply aliases
+                if let Some(alias) = aliases.get(&project) {
+                    project = alias.clone();
+                }
+                tx.execute(
+                    "UPDATE events SET project = ?1 WHERE id = ?2",
+                    params![project, id],
+                )?;
+                detected += 1;
+            }
+            processed += 1;
+        }
+        tx.commit()?;
+
+        // Print progress every batch
+        println!(
+            "Backfilled {} of {} events ({} with project detected)",
+            processed, total, detected
+        );
+    }
+
+    Ok((total, detected))
 }

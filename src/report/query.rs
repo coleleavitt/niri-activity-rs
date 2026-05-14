@@ -9,8 +9,8 @@ use rusqlite::{Connection, params};
 use super::types::{
     AppBreakdown, AppGroup, AwayData, CategoryBreakdown, DailyBreakdown, FatigueIndicators,
     FatigueTrend, FlowQuality, FlowSession, FlowSummary, FocusStreak, GapEntry, GapSummary,
-    GapType, HourBreakdown, HourlyErrorRate, InputMetrics, ReportData, ScheduleBreakdown,
-    StreakSummary, TimelineBucket, TimelineData, TodayData, TodayRow,
+    GapType, HourBreakdown, HourlyErrorRate, InputMetrics, ProjectBreakdown, ReportData,
+    ScheduleBreakdown, StreakSummary, TimelineBucket, TimelineData, TodayData, TodayRow,
 };
 use super::{
     App, MIN_STREAK_MS, MS_PER_HOUR, MS_PER_MIN, TimeRange, UNTIL_SENTINEL, day_end_utc,
@@ -273,6 +273,35 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         group_apps(flat, 15)
     };
 
+    let projects: Vec<ProjectBreakdown> = {
+        let mut stmt = app.conn.prepare(
+            "SELECT project, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(keystrokes), SUM(mouse_clicks)
+             FROM events WHERE timestamp >= ?1 AND timestamp < ?2 AND project IS NOT NULL
+             GROUP BY project ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC LIMIT 15"
+        )?;
+        stmt.query_map(params![since_utc, until_utc], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(
+            |(project, total_ms, active_ms, keys, clicks)| ProjectBreakdown {
+                project,
+                total_ms,
+                active_ms,
+                keys,
+                clicks,
+            },
+        )
+        .collect()
+    };
+
     struct RawRow {
         timestamp: String,
         active_ms: i64,
@@ -424,6 +453,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         jiggler_count,
         categories,
         top_apps,
+        projects,
         daily,
         peak_hours,
         schedule,
@@ -1220,6 +1250,7 @@ mod tests {
             "ALTER TABLE events ADD COLUMN scroll_horizontal INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+        conn.execute("ALTER TABLE events ADD COLUMN project TEXT", [])?;
         Ok(conn)
     }
 

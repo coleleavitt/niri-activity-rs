@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+use std::{fs, thread};
 
 use backon::{BlockingRetryable, ExponentialBuilder};
 use chrono::{Local, Utc};
@@ -21,6 +22,7 @@ use crate::error::Error;
 use crate::fmt::{cat_colored, cat_label, fmt_duration_compact, truncate};
 use crate::input::{InputSnapshot, start_idle_monitor};
 use crate::logind::start_logind_monitor;
+use crate::project;
 use crate::scheduler::check_scheduled_reports;
 
 // Duration constants
@@ -942,6 +944,48 @@ fn flush_on_disconnect(
 
 /// Flush the current session: reclassify false-active time, insert the DB
 /// event, and optionally reset accumulators based on `reset` mode.
+/// Maximum age of the pwd file (written by shell hooks) before we consider it
+/// stale.
+const PWD_FILE_FRESHNESS_SECS: u64 = 30;
+
+/// Detect the current project by checking the shell pwd file first, then
+/// falling back to window title parsing. Applies project aliases from config.
+fn detect_project(config: &Config, title: &str) -> Option<String> {
+    // 1. Try reading the pwd file written by shell hooks
+    let detected = pwd_file_project().or_else(|| {
+        // 2. Fall back to title-based detection
+        project::detect_project_from_title(title)
+    });
+
+    // 3. Apply alias mapping if configured
+    detected.map(|name| config.project_aliases.get(&name).cloned().unwrap_or(name))
+}
+
+/// Attempt to detect a project from the shell hook's pwd file.
+/// Returns None if the file is missing, stale (>30s), or detection fails.
+fn pwd_file_project() -> Option<String> {
+    let data_dir = get_data_dir().ok()?;
+    let pwd_path = data_dir.join("current_pwd");
+
+    // Check file freshness
+    let metadata = fs::metadata(&pwd_path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::from_secs(u64::MAX));
+    if age.as_secs() > PWD_FILE_FRESHNESS_SECS {
+        return None;
+    }
+
+    let contents = fs::read_to_string(&pwd_path).ok()?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    project::detect_project_from_path(Path::new(trimmed))
+}
+
 ///
 /// If `info` is `None`, the database insert is skipped but resets still apply
 /// (needed for enter-away when no window is focused).
@@ -963,6 +1007,9 @@ fn flush_session(
             ctx.input_active_ms,
             ctx.quiet,
         );
+
+        let detected_project = detect_project(ctx.config, &info.title);
+
         insert_event(
             ctx.conn,
             SessionSnapshot {
@@ -975,6 +1022,7 @@ fn flush_session(
                 input: *input,
                 jiggler_detected: jiggler,
                 input_offsets: std::mem::take(accum.input_offsets),
+                project: detected_project,
             },
         )?;
     }

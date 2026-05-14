@@ -251,6 +251,15 @@ pub struct FatigueIndicators {
 }
 
 #[derive(Serialize)]
+pub struct ProjectBreakdown {
+    pub project: String,
+    pub total_ms: i64,
+    pub active_ms: i64,
+    pub keys: i64,
+    pub clicks: i64,
+}
+
+#[derive(Serialize)]
 pub struct ReportData {
     pub since_str: String,
     pub now_str: String,
@@ -266,6 +275,7 @@ pub struct ReportData {
     pub jiggler_count: i64,
     pub categories: Vec<CategoryBreakdown>,
     pub top_apps: Vec<AppGroup>,
+    pub projects: Vec<ProjectBreakdown>,
     pub daily: Vec<DailyBreakdown>,
     pub peak_hours: Vec<HourBreakdown>,
     pub schedule: Option<ScheduleBreakdown>,

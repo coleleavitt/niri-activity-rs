@@ -425,6 +425,37 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             }
         }
     }
+    if !data.projects.is_empty() {
+        println!(
+            "\n{}",
+            section_header("── Top Projects ──────────────────────────────────────")
+        );
+        let max_proj_ms = data.projects.first().map_or(1, |p| p.total_ms).max(1);
+        for proj in &data.projects {
+            let frac_blocks =
+                (proj.total_ms as f64 / max_proj_ms as f64 * BAR_WIDTH as f64).max(0.125);
+            let bar = cat_bar_fractional(Category::Productive, frac_blocks, BAR_WIDTH);
+            let active_min = proj.active_ms as f64 / MS_PER_MIN as f64;
+            let keys_per_min = if active_min > 0.5 {
+                format!("{:.0}/m", proj.keys as f64 / active_min)
+            } else {
+                "-".to_string()
+            };
+            println!(
+                "  {} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks  ({})",
+                cat_colored(
+                    Category::Productive,
+                    &format!("{:<22}", truncate(&proj.project, 22))
+                ),
+                bar,
+                fmt_duration(proj.total_ms).bold(),
+                proj.keys,
+                keys_per_min.dimmed(),
+                proj.clicks,
+                cat_label(Category::Productive)
+            );
+        }
+    }
     println!(
         "\n{}",
         section_header("── Daily Breakdown ───────────────────────────────────")

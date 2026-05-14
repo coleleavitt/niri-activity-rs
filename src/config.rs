@@ -483,6 +483,15 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
     if total_ms > 0 { Some(total_ms) } else { None }
 }
 
+/// Raw projects configuration (deserialized from TOML).
+#[derive(Debug, Deserialize, Default)]
+struct RawProjectsConfig {
+    #[serde(default)]
+    search_dirs: Vec<String>,
+    #[serde(default)]
+    aliases: HashMap<String, String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default = "default_idle_threshold")]
@@ -520,6 +529,8 @@ struct RawConfig {
     #[serde(default)]
     agent_activity: AgentActivityConfig,
     #[serde(default)]
+    projects: RawProjectsConfig,
+    #[serde(default)]
     categories: HashMap<String, Category>,
     #[serde(default)]
     title_rules: Vec<RawTitleRule>,
@@ -542,6 +553,8 @@ pub struct Config {
     pub jiggler: JigglerConfig,
     pub sleep: SleepConfig,
     pub agent_activity: AgentActivityConfig,
+    pub project_search_dirs: Vec<PathBuf>,
+    pub project_aliases: HashMap<String, String>,
     pub categories: HashMap<String, Category>,
     pub title_rules: Vec<TitleRule>,
 }
@@ -662,6 +675,20 @@ fn default_schedule_days() -> Vec<String> {
     ]
 }
 
+/// Expand a leading `~` in a path string to the user's home directory.
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(base_dirs) = directories::BaseDirs::new() {
+            return base_dirs.home_dir().join(rest);
+        }
+    } else if path == "~" {
+        if let Some(base_dirs) = directories::BaseDirs::new() {
+            return base_dirs.home_dir().to_path_buf();
+        }
+    }
+    PathBuf::from(path)
+}
+
 impl From<RawConfig> for Config {
     fn from(raw: RawConfig) -> Self {
         let title_rules = raw
@@ -702,6 +729,14 @@ impl From<RawConfig> for Config {
             }
         });
 
+        let project_search_dirs = raw
+            .projects
+            .search_dirs
+            .iter()
+            .map(|s| expand_tilde(s))
+            .collect();
+        let project_aliases = raw.projects.aliases;
+
         Self {
             idle_threshold_secs: raw.idle_threshold_secs,
             deep_idle_secs: raw.deep_idle_secs,
@@ -718,6 +753,8 @@ impl From<RawConfig> for Config {
             jiggler: raw.jiggler,
             sleep: raw.sleep,
             agent_activity: raw.agent_activity,
+            project_search_dirs,
+            project_aliases,
             categories: raw.categories,
             title_rules,
         }
@@ -742,6 +779,8 @@ impl Default for Config {
             jiggler: JigglerConfig::default(),
             sleep: SleepConfig::default(),
             agent_activity: AgentActivityConfig::default(),
+            project_search_dirs: Vec::new(),
+            project_aliases: HashMap::new(),
             categories: HashMap::new(),
             title_rules: Vec::new(),
         }
@@ -1188,6 +1227,15 @@ holidays = [
 enabled = false
 daily = "8h"      # Target productive time per day (e.g., "8h", "6h30m")
 weekly = "40h"    # Target productive time per week
+
+# Project detection — map working directories to project names
+[projects]
+# Directories to search for git projects (~ is expanded to home dir)
+search_dirs = ["~/RustProjects/active", "~/projects", "~/work"]
+
+# Manual project name overrides (directory basename → display name)
+[projects.aliases]
+"niri-activity-rs" = "Activity Tracker"
 "#;
 
     fs::write(&config_path, example)?;
@@ -1354,5 +1402,92 @@ mod tests {
             config.classify("Alacritty", "vim spotify-rs/src/main.rs"),
             Category::Neutral
         );
+    }
+
+    #[test]
+    fn projects_config_parses_correctly() {
+        let toml_str = r#"
+[projects]
+search_dirs = ["~/RustProjects/active", "~/projects", "/absolute/path"]
+
+[projects.aliases]
+"niri-activity-rs" = "Activity Tracker"
+"ers-rs" = "Entity Resolution"
+"#;
+        let raw: RawConfig = toml::from_str(toml_str).expect("should parse projects config");
+        let config = Config::from(raw);
+
+        // Should have 3 search dirs
+        assert_eq!(config.project_search_dirs.len(), 3);
+
+        // Tilde should be expanded (not start with ~)
+        assert!(
+            !config.project_search_dirs[0]
+                .to_str()
+                .unwrap()
+                .starts_with('~')
+        );
+        assert!(
+            !config.project_search_dirs[1]
+                .to_str()
+                .unwrap()
+                .starts_with('~')
+        );
+        // Absolute path stays as-is
+        assert_eq!(
+            config.project_search_dirs[2],
+            PathBuf::from("/absolute/path")
+        );
+
+        // Tilde-expanded paths should end with the correct suffix
+        assert!(
+            config.project_search_dirs[0]
+                .to_str()
+                .unwrap()
+                .ends_with("RustProjects/active")
+        );
+        assert!(
+            config.project_search_dirs[1]
+                .to_str()
+                .unwrap()
+                .ends_with("projects")
+        );
+
+        // Aliases should be populated
+        assert_eq!(config.project_aliases.len(), 2);
+        assert_eq!(
+            config.project_aliases.get("niri-activity-rs").unwrap(),
+            "Activity Tracker"
+        );
+        assert_eq!(
+            config.project_aliases.get("ers-rs").unwrap(),
+            "Entity Resolution"
+        );
+    }
+
+    #[test]
+    fn projects_config_defaults_to_empty() {
+        let toml_str = r#"
+idle_threshold_secs = 120
+"#;
+        let raw: RawConfig = toml::from_str(toml_str).expect("should parse without projects");
+        let config = Config::from(raw);
+
+        assert!(config.project_search_dirs.is_empty());
+        assert!(config.project_aliases.is_empty());
+    }
+
+    #[test]
+    fn expand_tilde_absolute_path_unchanged() {
+        let path = expand_tilde("/home/user/projects");
+        assert_eq!(path, PathBuf::from("/home/user/projects"));
+    }
+
+    #[test]
+    fn expand_tilde_expands_home() {
+        let path = expand_tilde("~/some/path");
+        // Should not start with ~ after expansion
+        assert!(!path.to_str().unwrap().starts_with('~'));
+        assert!(path.to_str().unwrap().ends_with("some/path"));
     }
 }

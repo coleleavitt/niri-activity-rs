@@ -6,8 +6,10 @@ mod error;
 mod fmt;
 mod input;
 mod logind;
+mod project;
 mod report;
 mod scheduler;
+mod shell_hook;
 mod theme;
 mod tui;
 mod watcher;
@@ -197,6 +199,15 @@ enum Commands {
         #[arg(long)]
         deep_idle: Option<u64>,
     },
+    /// Output shell hook code for $PWD capture
+    ShellHook {
+        /// Shell type: bash, zsh, or fish (default: bash)
+        #[arg(default_value = "bash")]
+        shell: String,
+    },
+    /// Backfill the project column for historical terminal events using title
+    /// detection
+    BackfillProjects,
     /// Send activity report via email
     Email {
         #[arg(short, long, default_value = "7")]
@@ -344,6 +355,26 @@ fn main() {
             if total == 0 {
                 println!(
                     "Note: No events have input_offsets stored yet. Only future events will support retroactive reclassification."
+                );
+            }
+            Ok(())
+        })(),
+        Some(Commands::ShellHook { shell }) => shell_hook::print_hook(&shell),
+        Some(Commands::BackfillProjects) => (|| -> Result<(), Error> {
+            let cfg = config::load_config()?;
+            let data_dir = config::get_data_dir()?;
+            let db_path = data_dir.join("activity.db");
+            let mut conn = rusqlite::Connection::open(&db_path)?;
+            db::init_db(&conn)?;
+            db::run_migrations(&mut conn, &cfg)?;
+
+            let (total, detected) = db::backfill_projects(&mut conn, &cfg.project_aliases)?;
+            if total > 0 {
+                println!(
+                    "Done! Backfilled {} total events, {} with project detected ({:.1}%)",
+                    total,
+                    detected,
+                    (detected as f64 / total as f64) * 100.0
                 );
             }
             Ok(())
