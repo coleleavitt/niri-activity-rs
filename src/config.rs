@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     Productive,
@@ -56,6 +56,36 @@ pub struct TitleRule {
     pub category: Category,
     pub app: Vec<String>,
     pub compiled: Option<regex::Regex>,
+}
+
+/// Categorise a browser page by the site it came from rather than its title.
+///
+/// A title is whatever the page calls itself, so title rules misfire both
+/// ways: a GitHub repo about Discord reads as chat, a film from `cineby.at`
+/// reads as nothing. The domain is unambiguous.
+#[derive(Debug, Clone)]
+pub struct DomainRule {
+    /// Host to match. Also matches subdomains, so `youtube.com` covers
+    /// `www.youtube.com` and `m.youtube.com`.
+    pub domain: String,
+    pub category: Category,
+}
+
+impl DomainRule {
+    fn matches(&self, host: &str) -> bool {
+        // A rule naming no port matches any port, so `localhost` covers the
+        // dev servers on :3000 and :5173. A rule naming one is exact.
+        let host = if self.domain.contains(':') {
+            host
+        } else {
+            host.split(':').next().unwrap_or(host)
+        };
+
+        host == self.domain
+            || host
+                .strip_suffix(&self.domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,6 +142,16 @@ pub struct AgentActivityConfig {
     #[serde(default = "default_process_whitelist")]
     pub process_whitelist: Vec<String>,
 
+    /// Credit time to `productive` when an agent was working, whatever the
+    /// focused window was.
+    ///
+    /// Waiting on an agent produces work even when the screen shows something
+    /// unproductive. The underlying `agent_ms` measurement is unaffected, so
+    /// this only changes how reports attribute it and can be turned off again
+    /// without losing data.
+    #[serde(default = "default_agent_counts_productive")]
+    pub counts_as_productive: bool,
+
     /// Only count process activity if user had input within this many seconds.
     /// Prevents counting background processes when user is away. (default: 300
     /// = 5 min)
@@ -132,112 +172,19 @@ fn default_agent_activity_window() -> u64 {
 }
 
 fn default_agent_databases() -> Vec<String> {
-    vec!["~/.local/share/opencode/opencode.db".to_string()]
+    vec!["~/.local/share/opencode/opencode*.db".to_string()]
 }
 
 fn default_process_whitelist() -> Vec<String> {
-    [
-        // Rust ecosystem
-        "cargo",
-        "rustc",
-        "rustup",
-        "clippy-driver",
-        "rust-analyzer",
-        "rustfmt",
-        "rls",
-        "rust-gdb",
-        "rust-lldb",
-        "miri",
-        "sccache",
-        // JavaScript/TypeScript
-        "npm",
-        "node",
-        "bun",
-        "deno",
-        "pnpm",
-        "yarn",
-        "tsc",
-        "esbuild",
-        "turbo",
-        "swc",
-        // C/C++ compilers and build systems
-        "gcc",
-        "g++",
-        "clang",
-        "clang++",
-        "make",
-        "cmake",
-        "ninja",
-        "meson",
-        "ccache",
-        // Linkers
-        "ld",
-        "lld",
-        "mold",
-        "gold",
-        // Go
-        "go",
-        // Python
-        "python",
-        "python3",
-        "pip",
-        "uv",
-        "poetry",
-        "ruff",
-        "hatch",
-        "wheel",
-        "pytest",
-        "mypy",
-        "pyright",
-        // Java/JVM
-        "java",
-        "javac",
-        "gradle",
-        "mvn",
-        // .NET
-        "dotnet",
-        // Ruby
-        "ruby",
-        "gem",
-        "bundle",
-        // Other languages
-        "perl",
-        "php",
-        "composer",
-        "elixir",
-        "mix",
-        "zig",
-        // Containers
-        "docker",
-        "podman",
-        // Git
-        "git",
-        // Debuggers and profilers
-        "gdb",
-        "lldb",
-        "valgrind",
-        "strace",
-        "ltrace",
-        // Binary utilities
-        "as",
-        "ar",
-        "nm",
-        "objdump",
-        "objcopy",
-        "strip",
-        // Gentoo package management
-        "emerge",
-        "portage",
-        "eix",
-        "ebuild",
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
-    .collect()
+    Vec::new()
 }
 
 fn default_process_recency_secs() -> u64 {
     5 * 60
+}
+
+fn default_agent_counts_productive() -> bool {
+    true
 }
 
 impl Default for AgentActivityConfig {
@@ -248,6 +195,7 @@ impl Default for AgentActivityConfig {
             activity_window_secs: default_agent_activity_window(),
             databases: default_agent_databases(),
             process_whitelist: default_process_whitelist(),
+            counts_as_productive: default_agent_counts_productive(),
             process_recency_secs: default_process_recency_secs(),
         }
     }
@@ -534,6 +482,14 @@ struct RawConfig {
     categories: HashMap<String, Category>,
     #[serde(default)]
     title_rules: Vec<RawTitleRule>,
+    #[serde(default)]
+    domain_rules: Vec<RawDomainRule>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawDomainRule {
+    domain: String,
+    category: Category,
 }
 
 #[derive(Debug)]
@@ -557,6 +513,10 @@ pub struct Config {
     pub project_aliases: HashMap<String, String>,
     pub categories: HashMap<String, Category>,
     pub title_rules: Vec<TitleRule>,
+    pub domain_rules: Vec<DomainRule>,
+    /// Page title to domain, built from browser history. Empty until
+    /// [`Config::load_browser_history`] runs.
+    pub title_domains: HashMap<String, String>,
 }
 
 fn default_idle_threshold() -> u64 {
@@ -757,6 +717,15 @@ impl From<RawConfig> for Config {
             project_aliases,
             categories: raw.categories,
             title_rules,
+            domain_rules: raw
+                .domain_rules
+                .into_iter()
+                .map(|r| DomainRule {
+                    domain: r.domain.to_lowercase(),
+                    category: r.category,
+                })
+                .collect(),
+            title_domains: HashMap::new(),
         }
     }
 }
@@ -783,6 +752,8 @@ impl Default for Config {
             project_aliases: HashMap::new(),
             categories: HashMap::new(),
             title_rules: Vec::new(),
+            domain_rules: Vec::new(),
+            title_domains: HashMap::new(),
         }
     }
 }
@@ -925,9 +896,52 @@ impl Config {
         None
     }
 
+    /// Populate [`Config::title_domains`] from local browser history.
+    ///
+    /// Returns the number of titles resolved. A missing or unreadable history
+    /// database is not an error — domain rules simply stay inert and
+    /// classification falls back to title matching alone.
+    pub fn load_browser_history(&mut self) -> usize {
+        match browser_profiles::title_to_domain() {
+            Ok(map) => {
+                self.title_domains = map;
+                self.title_domains.len()
+            }
+            Err(e) => {
+                self.title_domains.clear();
+                tracing::debug!("browser history unavailable, domain rules inert: {e}");
+                0
+            }
+        }
+    }
+
+    pub fn can_reclassify_all(&self) -> bool {
+        self.domain_rules.is_empty() || !self.title_domains.is_empty()
+    }
+
+    fn domain_category(&self, title: &str) -> Option<Category> {
+        // A window title carries the browser's branding and a history title
+        // does not, so skipping this drops match rates from ~91% to ~4%.
+        let key = browser_profiles::strip_window_suffix(title);
+        let host = self
+            .title_domains
+            .get(key)
+            .or_else(|| self.title_domains.get(title))?;
+        self.domain_rules
+            .iter()
+            .find(|rule| rule.matches(host))
+            .map(|rule| rule.category)
+    }
+
     pub fn classify(&self, app_id: &str, title: &str) -> Category {
         let title_lower = title.to_lowercase();
         let explicit_cat = self.app_category(app_id);
+
+        // Domain beats title: the host a page was served from is a fact, while
+        // its title is a claim.
+        if let Some(cat) = self.domain_category(title) {
+            return cat;
+        }
 
         for rule in &self.title_rules {
             let scoped = !rule.app.is_empty();
@@ -1110,16 +1124,7 @@ pub fn load_config() -> Result<Config, Error> {
     }
 }
 
-/// Create a default configuration file if one does not already exist.
-pub fn init_config() -> Result<(), Error> {
-    let config_path = get_config_path()?;
-
-    if config_path.exists() {
-        println!("Config already exists: {}", config_path.display());
-        return Ok(());
-    }
-
-    let example = r#"# Seconds without input before state transitions to Passive (default: 60)
+const DEFAULT_CONFIG: &str = r#"# Seconds without input before state transitions to Passive (default: 60)
 idle_threshold_secs = 120
 
 # Seconds without input before Passive transitions to Idle (default: 300)
@@ -1203,9 +1208,27 @@ regex = true
 
 # Global productive patterns
 [[title_rules]]
-pattern = "GitHub|Stack Overflow|docs\.rs|LinkedIn"
+pattern = "GitHub|Stack Overflow|docs\\.rs|LinkedIn"
 category = "productive"
 regex = true
+
+[agent_activity]
+# Count time as productive whenever a coding agent was working, whatever was
+# on screen. Waiting on an agent produces work even when the focused window is
+# a video. Turning this off restores plain focus-based categories; the raw
+# measurement is stored either way, so nothing is lost by changing it.
+counts_as_productive = true
+
+# Domain rules — categorise browser pages by the site they came from, resolved
+# through local browser history. Checked BEFORE title rules, since a domain is
+# a fact and a title is a claim. Subdomains match automatically.
+[[domain_rules]]
+domain = "youtube.com"
+category = "unproductive"
+
+[[domain_rules]]
+domain = "github.com"
+category = "productive"
 
 
 # Work schedule — only affects report breakdown (tracking is always on)
@@ -1238,7 +1261,16 @@ search_dirs = ["~/RustProjects/active", "~/projects", "~/work"]
 "niri-activity-rs" = "Activity Tracker"
 "#;
 
-    fs::write(&config_path, example)?;
+/// Create a default configuration file if one does not already exist.
+pub fn init_config() -> Result<(), Error> {
+    let config_path = get_config_path()?;
+
+    if config_path.exists() {
+        println!("Config already exists: {}", config_path.display());
+        return Ok(());
+    }
+
+    fs::write(&config_path, DEFAULT_CONFIG)?;
     println!("Created config: {}", config_path.display());
     println!("\nEdit this file to customize your categories.");
 
@@ -1248,6 +1280,30 @@ search_dirs = ["~/RustProjects/active", "~/projects", "~/work"]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_config_is_valid_toml() {
+        toml::from_str::<RawConfig>(DEFAULT_CONFIG).expect("generated config must parse");
+    }
+
+    #[test]
+    fn domain_reclassification_requires_loaded_history() {
+        let config = domain_config(vec![("youtube.com", Category::Unproductive)], vec![]);
+
+        assert!(!config.can_reclassify_all());
+    }
+
+    #[test]
+    fn default_process_whitelist_excludes_persistent_runtimes() {
+        let defaults = default_process_whitelist();
+
+        for process in ["node", "java", "php", "sccache", "rust-analyzer"] {
+            assert!(
+                !defaults.iter().any(|candidate| candidate == process),
+                "{process} is commonly persistent and must not imply agent activity"
+            );
+        }
+    }
 
     #[test]
     fn glob_exact_match() {
@@ -1308,6 +1364,128 @@ mod tests {
         };
         assert_eq!(config.classify("jetbrains-clion", ""), Category::Productive);
         assert_eq!(config.classify("code", ""), Category::Neutral);
+    }
+
+    fn domain_config(rules: Vec<(&str, Category)>, titles: Vec<(&str, &str)>) -> Config {
+        let title_domains = titles
+            .into_iter()
+            .map(|(t, d)| (t.to_string(), d.to_string()))
+            .collect::<HashMap<_, _>>();
+        Config {
+            domain_rules: rules
+                .into_iter()
+                .map(|(domain, category)| DomainRule {
+                    domain: domain.to_string(),
+                    category,
+                })
+                .collect(),
+            title_domains,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn domain_rule_matches_subdomains() {
+        let config = domain_config(
+            vec![("youtube.com", Category::Unproductive)],
+            vec![
+                ("Some Video", "www.youtube.com"),
+                ("Mobile Video", "m.youtube.com"),
+                ("Bare", "youtube.com"),
+            ],
+        );
+        for title in ["Some Video", "Mobile Video", "Bare"] {
+            assert_eq!(config.classify("zen", title), Category::Unproductive);
+        }
+    }
+
+    #[test]
+    fn domain_rule_matches_through_browser_branding() {
+        let config = domain_config(
+            vec![("youtube.com", Category::Unproductive)],
+            vec![("Some Video", "www.youtube.com")],
+        );
+        assert_eq!(
+            config.classify("zen", "Some Video — Zen Browser"),
+            Category::Unproductive,
+            "window titles carry branding that history titles lack"
+        );
+    }
+
+    #[test]
+    fn portless_domain_rule_matches_any_port() {
+        let config = domain_config(
+            vec![("localhost", Category::Productive)],
+            vec![
+                ("Vite App", "localhost:5173"),
+                ("Next App", "localhost:3000"),
+                ("Bare", "localhost"),
+            ],
+        );
+        for title in ["Vite App", "Next App", "Bare"] {
+            assert_eq!(config.classify("zen", title), Category::Productive);
+        }
+    }
+
+    #[test]
+    fn domain_rule_with_a_port_is_exact() {
+        let config = domain_config(
+            vec![("localhost:3000", Category::Productive)],
+            vec![("App", "localhost:3000"), ("Other", "localhost:9999")],
+        );
+        assert_eq!(config.classify("zen", "App"), Category::Productive);
+        assert_eq!(config.classify("zen", "Other"), Category::Neutral);
+    }
+
+    #[test]
+    fn domain_rule_does_not_match_lookalike_suffix() {
+        let config = domain_config(
+            vec![("youtube.com", Category::Unproductive)],
+            vec![("Phish", "notyoutube.com")],
+        );
+        assert_eq!(config.classify("zen", "Phish"), Category::Neutral);
+    }
+
+    #[test]
+    fn domain_rule_beats_conflicting_title_rule() {
+        let mut config = domain_config(
+            vec![("github.com", Category::Productive)],
+            vec![(
+                "serenity-rs/serenity: A Rust library for the Discord API",
+                "github.com",
+            )],
+        );
+        config.title_rules = vec![TitleRule {
+            pattern: "Discord".to_string(),
+            category: Category::Unproductive,
+            app: vec!["zen".to_string()],
+            compiled: None,
+        }];
+
+        assert_eq!(
+            config.classify(
+                "zen",
+                "serenity-rs/serenity: A Rust library for the Discord API"
+            ),
+            Category::Productive,
+            "the page is served from github.com regardless of what it discusses"
+        );
+    }
+
+    #[test]
+    fn title_rules_still_apply_when_domain_is_unknown() {
+        let mut config = domain_config(vec![("github.com", Category::Productive)], vec![]);
+        config.title_rules = vec![TitleRule {
+            pattern: "YouTube".to_string(),
+            category: Category::Unproductive,
+            app: vec![],
+            compiled: None,
+        }];
+
+        assert_eq!(
+            config.classify("zen", "Some Video - YouTube"),
+            Category::Unproductive
+        );
     }
 
     #[test]
@@ -1467,13 +1645,13 @@ search_dirs = ["~/RustProjects/active", "~/projects", "/absolute/path"]
 
     #[test]
     fn projects_config_defaults_to_empty() {
-        let toml_str = r#"
+        let toml_str = r"
 idle_threshold_secs = 120
-"#;
+";
         let raw: RawConfig = toml::from_str(toml_str).expect("should parse without projects");
         let config = Config::from(raw);
 
-        assert!(config.project_search_dirs.is_empty());
+        assert_eq!(config.project_search_dirs, [] as [std::path::PathBuf; 0]);
         assert!(config.project_aliases.is_empty());
     }
 

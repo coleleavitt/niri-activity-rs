@@ -104,6 +104,11 @@ fn strip_jfc_status_prefix(title: &str) -> &str {
 /// Returns `Some(Some(project))` for a valid project directory,
 /// `Some(None)` for home dir `~` or `/home/user`, and `None` if the pattern
 /// doesn't match.
+#[allow(
+    clippy::option_option,
+    reason = "outer None means the title is not a shell prompt at all, which is \
+              distinct from a prompt that names no project"
+)]
 fn try_parse_shell_prompt(title: &str) -> Option<Option<String>> {
     // Must contain @ for user@host pattern
     let at_pos = title.find('@')?;
@@ -230,7 +235,7 @@ pub fn detect_project_from_path(path: &Path) -> Option<String> {
 
         for marker in PROJECT_MARKERS {
             if dir.join(marker).exists() {
-                return dir.file_name()?.to_str().map(|s| s.to_string());
+                return dir.file_name()?.to_str().map(str::to_string);
             }
         }
 

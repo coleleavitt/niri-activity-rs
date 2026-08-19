@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/browser-profiles", "crates/harness"]
+resolver = "3"
+
 [package]
 name = "niri-activity-rs"
 version = "0.1.0"
@@ -32,6 +36,12 @@ tempfile = "3.27.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 dirs = "6.0.0"
+linkscope = { path = "../linkscope" }
+browser-profiles = { path = "crates/browser-profiles" }
+harness = { path = "crates/harness" }
+
+[dev-dependencies]
+filetime = "0.2"
 
 [features]
 default = []

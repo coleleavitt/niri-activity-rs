@@ -13,6 +13,11 @@ pub struct SessionSnapshot<'a> {
     pub active_ms: i64,
     pub passive_ms: i64,
     pub idle_ms: i64,
+    /// Milliseconds a coding agent was working during this session.
+    ///
+    /// Overlaps active/passive/idle rather than partitioning them — an agent
+    /// runs while the user types, reads, or steps away.
+    pub agent_ms: i64,
     pub input: InputSnapshot,
     pub jiggler_detected: bool,
     pub input_offsets: Vec<u32>,
@@ -57,6 +62,7 @@ pub fn init_db(conn: &Connection) -> Result<(), Error> {
 
 /// Run all pending database migrations and apply category reclassifications.
 pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Error> {
+    init_db(conn)?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS migrations (
             id INTEGER PRIMARY KEY,
@@ -72,7 +78,9 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
             .collect::<Result<Vec<_>, _>>()?
     };
 
-    if !applied.contains(&"001_fix_historical_categories".to_string()) {
+    if !applied.contains(&"001_fix_historical_categories".to_string())
+        && config.can_reclassify_all()
+    {
         let tx = conn.transaction()?;
         let mut updated = 0i64;
         for (app_id, category) in &config.categories {
@@ -95,7 +103,10 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         }
     }
 
-    if !applied.contains(&"002_apply_title_rules".to_string()) && !config.title_rules.is_empty() {
+    if !applied.contains(&"002_apply_title_rules".to_string())
+        && !config.title_rules.is_empty()
+        && config.can_reclassify_all()
+    {
         let tx = conn.transaction()?;
         let mut stmt = tx.prepare("SELECT id, app_id, title FROM events")?;
         let rows: Vec<(i64, String, String)> = stmt
@@ -132,7 +143,7 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         }
     }
 
-    if !applied.contains(&"003_app_scoped_title_rules".to_string()) {
+    if !applied.contains(&"003_app_scoped_title_rules".to_string()) && config.can_reclassify_all() {
         let tx = conn.transaction()?;
         let mut stmt = tx.prepare("SELECT id, app_id, title, category FROM events")?;
         let rows: Vec<(i64, String, String, String)> = stmt
@@ -291,12 +302,49 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         tracing::info!("Migration 009: added git_branch column");
     }
 
+    if !applied.contains(&"010_add_agent_ms_column".to_string()) {
+        let tx = conn.transaction()?;
+        // Rows written before this migration have no measurement, which is
+        // not the same as measuring zero agent time; NULL keeps that
+        // distinction so historical reports can exclude them.
+        tx.execute("ALTER TABLE events ADD COLUMN agent_ms INTEGER", [])?;
+        tx.execute(
+            "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
+            params!["010_add_agent_ms_column", Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        tracing::info!("Migration 010: added agent_ms column");
+    }
+
+    if !applied.contains(&"011_index_pending_agent_ms".to_string()) {
+        let tx = conn.transaction()?;
+        // Partial rather than a plain index on agent_ms: only unmeasured rows
+        // are ever looked up this way, so indexing the rest would cost space
+        // and slow every insert for entries no query reads.
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_ms_pending
+             ON events(timestamp) WHERE agent_ms IS NULL",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
+            params!["011_index_pending_agent_ms", Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        tracing::info!("Migration 011: indexed events pending agent measurement");
+    }
+
     Ok(())
 }
 
 /// Reclassify all events in the database according to the current
 /// configuration.
 pub fn reclassify_all(conn: &mut Connection, config: &Config) -> Result<(), Error> {
+    if !config.can_reclassify_all() {
+        tracing::warn!("Skipping category reclassification because browser history is unavailable");
+        return Ok(());
+    }
+
     // Safety: check row count before loading all rows into memory.
     // For databases with >5M events, this could use significant RAM.
     const MAX_RECLASSIFY_ROWS: i64 = 5_000_000;
@@ -342,6 +390,85 @@ pub fn reclassify_all(conn: &mut Connection, config: &Config) -> Result<(), Erro
     Ok(())
 }
 
+/// Fill `agent_ms` for events recorded before agent tracking existed.
+///
+/// Reconstructs agent activity from harness logs and intersects it with each
+/// session's own span, so a five-minute focus that overlapped two busy minutes
+/// is credited two minutes rather than five.
+fn events_needing_agent_ms(
+    conn: &Connection,
+    since_secs: i64,
+) -> Result<Vec<(i64, String, i64)>, Error> {
+    let since_rfc3339 = chrono::DateTime::from_timestamp(since_secs, 0)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT id, timestamp, active_ms + COALESCE(passive_ms,0) + idle_ms
+           FROM events WHERE agent_ms IS NULL AND timestamp >= ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![&since_rfc3339], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Measure any events the live watcher never recorded agent time for.
+///
+/// Scans from the oldest unmeasured event rather than a fixed window, so a
+/// daemon that was down for a day and one down for a month both heal without
+/// a configured lookback. Returns `Ok(0)` immediately when nothing is pending,
+/// which the partial index makes effectively free.
+pub fn heal_missing_agent_ms(conn: &mut Connection) -> Result<i64, Error> {
+    // MIN over an empty set yields one row holding NULL, so the Option is the
+    // "nothing pending" signal rather than a missing row.
+    let oldest: Option<String> = conn.query_row(
+        "SELECT MIN(timestamp) FROM events WHERE agent_ms IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let Some(oldest) = oldest else {
+        return Ok(0);
+    };
+    let Ok(start) = chrono::DateTime::parse_from_rfc3339(&oldest) else {
+        return Ok(0);
+    };
+    backfill_agent_ms(conn, start.timestamp())
+}
+
+pub fn backfill_agent_ms(conn: &mut Connection, since_secs: i64) -> Result<i64, Error> {
+    let until_secs = Utc::now().timestamp();
+    let busy = harness::busy_minutes(since_secs, until_secs);
+    if busy.is_empty() {
+        return Ok(0);
+    }
+
+    // Only events inside the scanned window can be measured. Writing 0 to an
+    // event outside it would claim no agent ran, when the truth is that no
+    // log was read for that time.
+    let rows = events_needing_agent_ms(conn, since_secs)?;
+    let tx = conn.transaction()?;
+    let mut filled = 0i64;
+    for (id, timestamp, span_ms) in &rows {
+        let Ok(start) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+            continue;
+        };
+        let start_ms = start.timestamp_millis();
+        let agent_ms = busy.overlap_ms(start_ms, start_ms.saturating_add(*span_ms));
+        tx.execute(
+            "UPDATE events SET agent_ms = ?1 WHERE id = ?2",
+            params![agent_ms, id],
+        )?;
+        if agent_ms > 0 {
+            filled = filled.saturating_add(1);
+        }
+    }
+    tx.commit()?;
+    Ok(filled)
+}
+
 /// Reclassify events with zero input as passive instead of active, returning
 /// count updated.
 pub fn fix_false_active(conn: &Connection, input_active_ms: u64) -> Result<i64, Error> {
@@ -373,8 +500,8 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
             keystrokes, mouse_clicks, scroll_events, mouse_distance,
             jiggler_detected, input_offsets,
             backspace_count, modifier_count, left_clicks, right_clicks, middle_clicks,
-            scroll_up, scroll_down, scroll_horizontal, project, git_branch
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+            scroll_up, scroll_down, scroll_horizontal, project, git_branch, agent_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         params![
             snapshot.focus_start.to_rfc3339(),
             &snapshot.window.app_id,
@@ -399,15 +526,38 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
             i64::try_from(snapshot.input.scroll_horizontal).unwrap_or(i64::MAX),
             snapshot.project.as_deref(),
             snapshot.git_branch.as_deref(),
+            snapshot.agent_ms,
         ],
     )?;
     Ok(())
 }
 
-fn decode_input_offsets(blob: &[u8]) -> Vec<u32> {
+pub(crate) fn decode_input_offsets(blob: &[u8]) -> Vec<u32> {
     blob.chunks_exact(4)
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
+}
+
+const INPUT_OFFSET_DRIFT_TOLERANCE_MS: u32 = 1_000;
+
+pub(crate) fn normalize_input_offsets(blob: &[u8], total_duration_ms: i64) -> Option<Vec<u32>> {
+    let mut offsets = decode_input_offsets(blob);
+    let duration = u32::try_from(total_duration_ms.max(0)).unwrap_or(u32::MAX);
+    let shift = offsets
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(duration);
+    if shift > INPUT_OFFSET_DRIFT_TOLERANCE_MS {
+        return None;
+    }
+    for offset in &mut offsets {
+        *offset = offset.saturating_sub(shift).min(duration);
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    Some(offsets)
 }
 
 fn replay_classification(
@@ -424,9 +574,10 @@ fn replay_classification(
     let mut passive_ms: i64 = 0;
     let mut idle_ms: i64 = 0;
 
+    let total_u64 = u64::try_from(total_duration_ms).unwrap_or(0);
     let mut prev_offset: u64 = 0;
     for &offset in offsets {
-        let offset_u64 = u64::from(offset);
+        let offset_u64 = u64::from(offset).min(total_u64);
         if offset_u64 <= prev_offset {
             continue;
         }
@@ -454,8 +605,7 @@ fn replay_classification(
         prev_offset = offset_u64;
     }
 
-    let last_offset = u64::from(*offsets.last().unwrap_or(&0));
-    let total_u64 = u64::try_from(total_duration_ms).unwrap_or(0);
+    let last_offset = prev_offset;
     if total_u64 > last_offset {
         let trailing_gap = total_u64 - last_offset;
         if trailing_gap <= idle_threshold_ms {
@@ -489,6 +639,12 @@ pub fn reclassify_with_thresholds(
     idle_threshold_secs: u64,
     deep_idle_secs: u64,
 ) -> Result<(i64, i64), Error> {
+    if deep_idle_secs <= idle_threshold_secs {
+        return Err(Error::InvalidArgument(format!(
+            "deep-idle threshold ({deep_idle_secs}s) must be greater than idle threshold ({idle_threshold_secs}s)"
+        )));
+    }
+
     let idle_threshold_ms = idle_threshold_secs.saturating_mul(1000);
     let deep_idle_threshold_ms = deep_idle_secs.saturating_mul(1000);
 
@@ -515,10 +671,12 @@ pub fn reclassify_with_thresholds(
     let tx = conn.transaction()?;
     for (id, blob_opt, old_active, old_passive, old_idle) in rows {
         if let Some(blob) = blob_opt {
-            let offsets = decode_input_offsets(&blob);
             let total_duration = old_active
                 .saturating_add(old_passive)
                 .saturating_add(old_idle);
+            let Some(offsets) = normalize_input_offsets(&blob, total_duration) else {
+                continue;
+            };
             let (new_active, new_passive, new_idle) = replay_classification(
                 &offsets,
                 total_duration,
@@ -642,4 +800,173 @@ pub fn backfill_projects(
     }
 
     Ok((total, detected))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Category, Config, DomainRule};
+
+    #[test]
+    fn migrations_initialize_a_fresh_database() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+
+        run_migrations(&mut conn, &Config::default()).expect("migrations");
+
+        let events_table: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("events table");
+        assert_eq!(events_table, "events");
+    }
+
+    #[test]
+    fn replay_clamps_input_offsets_to_the_event_duration() {
+        let classified = replay_classification(&[360_000], 300_000, 120_000, 300_000);
+
+        assert_eq!(classified, (120_000, 180_000, 0));
+    }
+
+    #[test]
+    fn normalization_rebases_drifted_offsets_at_the_flush_boundary() {
+        let blob = [1_400u32, 1_900]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            normalize_input_offsets(&blob, 1_000),
+            Some(vec![500, 1_000])
+        );
+    }
+
+    #[test]
+    fn normalization_preserves_valid_offsets() {
+        let blob = [100u32, 200]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        assert_eq!(normalize_input_offsets(&blob, 500), Some(vec![100, 200]));
+    }
+
+    #[test]
+    fn normalization_rejects_large_origin_drift() {
+        let blob = [9_000u32, 9_500]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        assert_eq!(normalize_input_offsets(&blob, 500), None);
+    }
+
+    #[test]
+    fn reclassification_rejects_reversed_thresholds() {
+        let mut conn = db_with_events(&[]);
+
+        let error = reclassify_with_thresholds(&mut conn, 300, 120)
+            .expect_err("deep-idle must follow idle");
+
+        assert!(matches!(error, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn reclassification_preserves_categories_when_browser_history_is_unavailable() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        init_db(&conn).expect("schema");
+        conn.execute(
+            "INSERT INTO events (timestamp, app_id, title, category, active_ms, idle_ms)
+             VALUES ('2026-08-16T12:00:00+00:00', 'zen', 'A Video', 'unproductive', 60000, 0)",
+            [],
+        )
+        .expect("fixture");
+        let config = Config {
+            categories: std::collections::HashMap::from([(
+                "zen".to_string(),
+                Category::Productive,
+            )]),
+            domain_rules: vec![DomainRule {
+                domain: "youtube.com".to_string(),
+                category: Category::Unproductive,
+            }],
+            ..Config::default()
+        };
+
+        run_migrations(&mut conn, &config).expect("migrations");
+        reclassify_all(&mut conn, &config).expect("reclassify");
+
+        let category: String = conn
+            .query_row("SELECT category FROM events", [], |row| row.get(0))
+            .expect("category");
+        assert_eq!(category, "unproductive");
+    }
+
+    fn db_with_events(timestamps: &[&str]) -> Connection {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        init_db(&conn).expect("schema");
+        run_migrations(&mut conn, &Config::default()).expect("migrations");
+        for ts in timestamps {
+            conn.execute(
+                "INSERT INTO events (timestamp, app_id, title, category, active_ms, idle_ms)
+                 VALUES (?1, 'foot', 't', 'productive', 60000, 0)",
+                params![ts],
+            )
+            .expect("insert");
+        }
+        conn
+    }
+
+    #[test]
+    fn backfill_skips_events_older_than_the_scanned_window() {
+        // Writing 0 outside the window once stamped 574,214 historical rows
+        // as "measured, no agent" when no log had been read for them.
+        let conn = db_with_events(&["2026-02-02T12:00:00+00:00", "2026-08-16T12:00:00+00:00"]);
+        let since = chrono::DateTime::parse_from_rfc3339("2026-08-10T00:00:00+00:00")
+            .expect("fixed date")
+            .timestamp();
+
+        let eligible = events_needing_agent_ms(&conn, since).expect("query");
+        assert_eq!(
+            eligible.len(),
+            1,
+            "only the event inside the window is eligible"
+        );
+    }
+
+    #[test]
+    fn healing_is_a_no_op_when_every_event_is_measured() {
+        let mut conn = db_with_events(&["2026-08-16T12:00:00+00:00"]);
+        conn.execute("UPDATE events SET agent_ms = 0", [])
+            .expect("mark measured");
+
+        assert_eq!(
+            heal_missing_agent_ms(&mut conn).expect("heal"),
+            0,
+            "nothing pending must not trigger a log scan"
+        );
+    }
+
+    #[test]
+    fn healing_starts_from_the_oldest_unmeasured_event() {
+        let conn = db_with_events(&["2026-02-02T12:00:00+00:00", "2026-08-16T12:00:00+00:00"]);
+        let oldest: Option<String> = conn
+            .query_row(
+                "SELECT MIN(timestamp) FROM events WHERE agent_ms IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query");
+
+        assert_eq!(oldest.as_deref(), Some("2026-02-02T12:00:00+00:00"));
+    }
+
+    #[test]
+    fn backfill_considers_every_event_when_the_window_is_wide_enough() {
+        let conn = db_with_events(&["2026-02-02T12:00:00+00:00", "2026-08-16T12:00:00+00:00"]);
+        let rows = events_needing_agent_ms(&conn, 0).expect("query");
+        assert_eq!(rows.len(), 2);
+    }
 }

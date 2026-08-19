@@ -265,12 +265,15 @@ impl IntervalTracker {
 
 /// Detect if any jiggler/artificial input software is currently running.
 pub fn scan_jiggler_processes(blacklist: &[String]) -> bool {
+    let _linkscope_jiggler_scan = linkscope::phase("input.jiggler_proc_scan");
+    linkscope::record_items("input.jiggler_proc_scan", 1);
     let entries = match std::fs::read_dir("/proc") {
         Ok(e) => e,
         Err(_) => return false,
     };
 
     for entry in entries.flatten() {
+        linkscope::record_items("input.jiggler_proc_entries", 1);
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if !name_str.chars().all(|c| c.is_ascii_digit()) {
@@ -410,13 +413,28 @@ fn unified_input_loop(
     };
 
     loop {
+        let _linkscope_input_loop = linkscope::phase("input.loop");
+        linkscope::record_items("input.loop", 1);
         // SAFETY: raw_fd is valid for the lifetime of libinput
         #[allow(unsafe_code)]
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
         let mut pollfds = [PollFd::new(&borrowed_fd, PollFlags::IN)];
 
-        match poll(&mut pollfds, Some(&timeout)) {
-            Ok(_) => {
+        let poll_result = {
+            let _linkscope_input_poll = linkscope::phase("input.poll");
+            poll(&mut pollfds, Some(&timeout))
+        };
+        match poll_result {
+            Ok(ready) => {
+                if ready == 0 {
+                    linkscope::record_items("input.poll.timeout", 1);
+                } else {
+                    linkscope::record_items(
+                        "input.poll.ready",
+                        u64::try_from(ready).unwrap_or(u64::MAX),
+                    );
+                }
+                let _linkscope_input_dispatch = linkscope::phase("input.dispatch");
                 if let Err(e) = libinput.dispatch() {
                     tracing::warn!("libinput dispatch error: {:?}", e);
                     thread::sleep(Duration::from_secs(1));
@@ -424,6 +442,7 @@ fn unified_input_loop(
                 }
 
                 for event in &mut libinput {
+                    linkscope::record_items("input.events", 1);
                     let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
                     match event {

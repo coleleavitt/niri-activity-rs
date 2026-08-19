@@ -125,6 +125,7 @@ struct SessionAccum<'a> {
     active_ms: &'a mut i64,
     passive_ms: &'a mut i64,
     idle_ms: &'a mut i64,
+    agent_ms: &'a mut i64,
     input_baseline_ms: &'a mut u64,
     session_start_mono_ms: &'a mut u64,
     input_offsets: &'a mut Vec<u32>,
@@ -166,6 +167,7 @@ struct WatchState {
     accumulated_active_ms: i64,
     accumulated_passive_ms: i64,
     accumulated_idle_ms: i64,
+    accumulated_agent_ms: i64,
     last_idle_check: Instant,
     last_flush: Instant,
     is_locked: bool,
@@ -193,6 +195,7 @@ impl WatchState {
             accumulated_active_ms: 0,
             accumulated_passive_ms: 0,
             accumulated_idle_ms: 0,
+            accumulated_agent_ms: 0,
             last_idle_check: now_instant,
             last_flush: now_instant,
             is_locked: false,
@@ -217,6 +220,7 @@ impl WatchState {
             active_ms: &mut self.accumulated_active_ms,
             passive_ms: &mut self.accumulated_passive_ms,
             idle_ms: &mut self.accumulated_idle_ms,
+            agent_ms: &mut self.accumulated_agent_ms,
             input_baseline_ms: &mut self.input_baseline_ms,
             session_start_mono_ms: &mut self.session_start_mono_ms,
             input_offsets: &mut self.input_offsets,
@@ -228,6 +232,7 @@ impl WatchState {
         self.accumulated_active_ms = 0;
         self.accumulated_passive_ms = 0;
         self.accumulated_idle_ms = 0;
+        self.accumulated_agent_ms = 0;
     }
 
     fn reset_session(&mut self, now_instant: Instant, input_baseline: u64, session_mono: u64) {
@@ -239,6 +244,23 @@ impl WatchState {
         self.session_start_mono_ms = session_mono;
         self.last_seen_input_ms = input_baseline;
         self.input_offsets.clear();
+    }
+
+    fn resume_after_away(
+        &mut self,
+        now_instant: Instant,
+        input_baseline_ms: u64,
+        session_start_mono_ms: u64,
+    ) {
+        self.focus_start = Utc::now();
+        self.reset_accumulators();
+        self.last_idle_check = now_instant;
+        self.last_flush = now_instant;
+        self.input_baseline_ms = input_baseline_ms;
+        self.session_start_mono_ms = session_start_mono_ms;
+        self.last_seen_input_ms = input_baseline_ms;
+        self.input_offsets.clear();
+        self.input_offsets.push(0);
     }
 }
 
@@ -507,7 +529,11 @@ fn handle_idle_transitions(
         now_ms.saturating_sub(state.session_start_mono_ms)
     };
 
-    let agent_active = agent_monitor.is_active(idle_duration_ms);
+    let focused_title = state
+        .focused_id
+        .and_then(|id| state.windows.get(&id))
+        .map(|info| info.title.as_str());
+    let agent_active = agent_monitor.is_active(idle_duration_ms, focused_title);
     let new_state = compute_activity_state(idle_duration_ms, agent_active, thresholds);
 
     if new_state == ActivityState::Away && state.current_state != ActivityState::Away {
@@ -522,14 +548,7 @@ fn handle_idle_transitions(
     }
 
     if state.current_state == ActivityState::Away && new_state != ActivityState::Away {
-        handle_exit_away(
-            state,
-            input_stats,
-            monitor_start,
-            now_instant,
-            now_ms,
-            quiet,
-        );
+        handle_exit_away(state, input_stats, now_instant, now_ms, quiet);
     }
 
     if new_state != state.current_state && !quiet {
@@ -537,12 +556,12 @@ fn handle_idle_transitions(
         let to = color_state(new_state);
         tracing::debug!("{} {} → {}", "[STATE]".dimmed(), from, to);
     }
-    accumulate_state_time(state, now_instant);
+    accumulate_state_time(state, now_instant, agent_active);
 
     state.current_state = new_state;
 
     if should_periodic_flush(state, now_instant) {
-        handle_periodic_flush(state, flush_ctx, input_stats, now_instant, quiet)?;
+        handle_periodic_flush(state, flush_ctx, input_stats, now_ms, now_instant, quiet)?;
     }
 
     Ok(())
@@ -553,10 +572,10 @@ fn compute_activity_state(
     agent_active: bool,
     thresholds: &IdleThresholds,
 ) -> ActivityState {
-    if idle_duration_ms > thresholds.away_ms {
-        ActivityState::Away
-    } else if agent_active {
+    if agent_active {
         ActivityState::Active
+    } else if idle_duration_ms > thresholds.away_ms {
+        ActivityState::Away
     } else if idle_duration_ms > thresholds.deep_idle_ms {
         ActivityState::Idle
     } else if idle_duration_ms > thresholds.idle_ms {
@@ -608,7 +627,6 @@ fn handle_enter_away(
 fn handle_exit_away(
     state: &mut WatchState,
     input_stats: &crate::input::InputStats,
-    _monitor_start: Instant,
     now_instant: Instant,
     now_ms: u64,
     quiet: bool,
@@ -619,21 +637,21 @@ fn handle_exit_away(
             "[RESUMED]".green().bold(),
         );
     }
-    state.focus_start = Utc::now();
-    state.reset_accumulators();
-    state.last_idle_check = now_instant;
-    state.last_flush = now_instant;
-    state.input_baseline_ms = input_stats.last_activity_ms();
-    state.session_start_mono_ms = now_ms;
+    state.resume_after_away(now_instant, input_stats.last_activity_ms(), now_ms);
 }
 
-fn accumulate_state_time(state: &mut WatchState, now_instant: Instant) {
+fn accumulate_state_time(state: &mut WatchState, now_instant: Instant, agent_active: bool) {
     let elapsed_since_last_check = i64::try_from(
         now_instant
             .duration_since(state.last_idle_check)
             .as_millis(),
     )
     .unwrap_or(i64::MAX);
+    if agent_active {
+        state.accumulated_agent_ms = state
+            .accumulated_agent_ms
+            .saturating_add(elapsed_since_last_check);
+    }
     match state.current_state {
         ActivityState::Active => {
             state.accumulated_active_ms = state
@@ -665,6 +683,7 @@ fn handle_periodic_flush(
     state: &mut WatchState,
     flush_ctx: &FlushContext<'_>,
     input_stats: &crate::input::InputStats,
+    now_ms: u64,
     now_instant: Instant,
     quiet: bool,
 ) -> Result<(), Error> {
@@ -686,6 +705,7 @@ fn handle_periodic_flush(
                 new_focus_start: Utc::now(),
             },
         )?;
+        state.session_start_mono_ms = now_ms;
         if !quiet {
             let total = flushed
                 .active_ms
@@ -790,6 +810,14 @@ fn handle_window_closed(
     }
     state.windows.remove(&id);
     Ok(())
+}
+
+fn should_flush_metadata_change(state: &WatchState, id: u64, next: &WindowInfo) -> bool {
+    state.focused_id == Some(id)
+        && state
+            .windows
+            .get(&id)
+            .is_some_and(|current| current.app_id != next.app_id || current.title != next.title)
 }
 
 fn handle_focus_changed(
@@ -1126,6 +1154,7 @@ fn flush_session(
                 active_ms: *accum.active_ms,
                 passive_ms: *accum.passive_ms,
                 idle_ms: *accum.idle_ms,
+                agent_ms: *accum.agent_ms,
                 input: *input,
                 jiggler_detected: jiggler,
                 input_offsets: std::mem::take(accum.input_offsets),
@@ -1148,6 +1177,7 @@ fn flush_session(
             *accum.active_ms = 0;
             *accum.passive_ms = 0;
             *accum.idle_ms = 0;
+            *accum.agent_ms = 0;
             accum.input_offsets.clear();
         }
         FlushReset::Full {
@@ -1159,6 +1189,7 @@ fn flush_session(
             *accum.active_ms = 0;
             *accum.passive_ms = 0;
             *accum.idle_ms = 0;
+            *accum.agent_ms = 0;
             *accum.input_baseline_ms = new_baseline_ms;
             *accum.session_start_mono_ms = new_session_mono_ms;
             *accum.last_seen_input_ms = new_baseline_ms;
@@ -1192,7 +1223,10 @@ pub fn connect_to_niri() -> Result<Socket, Error> {
 pub fn watch(quiet: bool) -> Result<(), Error> {
     use std::collections::HashSet;
 
-    let config = load_config()?;
+    let mut config = load_config()?;
+    // A page the user has not visited before is absent from history, so live
+    // classification lags by one visit; reports re-resolve it afterwards.
+    config.load_browser_history();
     let data_dir = get_data_dir()?;
     let db_path = data_dir.join("activity.db");
     let untracked_log_path = data_dir.join("untracked_apps.log");
@@ -1210,9 +1244,19 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     println!("Categories configured: {}", config.categories.len());
 
     let mut conn = Connection::open(&db_path)?;
-    init_db(&conn)?;
-    run_migrations(&mut conn, &config)?;
-    reclassify_all(&mut conn, &config)?;
+    {
+        let _linkscope_db_init = linkscope::phase("watch.db_init");
+        init_db(&conn)?;
+        run_migrations(&mut conn, &config)?;
+        reclassify_all(&mut conn, &config)?;
+        match crate::db::heal_missing_agent_ms(&mut conn) {
+            Ok(0) => {}
+            Ok(n) => println!("Agent time reconstructed for {n} unmeasured events"),
+            // Healing is a repair, not a prerequisite: a corrupt agent log
+            // must not stop the watcher from recording activity.
+            Err(e) => tracing::warn!("Could not reconstruct agent time: {e}"),
+        }
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
@@ -1225,12 +1269,18 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     });
 
     let monitor_start = Instant::now();
-    let input_stats = start_idle_monitor(
-        monitor_start,
-        config.jiggler.clone(),
-        config.mouse_idle_threshold,
-    );
-    let logind = start_logind_monitor()?;
+    let input_stats = {
+        let _linkscope_input_start = linkscope::phase("watch.input_start");
+        start_idle_monitor(
+            monitor_start,
+            config.jiggler.clone(),
+            config.mouse_idle_threshold,
+        )
+    };
+    let logind = {
+        let _linkscope_logind_start = linkscope::phase("watch.logind_start");
+        start_logind_monitor()?
+    };
     let mut agent_monitor = AgentMonitor::new(&config.agent_activity);
     if config.agent_activity.enabled {
         println!(
@@ -1247,7 +1297,10 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     };
     let input_active_ms = config.input_active_secs.saturating_mul(1000);
 
-    let mut socket = connect_to_niri()?;
+    let mut socket = {
+        let _linkscope_niri_connect = linkscope::phase("watch.niri_connect");
+        connect_to_niri()?
+    };
     let reply = socket.send(Request::EventStream)?;
     match reply {
         Ok(Response::Handled) => {}
@@ -1282,63 +1335,85 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     println!("\nWatching window focus (event-driven)...");
     println!("Press Ctrl+C to stop gracefully\n");
 
+    let linkscope_report_interval = crate::profiling::report_interval();
+    let mut last_linkscope_report = Instant::now();
+
     loop {
+        let _linkscope_watch_loop = linkscope::phase("watch.loop");
+        linkscope::record_items("watch.loop", 1);
         if handle_shutdown(&shutdown, &mut state, &flush_ctx, &input_stats)? {
             return Ok(());
         }
 
         let now_instant = Instant::now();
 
-        handle_suspend_resume(
-            &mut state,
-            &logind,
-            &flush_ctx,
-            &input_stats,
-            monitor_start,
-            now_instant,
-            quiet,
-        )?;
-
-        check_input_heartbeat(&mut state, &input_stats, now_instant);
-
-        handle_lock_unlock(
-            &mut state,
-            &logind,
-            &flush_ctx,
-            &input_stats,
-            monitor_start,
-            now_instant,
-            quiet,
-        )?;
-
-        handle_idle_transitions(
-            &mut state,
-            &flush_ctx,
-            &input_stats,
-            &mut agent_monitor,
-            &thresholds,
-            monitor_start,
-            now_instant,
-            quiet,
-        )?;
-
-        // Check scheduled reports every 5 minutes (piggybacks on flush interval)
-        if now_instant.duration_since(state.last_schedule_check)
-            >= Duration::from_secs(FLUSH_INTERVAL_SECS)
         {
-            state.last_schedule_check = now_instant;
-            check_scheduled_reports(&conn, &config, quiet);
+            let _linkscope_watch_maintenance = linkscope::phase("watch.maintenance");
+            handle_suspend_resume(
+                &mut state,
+                &logind,
+                &flush_ctx,
+                &input_stats,
+                monitor_start,
+                now_instant,
+                quiet,
+            )?;
+
+            check_input_heartbeat(&mut state, &input_stats, now_instant);
+
+            handle_lock_unlock(
+                &mut state,
+                &logind,
+                &flush_ctx,
+                &input_stats,
+                monitor_start,
+                now_instant,
+                quiet,
+            )?;
+
+            handle_idle_transitions(
+                &mut state,
+                &flush_ctx,
+                &input_stats,
+                &mut agent_monitor,
+                &thresholds,
+                monitor_start,
+                now_instant,
+                quiet,
+            )?;
+
+            // Check scheduled reports every 5 minutes (piggybacks on flush interval)
+            if now_instant.duration_since(state.last_schedule_check)
+                >= Duration::from_secs(FLUSH_INTERVAL_SECS)
+            {
+                state.last_schedule_check = now_instant;
+                check_scheduled_reports(&conn, &config, quiet);
+            }
         }
 
-        let event = match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(ev) => Some(ev),
-            Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => {
-                if shutdown.load(Ordering::SeqCst) {
-                    continue;
+        crate::profiling::report_periodically(
+            &mut last_linkscope_report,
+            linkscope_report_interval,
+        );
+
+        let event = {
+            let _linkscope_watch_recv = linkscope::phase("watch.recv_timeout");
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(ev) => {
+                    linkscope::record_items("watch.events", 1);
+                    Some(ev)
                 }
-                flush_on_disconnect(&mut state, &flush_ctx, &input_stats);
-                return Err(Error::NiriEventStreamClosed);
+                Err(RecvTimeoutError::Timeout) => {
+                    linkscope::record_items("watch.recv_timeout", 1);
+                    None
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    if shutdown.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    flush_on_disconnect(&mut state, &flush_ctx, &input_stats);
+                    return Err(Error::NiriEventStreamClosed);
+                }
             }
         };
 
@@ -1361,18 +1436,140 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
 
         match event {
             Event::WindowsChanged { windows: win_list } => {
+                let _linkscope_event = linkscope::phase("watch.event.windows_changed");
                 handle_windows_changed(&mut state, &niri_ctx, win_list)?;
             }
             Event::WindowOpenedOrChanged { window } => {
-                state.windows.insert(window.id, WindowInfo::from(&window));
+                let _linkscope_event = linkscope::phase("watch.event.window_changed");
+                let info = WindowInfo::from(&window);
+                if should_flush_metadata_change(&state, window.id, &info) {
+                    handle_focus_changed(&mut state, &mut niri_ctx, Some(window.id))?;
+                }
+                state.windows.insert(window.id, info);
             }
             Event::WindowClosed { id } => {
+                let _linkscope_event = linkscope::phase("watch.event.window_closed");
                 handle_window_closed(&mut state, &niri_ctx, id)?;
             }
             Event::WindowFocusChanged { id: new_focus_id } => {
+                let _linkscope_event = linkscope::phase("watch.event.focus_changed");
                 handle_focus_changed(&mut state, &mut niri_ctx, new_focus_id)?;
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn thresholds() -> IdleThresholds {
+        IdleThresholds {
+            idle_ms: 120_000,
+            deep_idle_ms: 300_000,
+            away_ms: 1_800_000,
+        }
+    }
+
+    #[test]
+    fn compute_activity_state_enters_away_without_agent_activity() {
+        assert_eq!(
+            compute_activity_state(1_800_001, false, &thresholds()),
+            ActivityState::Away
+        );
+    }
+
+    #[test]
+    fn compute_activity_state_counts_agent_work_while_user_is_away() {
+        assert_eq!(
+            compute_activity_state(3_600_000, true, &thresholds()),
+            ActivityState::Active
+        );
+    }
+
+    #[test]
+    fn resuming_from_away_rebases_offsets_on_the_waking_input() {
+        let mut state = WatchState::new(100, 0);
+        state.input_offsets.push(9_000_000);
+
+        state.resume_after_away(Instant::now(), 9_500_000, 9_500_000);
+
+        assert_eq!(state.input_baseline_ms, 9_500_000);
+        assert_eq!(state.session_start_mono_ms, 9_500_000);
+        assert_eq!(state.last_seen_input_ms, 9_500_000);
+        assert_eq!(state.input_offsets, vec![0]);
+    }
+
+    fn advanced_state(current: ActivityState, agent_active: bool) -> WatchState {
+        let mut state = WatchState::new(0, 0);
+        state.current_state = current;
+        state.last_idle_check = Instant::now()
+            .checked_sub(Duration::from_millis(1000))
+            .expect("instant predates process start");
+        accumulate_state_time(&mut state, Instant::now(), agent_active);
+        state
+    }
+
+    #[test]
+    fn agent_time_accrues_independently_of_activity_state() {
+        // Agent time overlaps the state counters rather than partitioning
+        // them, so an idle user with a working agent accrues both.
+        let state = advanced_state(ActivityState::Idle, true);
+        assert!(state.accumulated_agent_ms >= 1000);
+        assert!(state.accumulated_idle_ms >= 1000);
+        assert_eq!(state.accumulated_active_ms, 0);
+    }
+
+    #[test]
+    fn agent_time_accrues_while_the_user_is_also_active() {
+        let state = advanced_state(ActivityState::Active, true);
+        assert!(state.accumulated_agent_ms >= 1000);
+        assert!(state.accumulated_active_ms >= 1000);
+    }
+
+    #[test]
+    fn no_agent_means_no_agent_time() {
+        let state = advanced_state(ActivityState::Active, false);
+        assert_eq!(state.accumulated_agent_ms, 0);
+        assert!(state.accumulated_active_ms >= 1000);
+    }
+
+    #[test]
+    fn resetting_accumulators_clears_agent_time() {
+        // A leak here would carry one session's agent time into the next.
+        let mut state = advanced_state(ActivityState::Active, true);
+        assert!(state.accumulated_agent_ms > 0);
+        state.reset_accumulators();
+        assert_eq!(state.accumulated_agent_ms, 0);
+    }
+
+    #[test]
+    fn focused_metadata_change_requires_a_session_flush() {
+        let mut state = WatchState::new(0, 0);
+        state.focused_id = Some(7);
+        state.windows.insert(
+            7,
+            WindowInfo {
+                app_id: "zen".to_string(),
+                title: "GitHub".to_string(),
+                pid: Some(10),
+            },
+        );
+
+        let changed = WindowInfo {
+            app_id: "zen".to_string(),
+            title: "YouTube".to_string(),
+            pid: Some(10),
+        };
+        let pid_only = WindowInfo {
+            app_id: "zen".to_string(),
+            title: "GitHub".to_string(),
+            pid: Some(11),
+        };
+
+        assert!(should_flush_metadata_change(&state, 7, &changed));
+        assert!(!should_flush_metadata_change(&state, 7, &pid_only));
+        assert!(!should_flush_metadata_change(&state, 8, &changed));
     }
 }

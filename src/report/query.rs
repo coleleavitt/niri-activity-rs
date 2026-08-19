@@ -1,15 +1,15 @@
 //! Query functions for activity data retrieval.
 
 use std::collections::HashMap;
-use std::str::FromStr;
 
-use chrono::Timelike;
+use chrono::{DateTime, Timelike, Utc};
 use rusqlite::{Connection, params};
 
+use super::interval::{EventInterval, load_human_intervals, load_overlapping};
 use super::types::{
     AppBreakdown, AppGroup, AwayData, CategoryBreakdown, DailyBreakdown, FatigueIndicators,
     FatigueTrend, FlowQuality, FlowSession, FlowSummary, FocusStreak, GapEntry, GapSummary,
-    GapType, HourBreakdown, HourlyErrorRate, InputMetrics, ProjectBreakdown, ReportData,
+    GapType, HourBreakdown, HourlyErrorRate, InputMetrics, Metrics, ProjectBreakdown, ReportData,
     ScheduleBreakdown, StreakSummary, TimelineBucket, TimelineData, TodayData, TodayRow,
 };
 use super::{
@@ -17,6 +17,7 @@ use super::{
     day_start_utc,
 };
 use crate::config::{Category, Config};
+use crate::db::normalize_input_offsets;
 use crate::error::Error;
 
 /// Query today's activity breakdown by application.
@@ -24,27 +25,22 @@ pub fn query_today(app: &App) -> Result<TodayData, Error> {
     let date = app.config.local_date_today();
     let start = day_start_utc(&app.config, date)?;
     let end = day_end_utc(&app.config, date)?;
-    let mut stmt = app.conn.prepare(
-        "SELECT app_id, MAX(category) as category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) as total_ms 
-         FROM events WHERE timestamp >= ?1 AND timestamp < ?2
-         GROUP BY app_id ORDER BY total_ms DESC",
-    )?;
-    let rows = stmt
-        .query_map(params![&start, &end], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
+    let mut totals: HashMap<(String, Category), i64> = HashMap::new();
+    for event in load_overlapping(&app.conn, &start, &end)? {
+        let event_total = event.total_ms();
+        let key = (event.app_id, event.category);
+        let total = totals.entry(key).or_default();
+        *total = total.saturating_add(event_total);
+    }
+    let mut rows = totals
         .into_iter()
-        .map(|(app_id, cat_raw, total_ms)| TodayRow {
+        .map(|((app_id, category), total_ms)| TodayRow {
             app_id,
-            category: Category::from_str(&cat_raw).unwrap_or(Category::Neutral),
+            category,
             total_ms,
         })
-        .collect();
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.total_ms));
     Ok(TodayData { date, rows })
 }
 
@@ -58,43 +54,203 @@ pub fn query_metrics_range(
     let days = u32::try_from((bounds.end_date - bounds.start_date).num_days())
         .unwrap_or(u32::MAX)
         .saturating_add(1);
-    let mut stmt = app.conn.prepare(
-        "SELECT category, SUM(active_ms), COALESCE(SUM(passive_ms),0), SUM(idle_ms)
-         FROM events WHERE timestamp >= ?1 AND timestamp < ?2 GROUP BY category",
-    )?;
-    let mut m = super::types::MetricsData {
+    let totals = metrics_between(&app.conn, &app.config, &bounds.since_utc, until_utc)?;
+    Ok(super::types::MetricsData {
         days,
-        total_ms: 0,
-        productive_ms: 0,
-        unproductive_ms: 0,
-        neutral_ms: 0,
-        productive_active_ms: 0,
-        productive_passive_ms: 0,
-        productive_idle_ms: 0,
-    };
-    for row in stmt.query_map(params![&bounds.since_utc, until_utc], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-        ))
-    })? {
-        let (cat_raw, active_ms, passive_ms, idle_ms) = row?;
-        let total = active_ms.saturating_add(passive_ms);
+        total_ms: totals.total_ms,
+        productive_ms: totals.productive_ms,
+        unproductive_ms: totals.unproductive_ms,
+        neutral_ms: totals.neutral_ms,
+        productive_active_ms: totals.productive_active_ms,
+        productive_passive_ms: totals.productive_passive_ms,
+        productive_idle_ms: totals.productive_idle_ms,
+    })
+}
+
+/// Total per-category time for a window, with agent time reattributed.
+///
+/// Shared by every surface that reports productivity so the terminal report,
+/// the spreadsheet, and the CSV export cannot disagree with each other.
+pub(crate) fn metrics_between(
+    conn: &Connection,
+    config: &Config,
+    start: &str,
+    end: &str,
+) -> Result<Metrics, Error> {
+    let mut m = Metrics::default();
+    for event in load_human_intervals(conn, config, start, end)? {
+        let total = event.total_ms();
         m.total_ms = m.total_ms.saturating_add(total);
-        match Category::from_str(&cat_raw).unwrap_or(Category::Neutral) {
+
+        let credited = StateCredit::for_event(config, &event);
+        match event.category {
             Category::Productive => {
                 m.productive_ms = m.productive_ms.saturating_add(total);
-                m.productive_active_ms = m.productive_active_ms.saturating_add(active_ms);
-                m.productive_passive_ms = m.productive_passive_ms.saturating_add(passive_ms);
-                m.productive_idle_ms = m.productive_idle_ms.saturating_add(idle_ms);
+                m.productive_active_ms = m.productive_active_ms.saturating_add(event.active_ms);
+                m.productive_passive_ms = m.productive_passive_ms.saturating_add(event.passive_ms);
+                m.productive_idle_ms = m.productive_idle_ms.saturating_add(event.idle_ms);
             }
-            Category::Unproductive => m.unproductive_ms = m.unproductive_ms.saturating_add(total),
-            Category::Neutral => m.neutral_ms = m.neutral_ms.saturating_add(total),
+            Category::Unproductive => {
+                m.unproductive_ms = m.unproductive_ms.saturating_add(total - credited.total_ms);
+                m.productive_ms = m.productive_ms.saturating_add(credited.total_ms);
+                m.productive_active_ms = m.productive_active_ms.saturating_add(credited.active_ms);
+                m.productive_passive_ms =
+                    m.productive_passive_ms.saturating_add(credited.passive_ms);
+                m.productive_idle_ms = m.productive_idle_ms.saturating_add(credited.idle_ms);
+            }
+            Category::Neutral => {
+                m.neutral_ms = m.neutral_ms.saturating_add(total - credited.total_ms);
+                m.productive_ms = m.productive_ms.saturating_add(credited.total_ms);
+                m.productive_active_ms = m.productive_active_ms.saturating_add(credited.active_ms);
+                m.productive_passive_ms =
+                    m.productive_passive_ms.saturating_add(credited.passive_ms);
+                m.productive_idle_ms = m.productive_idle_ms.saturating_add(credited.idle_ms);
+            }
         }
     }
     Ok(m)
+}
+
+/// Time to move from `category` into `productive` because an agent was working.
+///
+/// Clamped to the category's own total: `agent_ms` is measured against a
+/// session's full span while these figures exclude idle, so an unclamped
+/// credit could exceed the time it is drawn from and push a bucket negative.
+fn agent_credit(config: &Config, category: Category, agent_ms: i64, total_ms: i64) -> i64 {
+    if category == Category::Productive || !config.agent_activity.counts_as_productive {
+        return 0;
+    }
+    agent_ms.clamp(0, total_ms)
+}
+
+fn split_agent_credit(credit: i64, states: (i64, i64, i64)) -> (i64, i64, i64) {
+    let states = (states.0.max(0), states.1.max(0), states.2.max(0));
+    let total = states.0.saturating_add(states.1).saturating_add(states.2);
+    if credit <= 0 || total <= 0 {
+        return (0, 0, 0);
+    }
+    let credit = credit.min(total);
+    let share = |part: i64| {
+        i64::try_from(i128::from(credit) * i128::from(part) / i128::from(total)).unwrap_or(i64::MAX)
+    };
+    let active = share(states.0);
+    let active_passive = share(states.0.saturating_add(states.1));
+    let passive = active_passive.saturating_sub(active);
+    let idle = credit.saturating_sub(active_passive);
+    (active, passive, idle)
+}
+
+#[derive(Clone, Copy, Default)]
+#[allow(clippy::struct_field_names)]
+struct StateCredit {
+    total_ms: i64,
+    active_ms: i64,
+    passive_ms: i64,
+    idle_ms: i64,
+}
+
+impl StateCredit {
+    fn for_event(config: &Config, event: &EventInterval) -> Self {
+        let total_ms = agent_credit(
+            config,
+            event.category,
+            event.agent_ms.unwrap_or(0),
+            event.total_ms(),
+        );
+        let (active_ms, passive_ms, idle_ms) =
+            split_agent_credit(total_ms, (event.active_ms, event.passive_ms, event.idle_ms));
+        Self {
+            total_ms,
+            active_ms,
+            passive_ms,
+            idle_ms,
+        }
+    }
+
+    fn add(&mut self, other: Self) {
+        self.total_ms = self.total_ms.saturating_add(other.total_ms);
+        self.active_ms = self.active_ms.saturating_add(other.active_ms);
+        self.passive_ms = self.passive_ms.saturating_add(other.passive_ms);
+        self.idle_ms = self.idle_ms.saturating_add(other.idle_ms);
+    }
+}
+
+/// Move agent-concurrent time out of the other categories and into
+/// `productive`, preserving each category's own `agent_ms` for display.
+fn reattribute_agent_time_with_credits(
+    mut categories: Vec<CategoryBreakdown>,
+    credits: &HashMap<Category, StateCredit>,
+) -> Vec<CategoryBreakdown> {
+    let mut credited = StateCredit::default();
+    for cat in &mut categories {
+        let credit = credits.get(&cat.category).copied().unwrap_or_default();
+        if credit.total_ms == 0 {
+            continue;
+        }
+        credited.add(credit);
+        cat.total_ms = cat.total_ms.saturating_sub(credit.total_ms);
+        cat.active_ms = cat.active_ms.saturating_sub(credit.active_ms);
+        cat.idle_ms = cat.idle_ms.saturating_sub(credit.idle_ms);
+        cat.agent_ms = cat.agent_ms.saturating_sub(credit.total_ms);
+    }
+
+    if credited.total_ms == 0 {
+        return categories;
+    }
+
+    if let Some(productive) = categories
+        .iter_mut()
+        .find(|c| c.category == Category::Productive)
+    {
+        productive.total_ms = productive.total_ms.saturating_add(credited.total_ms);
+        productive.active_ms = productive.active_ms.saturating_add(credited.active_ms);
+        productive.idle_ms = productive.idle_ms.saturating_add(credited.idle_ms);
+        productive.agent_ms = productive.agent_ms.saturating_add(credited.total_ms);
+    } else {
+        categories.push(CategoryBreakdown {
+            category: Category::Productive,
+            total_ms: credited.total_ms,
+            active_ms: credited.active_ms,
+            idle_ms: credited.idle_ms,
+            agent_ms: credited.total_ms,
+        });
+    }
+
+    categories.sort_by_key(|c| std::cmp::Reverse(c.total_ms));
+    categories.retain(|c| c.total_ms > 0);
+    categories
+}
+
+#[cfg(test)]
+fn reattribute_agent_time(
+    config: &Config,
+    categories: Vec<CategoryBreakdown>,
+) -> Vec<CategoryBreakdown> {
+    let mut credits = HashMap::new();
+    for category in &categories {
+        let total_ms = agent_credit(
+            config,
+            category.category,
+            category.agent_ms,
+            category.total_ms,
+        );
+        let passive_ms = category
+            .total_ms
+            .saturating_sub(category.active_ms)
+            .saturating_sub(category.idle_ms);
+        let (active_ms, passive_ms, idle_ms) =
+            split_agent_credit(total_ms, (category.active_ms, passive_ms, category.idle_ms));
+        credits.insert(
+            category.category,
+            StateCredit {
+                total_ms,
+                active_ms,
+                passive_ms,
+                idle_ms,
+            },
+        );
+    }
+    reattribute_agent_time_with_credits(categories, &credits)
 }
 
 /// Query hourly activity timeline for the past N days, bucketed by minute
@@ -108,32 +264,7 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
     let date = app.config.local_date_today() - chrono::Duration::days(days_back as i64);
     let start = day_start_utc(&app.config, date)?;
     let end = day_end_utc(&app.config, date)?;
-    let mut stmt = app.conn.prepare(
-        "SELECT timestamp, app_id, category, active_ms, COALESCE(passive_ms,0), idle_ms, keystrokes
-         FROM events WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp",
-    )?;
-    struct EventRow {
-        timestamp: String,
-        app_id: String,
-        category: String,
-        active_ms: i64,
-        passive_ms: i64,
-        idle_ms: i64,
-        keystrokes: i64,
-    }
-    let events: Vec<EventRow> = stmt
-        .query_map(params![&start, &end], |row| {
-            Ok(EventRow {
-                timestamp: row.get(0)?,
-                app_id: row.get(1)?,
-                category: row.get(2)?,
-                active_ms: row.get(3)?,
-                passive_ms: row.get(4)?,
-                idle_ms: row.get(5)?,
-                keystrokes: row.get(6)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let events = load_human_intervals(&app.conn, &app.config, &start, &end)?;
 
     struct BucketAcc {
         productive_ms: i64,
@@ -145,33 +276,37 @@ pub fn query_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<Time
     }
     let mut bucket_map: std::collections::BTreeMap<u32, BucketAcc> =
         std::collections::BTreeMap::new();
-    for ev in &events {
-        let Some(ts) = app.config.parse_timestamp_to_local(&ev.timestamp) else {
-            continue;
-        };
-        let mins = ts.hour() * 60 + ts.minute();
-        let key = mins / bucket_min * bucket_min;
-        // Exclude idle_ms from total_ms to avoid double-counting
-        // (idle_ms is tracked separately in b.idle_ms)
-        let total_ms = ev.active_ms.saturating_add(ev.passive_ms);
-        let b = bucket_map.entry(key).or_insert_with(|| BucketAcc {
-            productive_ms: 0,
-            neutral_ms: 0,
-            unproductive_ms: 0,
-            idle_ms: 0,
-            keystrokes: 0,
-            app_totals: HashMap::new(),
-        });
-        match Category::from_str(&ev.category).unwrap_or(Category::Neutral) {
-            Category::Productive => b.productive_ms = b.productive_ms.saturating_add(total_ms),
-            Category::Unproductive => {
-                b.unproductive_ms = b.unproductive_ms.saturating_add(total_ms);
+    for event in &events {
+        for slice in event.minute_slices() {
+            let Some(timestamp) = slice.local_start(&app.config) else {
+                continue;
+            };
+            let minutes = timestamp.hour() * 60 + timestamp.minute();
+            let key = minutes / bucket_min * bucket_min;
+            let total_ms = slice.active_ms.saturating_add(slice.passive_ms);
+            let bucket = bucket_map.entry(key).or_insert_with(|| BucketAcc {
+                productive_ms: 0,
+                neutral_ms: 0,
+                unproductive_ms: 0,
+                idle_ms: 0,
+                keystrokes: 0,
+                app_totals: HashMap::new(),
+            });
+            match slice.category {
+                Category::Productive => {
+                    bucket.productive_ms = bucket.productive_ms.saturating_add(total_ms);
+                }
+                Category::Unproductive => {
+                    bucket.unproductive_ms = bucket.unproductive_ms.saturating_add(total_ms);
+                }
+                Category::Neutral => {
+                    bucket.neutral_ms = bucket.neutral_ms.saturating_add(total_ms);
+                }
             }
-            Category::Neutral => b.neutral_ms = b.neutral_ms.saturating_add(total_ms),
+            bucket.idle_ms = bucket.idle_ms.saturating_add(slice.idle_ms);
+            bucket.keystrokes = bucket.keystrokes.saturating_add(slice.keystrokes);
+            *bucket.app_totals.entry(slice.app_id).or_insert(0) += total_ms;
         }
-        b.idle_ms = b.idle_ms.saturating_add(ev.idle_ms);
-        b.keystrokes = b.keystrokes.saturating_add(ev.keystrokes);
-        *b.app_totals.entry(ev.app_id.clone()).or_insert(0) += total_ms;
     }
     let buckets = bucket_map
         .into_iter()
@@ -210,161 +345,152 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
     let since_utc = &bounds.since_utc;
     let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
 
-    let (total_ms, active_ms, passive_ms, idle_ms, total_keys, total_clicks, total_scroll, total_distance, total_events, jiggler_count): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = app.conn.query_row(
-        "SELECT COALESCE(SUM(active_ms + COALESCE(passive_ms,0) + idle_ms),0), COALESCE(SUM(active_ms),0), COALESCE(SUM(passive_ms),0),
-                COALESCE(SUM(idle_ms),0), COALESCE(SUM(keystrokes),0), COALESCE(SUM(mouse_clicks),0), COALESCE(SUM(scroll_events),0),
-                COALESCE(SUM(mouse_distance),0), COUNT(*), COALESCE(SUM(CASE WHEN jiggler_detected = 1 THEN 1 ELSE 0 END),0)
-         FROM events WHERE timestamp >= ?1 AND timestamp < ?2",
-        params![since_utc, until_utc],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?)),
-    )?;
+    let events = load_human_intervals(&app.conn, &app.config, since_utc, until_utc)?;
+    let mut total_ms = 0i64;
+    let mut active_ms = 0i64;
+    let mut passive_ms = 0i64;
+    let mut idle_ms = 0i64;
+    let mut total_keys = 0i64;
+    let mut total_clicks = 0i64;
+    let mut total_scroll = 0i64;
+    let mut total_distance = 0i64;
+    let total_events = i64::try_from(
+        events
+            .iter()
+            .filter(|event| event.start_ms == event.source_start_ms)
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
+    let mut jiggler_count = 0i64;
+    let mut agent_ms = 0i64;
+    let mut unmeasured_agent_ms = 0i64;
+    let mut category_map: HashMap<Category, CategoryBreakdown> = HashMap::new();
+    let mut category_credits: HashMap<Category, StateCredit> = HashMap::new();
+    let mut app_map: HashMap<(String, Category), AppBreakdown> = HashMap::new();
+    let mut project_map: HashMap<String, ProjectBreakdown> = HashMap::new();
 
-    let categories: Vec<CategoryBreakdown> = {
-        let mut stmt = app.conn.prepare("SELECT category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(idle_ms)
-             FROM events WHERE timestamp >= ?1 AND timestamp < ?2 GROUP BY category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC")?;
-        stmt.query_map(params![since_utc, until_utc], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(
-            |(cat_raw, cat_total, cat_active, cat_idle)| CategoryBreakdown {
-                category: Category::from_str(&cat_raw).unwrap_or(Category::Neutral),
-                total_ms: cat_total,
-                active_ms: cat_active,
-                idle_ms: cat_idle,
-            },
-        )
-        .collect()
-    };
+    for event in &events {
+        let event_total = event.total_ms();
+        total_ms = total_ms.saturating_add(event_total);
+        active_ms = active_ms.saturating_add(event.active_ms);
+        passive_ms = passive_ms.saturating_add(event.passive_ms);
+        idle_ms = idle_ms.saturating_add(event.idle_ms);
+        total_keys = total_keys.saturating_add(event.keystrokes);
+        total_clicks = total_clicks.saturating_add(event.mouse_clicks);
+        total_scroll = total_scroll.saturating_add(event.scroll_events);
+        total_distance = total_distance.saturating_add(event.mouse_distance);
+        if event.start_ms == event.source_start_ms {
+            jiggler_count = jiggler_count.saturating_add(i64::from(event.jiggler_detected));
+        }
+        if let Some(measured_agent_ms) = event.agent_ms {
+            agent_ms = agent_ms.saturating_add(measured_agent_ms);
+        } else {
+            unmeasured_agent_ms = unmeasured_agent_ms.saturating_add(event_total);
+        }
+        category_credits
+            .entry(event.category)
+            .or_default()
+            .add(StateCredit::for_event(&app.config, event));
 
-    let top_apps = {
-        let mut stmt = app.conn.prepare("SELECT app_id, category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(keystrokes), SUM(mouse_clicks)
-             FROM events WHERE timestamp >= ?1 AND timestamp < ?2 GROUP BY app_id, category ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC")?;
-        let flat: Vec<AppBreakdown> = stmt
-            .query_map(params![since_utc, until_utc], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(
-                |(app_id, cat_raw, app_total, app_active, keys, clicks)| AppBreakdown {
-                    app_id,
-                    category: Category::from_str(&cat_raw).unwrap_or(Category::Neutral),
-                    total_ms: app_total,
-                    active_ms: app_active,
-                    keys,
-                    clicks,
-                },
-            )
-            .collect();
-        group_apps(flat, 15)
-    };
+        let category = category_map
+            .entry(event.category)
+            .or_insert(CategoryBreakdown {
+                category: event.category,
+                total_ms: 0,
+                active_ms: 0,
+                idle_ms: 0,
+                agent_ms: 0,
+            });
+        category.total_ms = category.total_ms.saturating_add(event_total);
+        category.active_ms = category.active_ms.saturating_add(event.active_ms);
+        category.idle_ms = category.idle_ms.saturating_add(event.idle_ms);
+        category.agent_ms = category
+            .agent_ms
+            .saturating_add(event.agent_ms.unwrap_or(0));
 
-    let projects: Vec<ProjectBreakdown> = {
-        let mut stmt = app.conn.prepare(
-            "SELECT project, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), SUM(active_ms), SUM(keystrokes), SUM(mouse_clicks)
-             FROM events WHERE timestamp >= ?1 AND timestamp < ?2 AND project IS NOT NULL
-             GROUP BY project ORDER BY SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) DESC LIMIT 15"
-        )?;
-        stmt.query_map(params![since_utc, until_utc], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(
-            |(project, total_ms, active_ms, keys, clicks)| ProjectBreakdown {
-                project,
-                total_ms,
-                active_ms,
-                keys,
-                clicks,
-            },
-        )
-        .collect()
-    };
+        let app_entry = app_map
+            .entry((event.app_id.clone(), event.category))
+            .or_insert_with(|| AppBreakdown {
+                app_id: event.app_id.clone(),
+                category: event.category,
+                total_ms: 0,
+                active_ms: 0,
+                keys: 0,
+                clicks: 0,
+            });
+        app_entry.total_ms = app_entry.total_ms.saturating_add(event_total);
+        app_entry.active_ms = app_entry.active_ms.saturating_add(event.active_ms);
+        app_entry.keys = app_entry.keys.saturating_add(event.keystrokes);
+        app_entry.clicks = app_entry.clicks.saturating_add(event.mouse_clicks);
 
-    struct RawRow {
-        timestamp: String,
-        active_ms: i64,
-        passive_ms: i64,
-        idle_ms: i64,
-        keystrokes: i64,
+        if let Some(project) = &event.project {
+            let project_entry =
+                project_map
+                    .entry(project.clone())
+                    .or_insert_with(|| ProjectBreakdown {
+                        project: project.clone(),
+                        total_ms: 0,
+                        active_ms: 0,
+                        keys: 0,
+                        clicks: 0,
+                    });
+            project_entry.total_ms = project_entry.total_ms.saturating_add(event_total);
+            project_entry.active_ms = project_entry.active_ms.saturating_add(event.active_ms);
+            project_entry.keys = project_entry.keys.saturating_add(event.keystrokes);
+            project_entry.clicks = project_entry.clicks.saturating_add(event.mouse_clicks);
+        }
     }
-    let raw_rows: Vec<RawRow> = {
-        let mut stmt = app.conn.prepare("SELECT timestamp, active_ms, COALESCE(passive_ms,0), idle_ms, keystrokes FROM events WHERE timestamp >= ?1 AND timestamp < ?2")?;
-        stmt.query_map(params![since_utc, until_utc], |row| {
-            Ok(RawRow {
-                timestamp: row.get(0)?,
-                active_ms: row.get(1)?,
-                passive_ms: row.get(2)?,
-                idle_ms: row.get(3)?,
-                keystrokes: row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-    };
+
+    let categories = category_map.into_values().collect::<Vec<_>>();
+    let credited_before = category_credits
+        .values()
+        .map(|credit| credit.total_ms)
+        .sum();
+    let categories = reattribute_agent_time_with_credits(categories, &category_credits);
+
+    let top_apps = group_apps(app_map.into_values().collect(), 15);
+    let mut projects = project_map.into_values().collect::<Vec<_>>();
+    projects.sort_by_key(|project| std::cmp::Reverse(project.total_ms));
+    projects.truncate(15);
 
     let mut daily_map: std::collections::BTreeMap<String, (i64, i64, i64, i64)> =
         std::collections::BTreeMap::new();
     let mut hourly: HashMap<u32, (i64, i64)> = HashMap::new();
-    for row in &raw_rows {
-        let Some(local_dt) = app.config.parse_timestamp_to_local(&row.timestamp) else {
-            continue;
-        };
-        let day_key = local_dt.format("%Y-%m-%d").to_string();
-        let total = row
-            .active_ms
-            .saturating_add(row.passive_ms)
-            .saturating_add(row.idle_ms);
-        let d = daily_map.entry(day_key).or_insert((0, 0, 0, 0));
-        d.0 += total;
-        d.1 += row.active_ms;
-        d.2 += row.keystrokes;
-        d.3 += 1;
-        let minute = local_dt.minute() as i64;
-        let second = local_dt.second() as i64;
-        let millis = (local_dt.nanosecond() / 1_000_000) as i64;
-        let ms_into_hour = (minute * 60 + second) * 1000 + millis;
-        let ms_left = MS_PER_HOUR.saturating_sub(ms_into_hour).max(1);
-        let mut remaining = total;
-        let mut cur_hour = local_dt.hour();
-        let mut first = true;
-        while remaining > 0 {
-            let chunk = if first {
-                remaining.min(ms_left)
-            } else {
-                remaining.min(MS_PER_HOUR)
+    let mut schedule_totals = (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
+    for event in &events {
+        if event.source_start_ms == event.start_ms
+            && let Some(timestamp) = event.local_start(&app.config)
+        {
+            let day = timestamp.format("%Y-%m-%d").to_string();
+            daily_map.entry(day).or_insert((0, 0, 0, 0)).3 += 1;
+        }
+
+        for slice in event.minute_slices() {
+            let Some(timestamp) = slice.local_start(&app.config) else {
+                continue;
             };
-            if chunk <= 0 {
-                break;
+            let slice_total = slice.total_ms();
+            let day = timestamp.format("%Y-%m-%d").to_string();
+            let daily = daily_map.entry(day).or_insert((0, 0, 0, 0));
+            daily.0 = daily.0.saturating_add(slice_total);
+            daily.1 = daily.1.saturating_add(slice.active_ms);
+            daily.2 = daily.2.saturating_add(slice.keystrokes);
+
+            let hour = hourly.entry(timestamp.hour()).or_insert((0, 0));
+            hour.0 = hour.0.saturating_add(slice_total);
+            hour.1 = hour.1.saturating_add(slice.keystrokes);
+
+            if app.config.schedule.enabled {
+                if app.config.schedule.is_in_schedule(&timestamp) {
+                    schedule_totals.0 = schedule_totals.0.saturating_add(slice_total);
+                    schedule_totals.1 = schedule_totals.1.saturating_add(slice.active_ms);
+                    schedule_totals.2 = schedule_totals.2.saturating_add(slice.keystrokes);
+                } else {
+                    schedule_totals.3 = schedule_totals.3.saturating_add(slice_total);
+                    schedule_totals.4 = schedule_totals.4.saturating_add(slice.active_ms);
+                    schedule_totals.5 = schedule_totals.5.saturating_add(slice.keystrokes);
+                }
             }
-            let h = hourly.entry(cur_hour).or_insert((0, 0));
-            h.0 += chunk;
-            if first {
-                h.1 += row.keystrokes;
-            }
-            remaining -= chunk;
-            cur_hour = (cur_hour + 1) % 24;
-            first = false;
         }
     }
     let daily: Vec<DailyBreakdown> = daily_map
@@ -390,52 +516,32 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         .collect();
 
     let schedule = if app.config.schedule.enabled {
-        let (mut wt, mut wa, mut wk, mut at, mut aa, mut ak) = (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
-        for row in &raw_rows {
-            let Some(dt) = app.config.parse_timestamp_to_local(&row.timestamp) else {
-                continue;
-            };
-            let t = row
-                .active_ms
-                .saturating_add(row.passive_ms)
-                .saturating_add(row.idle_ms);
-            if app.config.schedule.is_in_schedule(&dt) {
-                wt += t;
-                wa += row.active_ms;
-                wk += row.keystrokes;
-            } else {
-                at += t;
-                aa += row.active_ms;
-                ak += row.keystrokes;
-            }
-        }
         Some(ScheduleBreakdown {
             work_label: format!(
                 "Work Hours ({}-{}):",
                 app.config.schedule.start, app.config.schedule.end
             ),
-            work_total_ms: wt,
-            work_active_ms: wa,
-            work_keys: wk,
-            after_total_ms: at,
-            after_active_ms: aa,
-            after_keys: ak,
+            work_total_ms: schedule_totals.0,
+            work_active_ms: schedule_totals.1,
+            work_keys: schedule_totals.2,
+            after_total_ms: schedule_totals.3,
+            after_active_ms: schedule_totals.4,
+            after_keys: schedule_totals.5,
         })
     } else {
         None
     };
 
-    let away = query_gaps(
+    let away = Some(query_gaps(
         &app.conn,
         &app.config,
         since_utc,
         until_utc,
         &app.config.sleep,
-    )
-    .ok();
-    let streaks = query_streaks(&app.conn, &app.config, since_utc, until_utc).ok();
-    let input_metrics = query_input_metrics(&app.conn, since_utc, until_utc, total_keys).ok();
-    let flow = query_flow_sessions(&app.conn, &app.config, since_utc, until_utc).ok();
+    )?);
+    let streaks = Some(query_streaks(&events, &app.config));
+    let input_metrics = Some(input_metrics(&events, total_keys));
+    let flow = Some(query_flow_sessions(&events, &app.config));
     let fatigue = query_fatigue_indicators(&app.conn, &app.config, since_utc, until_utc).ok();
 
     Ok(ReportData {
@@ -445,6 +551,9 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
         active_ms,
         passive_ms,
         idle_ms,
+        agent_ms,
+        unmeasured_agent_ms,
+        agent_credited_ms: credited_before,
         total_keys,
         total_clicks,
         total_scroll,
@@ -558,33 +667,7 @@ fn flush_streak(
     app_ms.clear();
 }
 
-fn query_streaks(
-    conn: &Connection,
-    config: &Config,
-    since_utc: &str,
-    until_utc: &str,
-) -> Result<StreakSummary, Error> {
-    struct EventRow {
-        timestamp: String,
-        app_id: String,
-        category: String,
-        active_ms: i64,
-        keystrokes: i64,
-        mouse_clicks: i64,
-    }
-    let mut stmt = conn.prepare("SELECT timestamp, app_id, category, active_ms, keystrokes, mouse_clicks FROM events WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp")?;
-    let events: Vec<EventRow> = stmt
-        .query_map(params![since_utc, until_utc], |row| {
-            Ok(EventRow {
-                timestamp: row.get(0)?,
-                app_id: row.get(1)?,
-                category: row.get(2)?,
-                active_ms: row.get(3)?,
-                keystrokes: row.get(4)?,
-                mouse_clicks: row.get(5)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+fn query_streaks(events: &[EventInterval], config: &Config) -> StreakSummary {
     #[allow(clippy::cast_possible_wrap)]
     let away_ms = config
         .away_threshold_secs
@@ -608,11 +691,13 @@ fn query_streaks(
     let mut pending_unproductive_ms: i64 = 0;
     let mut in_streak = false;
     let mut last_input_ts: Option<chrono::DateTime<chrono::FixedOffset>> = None;
-    for ev in &events {
-        let cat = Category::from_str(&ev.category).unwrap_or(Category::Neutral);
-        let is_prod = cat == Category::Productive;
+    for ev in events {
+        let is_prod = ev.category == Category::Productive;
         let has_input = ev.keystrokes > 0 || ev.mouse_clicks > 0;
-        let cur_dt = config.parse_timestamp_to_local(&ev.timestamp);
+        let cur_dt = ev.local_start(config);
+        let timestamp = DateTime::<Utc>::from_timestamp_millis(ev.start_ms)
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_default();
         if in_streak {
             let input_idle = matches!((last_input_ts, cur_dt), (Some(last), Some(cur)) if (cur - last).num_milliseconds() > idle_timeout_ms);
             let wall_gap = matches!((last_input_ts.or(cur_dt), cur_dt), (Some(prev), Some(cur)) if last_input_ts.is_some() && (cur - prev).num_milliseconds() > away_ms);
@@ -654,7 +739,7 @@ fn query_streaks(
                 *streak_app_ms.entry(ev.app_id.clone()).or_insert(0) += ev.active_ms;
             } else {
                 in_streak = true;
-                streak_start = Some(ev.timestamp.clone());
+                streak_start = Some(timestamp);
                 streak_productive_ms = ev.active_ms;
                 streak_keys = ev.keystrokes;
                 pending_unproductive_ms = 0;
@@ -691,13 +776,13 @@ fn query_streaks(
     let longest_ms = longest.map_or(0, |s| s.duration_ms);
     let longest_app = longest.map(|s| s.app_id.clone()).unwrap_or_default();
     streaks.truncate(5);
-    Ok(StreakSummary {
+    StreakSummary {
         longest_productive_ms: longest_ms,
         longest_productive_app: longest_app,
         avg_productive_streak_ms: avg_streak_ms,
         total_productive_streaks: total_streaks,
         top_streaks: streaks,
-    })
+    }
 }
 
 fn query_gaps(
@@ -707,10 +792,34 @@ fn query_gaps(
     until_utc: &str,
     sleep: &crate::config::SleepConfig,
 ) -> Result<AwayData, Error> {
+    let range_start = chrono::DateTime::parse_from_rfc3339(since_utc)
+        .map_err(|error| Error::InvalidArgument(format!("invalid report start: {error}")))?;
+    let range_end = if until_utc == UNTIL_SENTINEL {
+        Utc::now().fixed_offset()
+    } else {
+        chrono::DateTime::parse_from_rfc3339(until_utc)
+            .map_err(|error| Error::InvalidArgument(format!("invalid report end: {error}")))?
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let halo_ms = (sleep.gap_max_hours.max(0.0) * MS_PER_HOUR as f64).round() as i64;
+    let halo = chrono::Duration::milliseconds(halo_ms);
+    let halo_start = range_start
+        .checked_sub_signed(halo)
+        .unwrap_or(range_start)
+        .to_rfc3339();
+    let halo_end = range_end
+        .checked_add_signed(halo)
+        .unwrap_or(range_end)
+        .to_rfc3339();
+
     let mut stmt = conn.prepare(
-        "WITH ordered AS (SELECT timestamp, LAG(timestamp) OVER (ORDER BY timestamp) as prev_ts FROM events WHERE timestamp >= ?1 AND timestamp < ?2),
-         gaps AS (SELECT prev_ts as gap_start, timestamp as gap_end, (julianday(timestamp) - julianday(prev_ts)) * 24.0 as gap_hours FROM ordered WHERE prev_ts IS NOT NULL)
-         SELECT gap_start, gap_end, gap_hours FROM gaps ORDER BY gap_start")?;
+        "SELECT timestamp,
+                active_ms + COALESCE(passive_ms, 0) + idle_ms AS total_ms,
+                input_offsets, keystrokes, mouse_clicks, scroll_events
+           FROM events
+          WHERE timestamp >= ?1 AND timestamp < ?2
+          ORDER BY timestamp, id",
+    )?;
     struct RawGap {
         gap_start: String,
         gap_end: String,
@@ -718,64 +827,154 @@ fn query_gaps(
         duration_ms: i64,
     }
     let mut raw_gaps: Vec<RawGap> = Vec::new();
-    for row in stmt.query_map(params![since_utc, until_utc], |row| {
+    let mut input_points = Vec::new();
+    let mut legacy_intervals = Vec::new();
+    let mut legacy_events = Vec::new();
+    let mut has_measured_rows = false;
+    for row in stmt.query_map(params![halo_start, halo_end], |row| {
         Ok((
             row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, f64>(2)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
         ))
     })? {
-        let (gap_start, gap_end, gap_hours) = row?;
-        if !(sleep.gap_min_hours..=sleep.gap_max_hours).contains(&gap_hours) {
+        let (timestamp, total_ms, offsets, keystrokes, mouse_clicks, scroll_events) = row?;
+        let Ok(start) = chrono::DateTime::parse_from_rfc3339(&timestamp) else {
             continue;
+        };
+        let start_ms = start.timestamp_millis();
+        let duration_ms = total_ms.max(0);
+        let end_ms = start_ms.saturating_add(duration_ms);
+        let has_counted_input = keystrokes > 0 || mouse_clicks > 0 || scroll_events > 0;
+        match offsets {
+            Some(blob) if blob.len() % 4 == 0 => {
+                has_measured_rows = true;
+                if let Some(decoded) = normalize_input_offsets(&blob, duration_ms) {
+                    input_points.extend(decoded.iter().map(|offset| {
+                        start_ms.saturating_add(i64::from(*offset).min(duration_ms))
+                    }));
+                    if decoded.is_empty() && has_counted_input {
+                        input_points.push(end_ms);
+                    }
+                } else if has_counted_input {
+                    input_points.push(end_ms);
+                }
+            }
+            _ => {
+                legacy_intervals.push((start_ms, end_ms));
+                legacy_events.push((start_ms, duration_ms));
+                if has_counted_input {
+                    input_points.push(end_ms);
+                }
+            }
         }
-        let start_hour = config
-            .parse_timestamp_to_local(&gap_start)
-            .map_or(0, |dt| dt.hour());
-        let end_hour = config
-            .parse_timestamp_to_local(&gap_end)
-            .map_or(0, |dt| dt.hour());
-        let Some(gap_type) = classify_gap(start_hour, end_hour, gap_hours, sleep) else {
-            continue;
+    }
+    input_points.sort_unstable();
+    input_points.dedup();
+
+    let range_start_ms = range_start.timestamp_millis();
+    let range_end_ms = range_end.timestamp_millis();
+    {
+        let mut record_gap = |gap_start_ms: i64, gap_end_ms: i64| {
+            let gap_start_dt = DateTime::<Utc>::from_timestamp_millis(gap_start_ms);
+            let gap_end_dt = DateTime::<Utc>::from_timestamp_millis(gap_end_ms);
+            let (Some(gap_start_dt), Some(gap_end_dt)) = (gap_start_dt, gap_end_dt) else {
+                return;
+            };
+            let gap_ms = gap_end_dt
+                .signed_duration_since(gap_start_dt)
+                .num_milliseconds();
+            let gap_hours = gap_ms as f64 / MS_PER_HOUR as f64;
+            if !(sleep.gap_min_hours..=sleep.gap_max_hours).contains(&gap_hours) {
+                return;
+            }
+            let gap_start = gap_start_dt.to_rfc3339();
+            let gap_end = gap_end_dt.to_rfc3339();
+            let start_hour = config
+                .parse_timestamp_to_local(&gap_start)
+                .map_or(0, |dt| dt.hour());
+            let end_hour = config
+                .parse_timestamp_to_local(&gap_end)
+                .map_or(0, |dt| dt.hour());
+            let Some(gap_type) = classify_gap(start_hour, end_hour, gap_hours, sleep) else {
+                return;
+            };
+            let clipped_start_ms = gap_start_ms.max(range_start_ms);
+            let clipped_end_ms = gap_end_ms.min(range_end_ms);
+            if clipped_start_ms >= clipped_end_ms {
+                return;
+            }
+            let Some(clipped_start) = DateTime::<Utc>::from_timestamp_millis(clipped_start_ms)
+            else {
+                return;
+            };
+            let Some(clipped_end) = DateTime::<Utc>::from_timestamp_millis(clipped_end_ms) else {
+                return;
+            };
+            raw_gaps.push(RawGap {
+                gap_start: clipped_start.to_rfc3339(),
+                gap_end: clipped_end.to_rfc3339(),
+                gap_type,
+                duration_ms: clipped_end_ms.saturating_sub(clipped_start_ms),
+            });
         };
-        let duration_ms = if gap_hours.is_finite()
-            && gap_hours >= 0.0
-            && gap_hours <= (i64::MAX as f64 / MS_PER_HOUR as f64)
-        {
-            (gap_hours * MS_PER_HOUR as f64) as i64
+
+        if has_measured_rows {
+            for points in input_points.windows(2) {
+                let gap_start_ms = points[0];
+                let gap_end_ms = points[1];
+                if legacy_intervals
+                    .iter()
+                    .any(|(start, end)| *start < gap_end_ms && *end > gap_start_ms)
+                {
+                    continue;
+                }
+                record_gap(gap_start_ms, gap_end_ms);
+            }
         } else {
-            i64::MAX
-        };
-        raw_gaps.push(RawGap {
-            gap_start,
-            gap_end,
-            gap_type,
-            duration_ms,
-        });
+            for events in legacy_events.windows(2) {
+                let gap_start_ms = events[0].0.saturating_add(events[0].1);
+                record_gap(gap_start_ms, events[1].0);
+            }
+        }
     }
     let merge_window_ms = i64::from(sleep.merge_window_min).saturating_mul(MS_PER_MIN);
     let mut merged: Vec<RawGap> = Vec::new();
     for gap in raw_gaps {
         let should_merge = merge_window_ms > 0
-            && gap.gap_type == GapType::Sleep
             && merged.last().is_some_and(|prev| {
-                if prev.gap_type != GapType::Sleep {
+                let Some(prev_start) = config.parse_timestamp_to_local(&prev.gap_start) else {
                     return false;
-                }
+                };
                 let Some(prev_end) = config.parse_timestamp_to_local(&prev.gap_end) else {
                     return false;
                 };
                 let Some(curr_start) = config.parse_timestamp_to_local(&gap.gap_start) else {
                     return false;
                 };
+                let Some(curr_end) = config.parse_timestamp_to_local(&gap.gap_end) else {
+                    return false;
+                };
                 let between = curr_start
                     .signed_duration_since(prev_end)
                     .num_milliseconds();
-                between >= 0 && between < merge_window_ms
+                if between < 0 || between >= merge_window_ms {
+                    return false;
+                }
+                let combined_ms = curr_end
+                    .signed_duration_since(prev_start)
+                    .num_milliseconds();
+                let combined_hours = combined_ms as f64 / MS_PER_HOUR as f64;
+                classify_gap(prev_start.hour(), curr_end.hour(), combined_hours, sleep)
+                    == Some(GapType::Sleep)
             });
         if should_merge {
             if let Some(prev) = merged.last_mut() {
                 prev.gap_end.clone_from(&gap.gap_end);
+                prev.gap_type = GapType::Sleep;
                 if let (Some(s), Some(e)) = (
                     config.parse_timestamp_to_local(&prev.gap_start),
                     config.parse_timestamp_to_local(&gap.gap_end),
@@ -853,72 +1052,63 @@ fn query_gaps(
     })
 }
 
-fn query_input_metrics(
-    conn: &Connection,
-    since_utc: &str,
-    until_utc: &str,
-    total_keys: i64,
-) -> Result<InputMetrics, Error> {
-    let (backspace_count, modifier_count, left_clicks, right_clicks, middle_clicks, scroll_up, scroll_down, scroll_horizontal): (i64, i64, i64, i64, i64, i64, i64, i64) = conn.query_row(
-        "SELECT COALESCE(SUM(backspace_count),0), COALESCE(SUM(modifier_count),0), COALESCE(SUM(left_clicks),0), COALESCE(SUM(right_clicks),0),
-                COALESCE(SUM(middle_clicks),0), COALESCE(SUM(scroll_up),0), COALESCE(SUM(scroll_down),0), COALESCE(SUM(scroll_horizontal),0)
-         FROM events WHERE timestamp >= ?1 AND timestamp < ?2", params![since_utc, until_utc],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)))?;
+fn input_metrics(events: &[EventInterval], total_keys: i64) -> InputMetrics {
+    let mut metrics = InputMetrics {
+        backspace_count: 0,
+        modifier_count: 0,
+        left_clicks: 0,
+        right_clicks: 0,
+        middle_clicks: 0,
+        scroll_up: 0,
+        scroll_down: 0,
+        scroll_horizontal: 0,
+        backspace_rate: 0.0,
+        modifier_rate: 0.0,
+    };
+    for event in events {
+        metrics.backspace_count = metrics
+            .backspace_count
+            .saturating_add(event.granular.backspace_count);
+        metrics.modifier_count = metrics
+            .modifier_count
+            .saturating_add(event.granular.modifier_count);
+        metrics.left_clicks = metrics
+            .left_clicks
+            .saturating_add(event.granular.left_clicks);
+        metrics.right_clicks = metrics
+            .right_clicks
+            .saturating_add(event.granular.right_clicks);
+        metrics.middle_clicks = metrics
+            .middle_clicks
+            .saturating_add(event.granular.middle_clicks);
+        metrics.scroll_up = metrics.scroll_up.saturating_add(event.granular.scroll_up);
+        metrics.scroll_down = metrics
+            .scroll_down
+            .saturating_add(event.granular.scroll_down);
+        metrics.scroll_horizontal = metrics
+            .scroll_horizontal
+            .saturating_add(event.granular.scroll_horizontal);
+    }
     let backspace_rate = if total_keys > 0 {
-        (backspace_count as f64 / total_keys as f64) * 100.0
+        (metrics.backspace_count as f64 / total_keys as f64) * 100.0
     } else {
         0.0
     };
     let modifier_rate = if total_keys > 0 {
-        (modifier_count as f64 / total_keys as f64) * 100.0
+        (metrics.modifier_count as f64 / total_keys as f64) * 100.0
     } else {
         0.0
     };
-    Ok(InputMetrics {
-        backspace_count,
-        modifier_count,
-        left_clicks,
-        right_clicks,
-        middle_clicks,
-        scroll_up,
-        scroll_down,
-        scroll_horizontal,
-        backspace_rate,
-        modifier_rate,
-    })
+    metrics.backspace_rate = backspace_rate;
+    metrics.modifier_rate = modifier_rate;
+    metrics
 }
 
-fn query_flow_sessions(
-    conn: &Connection,
-    config: &Config,
-    since_utc: &str,
-    until_utc: &str,
-) -> Result<FlowSummary, Error> {
+fn query_flow_sessions(rows: &[EventInterval], config: &Config) -> FlowSummary {
     const GAP_TOLERANCE_MS: i64 = 2 * 60 * 1000;
     const MIN_SESSION_MS: i64 = 5 * 60 * 1000;
     const MIN_KEYS_THRESHOLD: f64 = 30.0;
     const OPTIMAL_KEYS: f64 = 80.0;
-    struct EventRow {
-        app_id: String,
-        timestamp: String,
-        active_ms: i64,
-        keystrokes: i64,
-        backspace_count: i64,
-        category: String,
-    }
-    let mut stmt = conn.prepare("SELECT app_id, timestamp, active_ms, keystrokes, backspace_count, category FROM events WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp")?;
-    let rows: Vec<EventRow> = stmt
-        .query_map(params![since_utc, until_utc], |row| {
-            Ok(EventRow {
-                app_id: row.get(0)?,
-                timestamp: row.get(1)?,
-                active_ms: row.get(2)?,
-                keystrokes: row.get(3)?,
-                backspace_count: row.get(4)?,
-                category: row.get(5)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
     struct SessionBuilder {
         app_id: String,
         start_ts: String,
@@ -985,9 +1175,12 @@ fn query_flow_sessions(
             backspace_rate_pct: br,
         });
     };
-    for row in &rows {
-        let is_prod = Category::from_str(&row.category) == Ok(Category::Productive);
-        let cur_dt = config.parse_timestamp_to_local(&row.timestamp);
+    for row in rows {
+        let is_prod = row.category == Category::Productive;
+        let cur_dt = row.local_start(config);
+        let timestamp = DateTime::<Utc>::from_timestamp_millis(row.start_ms)
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_default();
         let gap_exceeded = current.as_ref().is_some_and(|c| matches!((c.last_event_ts, cur_dt), (Some(last), Some(cur)) if (cur - last).num_milliseconds() > GAP_TOLERANCE_MS));
         if (gap_exceeded || (!is_prod && current.is_some()))
             && let Some(b) = current.take()
@@ -1009,7 +1202,7 @@ fn query_flow_sessions(
             if c.app_id == row.app_id {
                 c.duration_ms += row.active_ms;
                 c.keystrokes += row.keystrokes;
-                c.backspaces += row.backspace_count;
+                c.backspaces += row.granular.backspace_count;
                 c.event_rates.push(event_rate);
                 c.last_event_ts = cur_dt;
             } else {
@@ -1017,10 +1210,10 @@ fn query_flow_sessions(
                 finalize(b, config, &mut sessions);
                 current = Some(SessionBuilder {
                     app_id: row.app_id.clone(),
-                    start_ts: row.timestamp.clone(),
+                    start_ts: timestamp.clone(),
                     duration_ms: row.active_ms,
                     keystrokes: row.keystrokes,
-                    backspaces: row.backspace_count,
+                    backspaces: row.granular.backspace_count,
                     event_rates: vec![event_rate],
                     last_event_ts: cur_dt,
                 });
@@ -1028,10 +1221,10 @@ fn query_flow_sessions(
         } else {
             current = Some(SessionBuilder {
                 app_id: row.app_id.clone(),
-                start_ts: row.timestamp.clone(),
+                start_ts: timestamp,
                 duration_ms: row.active_ms,
                 keystrokes: row.keystrokes,
-                backspaces: row.backspace_count,
+                backspaces: row.granular.backspace_count,
                 event_rates: vec![event_rate],
                 last_event_ts: cur_dt,
             });
@@ -1082,7 +1275,7 @@ fn query_flow_sessions(
         FlowQuality::Light
     };
     let top_sessions: Vec<FlowSession> = sessions.into_iter().take(5).collect();
-    Ok(FlowSummary {
+    FlowSummary {
         total_flow_ms,
         flow_sessions,
         avg_flow_duration_ms,
@@ -1093,7 +1286,7 @@ fn query_flow_sessions(
         moderate_flow_ms: mod_ms,
         light_flow_ms: light_ms,
         top_sessions,
-    })
+    }
 }
 
 fn compute_consistency(rates: &[f64]) -> u8 {
@@ -1199,58 +1392,198 @@ fn query_fatigue_indicators(
 
 #[cfg(test)]
 mod tests {
+    use chrono::Datelike;
     use rusqlite::Connection;
 
     use super::*;
     use crate::config::SleepConfig;
     use crate::db::init_db;
 
+    fn config_with_credit(enabled: bool) -> Config {
+        let mut config = Config::default();
+        config.agent_activity.counts_as_productive = enabled;
+        config
+    }
+
+    fn breakdown(category: Category, total_ms: i64, agent_ms: i64) -> CategoryBreakdown {
+        CategoryBreakdown {
+            category,
+            total_ms,
+            active_ms: total_ms,
+            idle_ms: 0,
+            agent_ms,
+        }
+    }
+
+    fn total_of(categories: &[CategoryBreakdown], category: Category) -> i64 {
+        categories
+            .iter()
+            .find(|c| c.category == category)
+            .map_or(0, |c| c.total_ms)
+    }
+
+    #[test]
+    fn agent_time_moves_from_unproductive_to_productive() {
+        let input = vec![
+            breakdown(Category::Productive, 3_600_000, 1_800_000),
+            breakdown(Category::Unproductive, 1_200_000, 600_000),
+        ];
+        let out = reattribute_agent_time(&config_with_credit(true), input);
+
+        assert_eq!(total_of(&out, Category::Productive), 4_200_000);
+        assert_eq!(total_of(&out, Category::Unproductive), 600_000);
+    }
+
+    #[test]
+    fn reattribution_conserves_category_agent_time() {
+        let input = vec![
+            breakdown(Category::Productive, 3_600_000, 1_000_000),
+            breakdown(Category::Unproductive, 1_200_000, 600_000),
+        ];
+
+        let out = reattribute_agent_time(&config_with_credit(true), input);
+
+        let productive = out
+            .iter()
+            .find(|category| category.category == Category::Productive)
+            .expect("productive category");
+        assert_eq!(productive.agent_ms, 1_600_000);
+        assert_eq!(
+            out.iter().map(|category| category.agent_ms).sum::<i64>(),
+            1_600_000
+        );
+    }
+
+    #[test]
+    fn reattribution_conserves_total_time() {
+        let input = vec![
+            breakdown(Category::Productive, 3_600_000, 1_000_000),
+            breakdown(Category::Unproductive, 1_200_000, 600_000),
+            breakdown(Category::Neutral, 900_000, 300_000),
+        ];
+        let before: i64 = input.iter().map(|c| c.total_ms).sum();
+        let after: i64 = reattribute_agent_time(&config_with_credit(true), input)
+            .iter()
+            .map(|c| c.total_ms)
+            .sum();
+
+        assert_eq!(before, after, "moving time must not create or destroy any");
+    }
+
+    #[test]
+    fn reattribution_preserves_human_state_totals() {
+        let input = vec![CategoryBreakdown {
+            category: Category::Unproductive,
+            total_ms: 600_000,
+            active_ms: 60_000,
+            idle_ms: 240_000,
+            agent_ms: 300_000,
+        }];
+
+        let out = reattribute_agent_time(&config_with_credit(true), input);
+
+        assert_eq!(
+            out.iter().map(|category| category.active_ms).sum::<i64>(),
+            60_000
+        );
+        assert_eq!(
+            out.iter().map(|category| category.idle_ms).sum::<i64>(),
+            240_000
+        );
+    }
+
+    #[test]
+    fn credit_rounding_never_creates_a_missing_state() {
+        assert_eq!(split_agent_credit(1, (1, 1, 0)), (0, 1, 0));
+    }
+
+    #[test]
+    fn disabling_the_setting_leaves_categories_untouched() {
+        let input = vec![
+            breakdown(Category::Productive, 3_600_000, 1_000_000),
+            breakdown(Category::Unproductive, 1_200_000, 600_000),
+        ];
+        let out = reattribute_agent_time(&config_with_credit(false), input);
+
+        assert_eq!(total_of(&out, Category::Productive), 3_600_000);
+        assert_eq!(total_of(&out, Category::Unproductive), 1_200_000);
+    }
+
+    #[test]
+    fn credit_cannot_exceed_the_time_it_comes_from() {
+        // agent_ms spans a whole session while total_ms excludes idle, so the
+        // raw figure can exceed the bucket it is drawn from.
+        let input = vec![breakdown(Category::Unproductive, 500_000, 900_000)];
+        let out = reattribute_agent_time(&config_with_credit(true), input);
+
+        assert_eq!(total_of(&out, Category::Unproductive), 0);
+        assert_eq!(
+            total_of(&out, Category::Productive),
+            500_000,
+            "credit must clamp to the source category's total"
+        );
+    }
+
+    #[test]
+    fn a_categorys_agent_time_never_exceeds_its_own_total() {
+        // Subtracting the credit from total_ms but not agent_ms once produced
+        // "8m (agent: 31m 366%)" in a real report.
+        let input = vec![
+            breakdown(Category::Productive, 3_600_000, 1_000_000),
+            breakdown(Category::Unproductive, 1_200_000, 900_000),
+        ];
+        for cat in reattribute_agent_time(&config_with_credit(true), input) {
+            assert!(
+                cat.agent_ms <= cat.total_ms,
+                "{:?}: agent {} exceeds total {}",
+                cat.category,
+                cat.agent_ms,
+                cat.total_ms
+            );
+        }
+    }
+
+    #[test]
+    fn reattribution_preserves_proportional_idle_breakdowns() {
+        let mut idle_heavy = breakdown(Category::Unproductive, 1_000, 900);
+        idle_heavy.active_ms = 100;
+        idle_heavy.idle_ms = 700;
+
+        let out = reattribute_agent_time(&config_with_credit(true), vec![idle_heavy]);
+        let unproductive = out
+            .iter()
+            .find(|category| category.category == Category::Unproductive)
+            .expect("unproductive remainder");
+
+        assert_eq!(unproductive.total_ms, 100);
+        assert_eq!(unproductive.active_ms, 10);
+        assert_eq!(unproductive.idle_ms, 70);
+    }
+
+    #[test]
+    fn productive_time_is_never_double_counted() {
+        let input = vec![breakdown(Category::Productive, 3_600_000, 3_600_000)];
+        let out = reattribute_agent_time(&config_with_credit(true), input);
+        assert_eq!(total_of(&out, Category::Productive), 3_600_000);
+    }
+
+    #[test]
+    fn a_productive_bucket_appears_when_none_existed() {
+        let input = vec![breakdown(Category::Unproductive, 1_200_000, 600_000)];
+        let out = reattribute_agent_time(&config_with_credit(true), input);
+        assert_eq!(total_of(&out, Category::Productive), 600_000);
+    }
+
+    /// Build a schema identical to a real database.
+    ///
+    /// Runs the production migrations rather than restating them, so a new
+    /// column cannot pass its own tests while breaking every query here.
     fn setup_test_db() -> rusqlite::Result<Connection> {
-        let conn = Connection::open_in_memory()?;
-        init_db(&conn).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        // Run migrations to add all columns
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN passive_ms INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN jiggler_detected INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-        conn.execute("ALTER TABLE events ADD COLUMN input_offsets BLOB", [])?;
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN backspace_count INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN modifier_count INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN left_clicks INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN right_clicks INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN middle_clicks INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN scroll_up INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN scroll_down INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN scroll_horizontal INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-        conn.execute("ALTER TABLE events ADD COLUMN project TEXT", [])?;
+        let mut conn = Connection::open_in_memory()?;
+        let to_sqlite =
+            |e: crate::error::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(e));
+        init_db(&conn).map_err(to_sqlite)?;
+        crate::db::run_migrations(&mut conn, &Config::default()).map_err(to_sqlite)?;
         Ok(conn)
     }
 
@@ -1274,11 +1607,48 @@ mod tests {
         Ok(())
     }
 
+    struct MeasuredEvent<'a> {
+        timestamp: &'a str,
+        total_ms: i64,
+        agent_ms: i64,
+        input_offsets: &'a [u32],
+    }
+
+    fn insert_measured_event(conn: &Connection, event: MeasuredEvent<'_>) -> rusqlite::Result<()> {
+        let offsets: Vec<u8> = event
+            .input_offsets
+            .iter()
+            .flat_map(|offset| offset.to_le_bytes())
+            .collect();
+        let has_input = !event.input_offsets.is_empty();
+        conn.execute(
+            "INSERT INTO events (
+                 timestamp, app_id, title, category, active_ms, passive_ms, idle_ms,
+                 agent_ms, keystrokes, input_offsets
+             ) VALUES (?1, 'foot', '', 'productive', ?2, ?3, 0, ?4, ?5, ?6)",
+            params![
+                event.timestamp,
+                if has_input { event.total_ms } else { 0 },
+                if has_input { 0 } else { event.total_ms },
+                event.agent_ms,
+                i64::from(has_input),
+                offsets,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Creates a test App with in-memory database and default config.
     fn create_test_app() -> App {
         let conn = setup_test_db().expect("failed to create test db");
         let config = Config::default();
         App { config, conn }
+    }
+
+    fn create_utc_test_app() -> App {
+        let mut app = create_test_app();
+        app.config.timezone = Some(chrono_tz::UTC);
+        app
     }
 
     // ==================== classify_gap tests ====================
@@ -1329,6 +1699,571 @@ mod tests {
         // 30 hour gap = above maximum, returns None
         let result = classify_gap(10, 16, 30.0, &sleep);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn query_gaps_starts_after_previous_event_duration() {
+        let app = create_test_app();
+
+        insert_test_event(
+            &app.conn,
+            "2026-05-25T10:00:00+00:00",
+            "code",
+            "productive",
+            45 * MS_PER_MIN,
+            0,
+            0,
+            100,
+            5,
+        )
+        .expect("insert should succeed");
+        insert_test_event(
+            &app.conn,
+            "2026-05-25T12:00:00+00:00",
+            "code",
+            "productive",
+            MS_PER_MIN,
+            0,
+            0,
+            10,
+            1,
+        )
+        .expect("insert should succeed");
+
+        let away = query_gaps(
+            &app.conn,
+            &app.config,
+            "2026-05-25T00:00:00+00:00",
+            "2026-05-26T00:00:00+00:00",
+            &app.config.sleep,
+        )
+        .expect("query should succeed");
+
+        assert_eq!(away.total_away_ms, 75 * MS_PER_MIN);
+        assert_eq!(away.summaries.len(), 1);
+        assert_eq!(away.summaries[0].gap_type, GapType::ShortBreak);
+        assert_eq!(away.summaries[0].count, 1);
+        assert_eq!(away.entries.len(), 1);
+        assert_eq!(away.entries[0].duration_ms, 75 * MS_PER_MIN);
+    }
+
+    #[test]
+    fn overnight_agent_work_does_not_hide_human_sleep() {
+        let app = create_utc_test_app();
+        insert_measured_event(
+            &app.conn,
+            MeasuredEvent {
+                timestamp: "2026-05-25T22:00:00+00:00",
+                total_ms: MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[1_000],
+            },
+        )
+        .expect("sleep start input");
+        insert_measured_event(
+            &app.conn,
+            MeasuredEvent {
+                timestamp: "2026-05-26T00:00:00+00:00",
+                total_ms: 5 * MS_PER_HOUR,
+                agent_ms: 5 * MS_PER_HOUR,
+                input_offsets: &[],
+            },
+        )
+        .expect("autonomous agent work");
+        insert_measured_event(
+            &app.conn,
+            MeasuredEvent {
+                timestamp: "2026-05-26T06:00:00+00:00",
+                total_ms: MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[1_000],
+            },
+        )
+        .expect("wake input");
+
+        let away = query_gaps(
+            &app.conn,
+            &app.config,
+            "2026-05-25T00:00:00+00:00",
+            "2026-05-27T00:00:00+00:00",
+            &app.config.sleep,
+        )
+        .expect("human gaps");
+        let report = query_report_range(
+            &app,
+            TimeRange::DateRange(
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 26).expect("valid date"),
+            ),
+        )
+        .expect("report");
+
+        assert_eq!(away.summaries.len(), 1);
+        assert_eq!(away.summaries[0].gap_type, GapType::Sleep);
+        assert_eq!(away.summaries[0].total_ms, 8 * MS_PER_HOUR);
+        assert_eq!(report.agent_ms, 5 * MS_PER_HOUR);
+    }
+
+    #[test]
+    fn daytime_agent_work_remains_a_long_break_not_sleep() {
+        let app = create_utc_test_app();
+        for event in [
+            MeasuredEvent {
+                timestamp: "2026-05-25T10:00:00+00:00",
+                total_ms: MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[1_000],
+            },
+            MeasuredEvent {
+                timestamp: "2026-05-25T11:00:00+00:00",
+                total_ms: 2 * MS_PER_HOUR,
+                agent_ms: 2 * MS_PER_HOUR,
+                input_offsets: &[],
+            },
+            MeasuredEvent {
+                timestamp: "2026-05-25T14:00:00+00:00",
+                total_ms: MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[1_000],
+            },
+        ] {
+            insert_measured_event(&app.conn, event).expect("measured event");
+        }
+
+        let away = query_gaps(
+            &app.conn,
+            &app.config,
+            "2026-05-25T00:00:00+00:00",
+            "2026-05-26T00:00:00+00:00",
+            &app.config.sleep,
+        )
+        .expect("human gaps");
+
+        assert_eq!(away.summaries.len(), 1);
+        assert_eq!(away.summaries[0].gap_type, GapType::LongBreak);
+        assert_eq!(away.summaries[0].total_ms, 4 * MS_PER_HOUR);
+    }
+
+    #[test]
+    fn legacy_unknown_event_prevents_speculative_sleep() {
+        let app = create_utc_test_app();
+        for event in [
+            MeasuredEvent {
+                timestamp: "2026-05-25T22:00:00+00:00",
+                total_ms: MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[1_000],
+            },
+            MeasuredEvent {
+                timestamp: "2026-05-26T06:00:00+00:00",
+                total_ms: MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[1_000],
+            },
+        ] {
+            insert_measured_event(&app.conn, event).expect("measured boundary");
+        }
+        insert_test_event(
+            &app.conn,
+            "2026-05-26T02:00:00+00:00",
+            "foot",
+            "productive",
+            MS_PER_MIN,
+            0,
+            0,
+            0,
+            0,
+        )
+        .expect("legacy unknown event");
+
+        let away = query_gaps(
+            &app.conn,
+            &app.config,
+            "2026-05-25T00:00:00+00:00",
+            "2026-05-27T00:00:00+00:00",
+            &app.config.sleep,
+        )
+        .expect("human gaps");
+
+        assert!(away.summaries.is_empty());
+    }
+
+    #[test]
+    fn sleep_uses_boundary_evidence_and_clips_to_report_range() {
+        let app = create_utc_test_app();
+        for event in [
+            MeasuredEvent {
+                timestamp: "2026-05-25T23:00:00+00:00",
+                total_ms: MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[1_000],
+            },
+            MeasuredEvent {
+                timestamp: "2026-05-26T07:00:00+00:00",
+                total_ms: MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[1_000],
+            },
+        ] {
+            insert_measured_event(&app.conn, event).expect("measured boundary");
+        }
+
+        let away = query_gaps(
+            &app.conn,
+            &app.config,
+            "2026-05-26T00:00:00+00:00",
+            "2026-05-27T00:00:00+00:00",
+            &app.config.sleep,
+        )
+        .expect("human gaps");
+
+        assert_eq!(away.summaries.len(), 1);
+        assert_eq!(away.summaries[0].gap_type, GapType::Sleep);
+        assert_eq!(away.summaries[0].total_ms, 7 * MS_PER_HOUR + 1_000);
+    }
+
+    #[test]
+    fn sparse_overnight_input_does_not_fragment_sleep_into_breaks() {
+        let app = create_utc_test_app();
+        for timestamp in [
+            "2026-05-26T01:00:00+00:00",
+            "2026-05-26T03:30:00+00:00",
+            "2026-05-26T05:00:00+00:00",
+            "2026-05-26T07:00:00+00:00",
+        ] {
+            insert_measured_event(
+                &app.conn,
+                MeasuredEvent {
+                    timestamp,
+                    total_ms: MS_PER_MIN,
+                    agent_ms: 0,
+                    input_offsets: &[1_000],
+                },
+            )
+            .expect("sparse input point");
+        }
+
+        let away = query_gaps(
+            &app.conn,
+            &app.config,
+            "2026-05-26T00:00:00+00:00",
+            "2026-05-27T00:00:00+00:00",
+            &app.config.sleep,
+        )
+        .expect("human gaps");
+
+        assert_eq!(away.summaries.len(), 1);
+        assert_eq!(away.summaries[0].gap_type, GapType::Sleep);
+        assert_eq!(away.summaries[0].total_ms, 6 * MS_PER_HOUR);
+    }
+
+    #[test]
+    fn report_active_starts_at_input_instead_of_filling_the_stored_bucket() {
+        let app = create_utc_test_app();
+        insert_measured_event(
+            &app.conn,
+            MeasuredEvent {
+                timestamp: "2026-05-25T10:00:00+00:00",
+                total_ms: 5 * MS_PER_MIN,
+                agent_ms: 5 * MS_PER_MIN,
+                input_offsets: &[4 * MS_PER_MIN as u32],
+            },
+        )
+        .expect("sparse input event");
+
+        let report = query_report_range(
+            &app,
+            TimeRange::DateRange(
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+            ),
+        )
+        .expect("report");
+
+        assert_eq!(report.active_ms, MS_PER_MIN);
+        assert_eq!(report.passive_ms, 0);
+        assert_eq!(report.idle_ms, 4 * MS_PER_MIN);
+        assert_eq!(report.agent_ms, 5 * MS_PER_MIN);
+        assert_eq!(report.total_events, 1);
+
+        let intervals = load_human_intervals(
+            &app.conn,
+            &app.config,
+            "2026-05-25T10:00:00+00:00",
+            "2026-05-25T10:05:00+00:00",
+        )
+        .expect("human intervals");
+        assert_eq!(intervals.len(), 2);
+        assert_eq!(intervals[0].idle_ms, 4 * MS_PER_MIN);
+        assert_eq!(intervals[1].active_ms, MS_PER_MIN);
+    }
+
+    #[test]
+    fn measured_input_counters_stay_in_active_segments() {
+        let app = create_utc_test_app();
+        insert_measured_event(
+            &app.conn,
+            MeasuredEvent {
+                timestamp: "2026-05-25T10:00:00+00:00",
+                total_ms: 5 * MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[MS_PER_MIN as u32],
+            },
+        )
+        .expect("measured input");
+
+        let intervals = load_human_intervals(
+            &app.conn,
+            &app.config,
+            "2026-05-25T10:00:00+00:00",
+            "2026-05-25T10:05:00+00:00",
+        )
+        .expect("human intervals");
+
+        let active_keys = intervals
+            .iter()
+            .filter(|interval| interval.active_ms > 0)
+            .map(|interval| interval.keystrokes)
+            .sum::<i64>();
+        let inactive_keys = intervals
+            .iter()
+            .filter(|interval| interval.active_ms == 0)
+            .map(|interval| interval.keystrokes)
+            .sum::<i64>();
+        assert_eq!(active_keys, 1);
+        assert_eq!(inactive_keys, 0);
+    }
+
+    #[test]
+    fn measured_agent_only_event_is_human_idle() {
+        let app = create_utc_test_app();
+        insert_measured_event(
+            &app.conn,
+            MeasuredEvent {
+                timestamp: "2026-05-25T10:00:00+00:00",
+                total_ms: 5 * MS_PER_MIN,
+                agent_ms: 5 * MS_PER_MIN,
+                input_offsets: &[],
+            },
+        )
+        .expect("agent-only event");
+
+        let report = query_report_range(
+            &app,
+            TimeRange::DateRange(
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+            ),
+        )
+        .expect("report");
+
+        assert_eq!(report.active_ms, 0);
+        assert_eq!(report.passive_ms, 0);
+        assert_eq!(report.idle_ms, 5 * MS_PER_MIN);
+        assert_eq!(report.agent_ms, 5 * MS_PER_MIN);
+    }
+
+    #[test]
+    fn category_credit_is_clamped_per_event_before_aggregation() {
+        let app = create_utc_test_app();
+        for event in [
+            MeasuredEvent {
+                timestamp: "2026-05-25T10:00:00+00:00",
+                total_ms: 100_000,
+                agent_ms: 200_000,
+                input_offsets: &[],
+            },
+            MeasuredEvent {
+                timestamp: "2026-05-25T10:01:40+00:00",
+                total_ms: 100_000,
+                agent_ms: 0,
+                input_offsets: &[],
+            },
+        ] {
+            insert_measured_event(&app.conn, event).expect("measured event");
+        }
+        app.conn
+            .execute("UPDATE events SET category = 'neutral'", [])
+            .expect("neutral fixtures");
+
+        let report = query_report_range(
+            &app,
+            TimeRange::DateRange(
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+            ),
+        )
+        .expect("report");
+        let metrics = metrics_between(
+            &app.conn,
+            &app.config,
+            "2026-05-25T00:00:00+00:00",
+            "2026-05-26T00:00:00+00:00",
+        )
+        .expect("metrics");
+
+        assert_eq!(report.agent_credited_ms, 100_000);
+        assert_eq!(total_of(&report.categories, Category::Productive), 100_000);
+        assert_eq!(total_of(&report.categories, Category::Neutral), 100_000);
+        assert_eq!(metrics.productive_ms, 100_000);
+        assert_eq!(metrics.neutral_ms, 100_000);
+    }
+
+    #[test]
+    fn human_presence_window_crosses_periodic_flush_boundaries() {
+        let app = create_utc_test_app();
+        for event in [
+            MeasuredEvent {
+                timestamp: "2026-05-25T10:00:00+00:00",
+                total_ms: 5 * MS_PER_MIN,
+                agent_ms: 5 * MS_PER_MIN,
+                input_offsets: &[299_000],
+            },
+            MeasuredEvent {
+                timestamp: "2026-05-25T10:05:00+00:00",
+                total_ms: 5 * MS_PER_MIN,
+                agent_ms: 5 * MS_PER_MIN,
+                input_offsets: &[],
+            },
+        ] {
+            insert_measured_event(&app.conn, event).expect("measured event");
+        }
+
+        let report = query_report_range(
+            &app,
+            TimeRange::DateRange(
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+            ),
+        )
+        .expect("report");
+
+        assert_eq!(report.active_ms, 120_000);
+        assert_eq!(report.passive_ms, 180_000);
+        assert_eq!(report.idle_ms, 300_000);
+        assert_eq!(report.agent_ms, 10 * MS_PER_MIN);
+
+        let first = load_human_intervals(
+            &app.conn,
+            &app.config,
+            "2026-05-25T10:00:00+00:00",
+            "2026-05-25T10:05:00+00:00",
+        )
+        .expect("first half");
+        let second = load_human_intervals(
+            &app.conn,
+            &app.config,
+            "2026-05-25T10:05:00+00:00",
+            "2026-05-25T10:10:00+00:00",
+        )
+        .expect("second half");
+        let halves = first.into_iter().chain(second).collect::<Vec<_>>();
+        assert_eq!(
+            halves.iter().map(|event| event.active_ms).sum::<i64>(),
+            120_000
+        );
+        assert_eq!(
+            halves.iter().map(|event| event.passive_ms).sum::<i64>(),
+            180_000
+        );
+        assert_eq!(
+            halves.iter().map(|event| event.idle_ms).sum::<i64>(),
+            300_000
+        );
+    }
+
+    #[test]
+    fn report_preserves_legacy_human_state_without_offsets() {
+        let app = create_utc_test_app();
+        insert_test_event(
+            &app.conn,
+            "2026-05-25T10:00:00+00:00",
+            "foot",
+            "productive",
+            MS_PER_MIN,
+            0,
+            4 * MS_PER_MIN,
+            0,
+            0,
+        )
+        .expect("legacy event");
+
+        let report = query_report_range(
+            &app,
+            TimeRange::DateRange(
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+            ),
+        )
+        .expect("report");
+
+        assert_eq!(report.active_ms, MS_PER_MIN);
+        assert_eq!(report.idle_ms, 4 * MS_PER_MIN);
+    }
+
+    #[test]
+    fn ambiguous_input_row_does_not_disable_following_measured_state() {
+        let app = create_utc_test_app();
+        for event in [
+            MeasuredEvent {
+                timestamp: "2026-05-25T10:00:00+00:00",
+                total_ms: MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[],
+            },
+            MeasuredEvent {
+                timestamp: "2026-05-25T10:01:00+00:00",
+                total_ms: 5 * MS_PER_MIN,
+                agent_ms: 5 * MS_PER_MIN,
+                input_offsets: &[],
+            },
+        ] {
+            insert_measured_event(&app.conn, event).expect("measured event");
+        }
+        app.conn
+            .execute(
+                "UPDATE events SET active_ms = 60000, passive_ms = 0, keystrokes = 1 WHERE timestamp = '2026-05-25T10:00:00+00:00'",
+                [],
+            )
+            .expect("ambiguous fixture");
+
+        let report = query_report_range(
+            &app,
+            TimeRange::DateRange(
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date"),
+            ),
+        )
+        .expect("report");
+
+        assert_eq!(report.active_ms, MS_PER_MIN);
+        assert_eq!(report.idle_ms, 5 * MS_PER_MIN);
+    }
+
+    #[test]
+    fn sparse_input_does_not_create_a_five_minute_focus_streak() {
+        let app = create_utc_test_app();
+        insert_measured_event(
+            &app.conn,
+            MeasuredEvent {
+                timestamp: "2026-05-25T03:53:00+00:00",
+                total_ms: 5 * MS_PER_MIN,
+                agent_ms: 5 * MS_PER_MIN,
+                input_offsets: &[4 * MS_PER_MIN as u32],
+            },
+        )
+        .expect("sparse input event");
+
+        let events = load_human_intervals(
+            &app.conn,
+            &app.config,
+            "2026-05-25T00:00:00+00:00",
+            "2026-05-26T00:00:00+00:00",
+        )
+        .expect("human intervals");
+        let streaks = query_streaks(&events, &app.config);
+
+        assert_eq!(streaks.total_productive_streaks, 0);
     }
 
     // ==================== group_apps tests ====================
@@ -1571,6 +2506,45 @@ mod tests {
         assert_eq!(result.rows[0].app_id, "today_app");
     }
 
+    #[test]
+    fn query_today_preserves_mixed_application_categories() {
+        let app = create_utc_test_app();
+        let today = app.config.local_date_today();
+        let timestamp = format!("{}T10:00:00+00:00", today);
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "zen",
+            "productive",
+            60_000,
+            0,
+            0,
+            0,
+            0,
+        )
+        .expect("productive event");
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "zen",
+            "unproductive",
+            1_000,
+            0,
+            0,
+            0,
+            0,
+        )
+        .expect("unproductive event");
+
+        let result = query_today(&app).expect("today");
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].category, Category::Productive);
+        assert_eq!(result.rows[0].total_ms, 60_000);
+        assert_eq!(result.rows[1].category, Category::Unproductive);
+        assert_eq!(result.rows[1].total_ms, 1_000);
+    }
+
     // ==================== query_metrics_range tests ====================
 
     #[test]
@@ -1603,7 +2577,7 @@ mod tests {
         .expect("insert should succeed");
 
         let result = query_metrics_range(&app, TimeRange::Days(1)).expect("query should succeed");
-        assert_eq!(result.productive_ms, 4200000); // active + passive
+        assert_eq!(result.productive_ms, 4500000);
         assert_eq!(result.productive_active_ms, 3600000);
         assert_eq!(result.productive_passive_ms, 600000);
         assert_eq!(result.productive_idle_ms, 300000);
@@ -1649,6 +2623,148 @@ mod tests {
         assert_eq!(result.unproductive_ms, 1000000);
         assert_eq!(result.neutral_ms, 500000);
         assert_eq!(result.total_ms, 3500000);
+    }
+
+    #[test]
+    fn metrics_and_report_use_the_same_idle_inclusive_totals() {
+        let app = create_utc_test_app();
+        let today = app.config.local_date_today();
+        let timestamp = format!("{}T10:00:00+00:00", today);
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "code",
+            "productive",
+            60_000,
+            0,
+            60_000,
+            0,
+            0,
+        )
+        .expect("productive event");
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "youtube",
+            "unproductive",
+            60_000,
+            0,
+            0,
+            0,
+            0,
+        )
+        .expect("unproductive event");
+
+        let metrics = query_metrics_range(&app, TimeRange::Days(0)).expect("metrics");
+        let report = query_report_range(&app, TimeRange::Days(0)).expect("report");
+        let report_productive = report
+            .categories
+            .iter()
+            .find(|category| category.category == Category::Productive)
+            .expect("productive category");
+
+        assert_eq!(metrics.total_ms, 180_000);
+        assert_eq!(metrics.total_ms, report.total_ms);
+        assert_eq!(metrics.productive_ms, 120_000);
+        assert_eq!(metrics.productive_ms, report_productive.total_ms);
+    }
+
+    #[test]
+    fn report_window_clips_an_event_that_started_before_midnight() {
+        let app = create_utc_test_app();
+        let today = app.config.local_date_today();
+        let yesterday = today - chrono::Duration::days(1);
+        insert_test_event(
+            &app.conn,
+            &format!("{}T23:59:00+00:00", yesterday),
+            "code",
+            "productive",
+            120_000,
+            0,
+            0,
+            100,
+            0,
+        )
+        .expect("cross-midnight event");
+        app.conn
+            .execute(
+                "UPDATE events SET backspace_count = 10 WHERE app_id = 'code'",
+                [],
+            )
+            .expect("granular input");
+        let range = TimeRange::DateRange(today, today);
+
+        let metrics = query_metrics_range(&app, range.clone()).expect("metrics");
+        let report = query_report_range(&app, range).expect("report");
+
+        assert_eq!(metrics.total_ms, 60_000);
+        assert_eq!(report.total_ms, 60_000);
+        assert_eq!(report.daily.len(), 1);
+        assert_eq!(report.daily[0].date, today.to_string());
+        assert_eq!(report.daily[0].total_ms, 60_000);
+        assert_eq!(report.total_keys, 50);
+        assert_eq!(
+            report.input_metrics.expect("input metrics").backspace_count,
+            5
+        );
+    }
+
+    #[test]
+    fn report_clips_granular_input_at_the_window_end() {
+        let app = create_utc_test_app();
+        let today = app.config.local_date_today();
+        insert_test_event(
+            &app.conn,
+            &format!("{}T23:59:00+00:00", today),
+            "code",
+            "productive",
+            120_000,
+            0,
+            0,
+            100,
+            0,
+        )
+        .expect("cross-boundary event");
+        app.conn
+            .execute("UPDATE events SET backspace_count = 10", [])
+            .expect("granular input");
+
+        let report = query_report_range(&app, TimeRange::DateRange(today, today)).expect("report");
+
+        assert_eq!(report.total_keys, 50);
+        assert_eq!(
+            report.input_metrics.expect("input metrics").backspace_count,
+            5
+        );
+    }
+
+    #[test]
+    fn report_splits_an_event_at_the_schedule_boundary() {
+        let mut app = create_utc_test_app();
+        let today = app.config.local_date_today();
+        app.config.schedule.enabled = true;
+        app.config.schedule.start = "09:00".to_string();
+        app.config.schedule.end = "17:00".to_string();
+        app.config.schedule.days = vec![today.weekday().to_string()];
+        insert_test_event(
+            &app.conn,
+            &format!("{}T08:59:30+00:00", today),
+            "code",
+            "productive",
+            60_000,
+            0,
+            0,
+            60,
+            0,
+        )
+        .expect("cross-schedule event");
+
+        let report = query_report_range(&app, TimeRange::Days(0)).expect("report");
+        let schedule = report.schedule.expect("schedule");
+
+        assert_eq!(schedule.work_total_ms, 30_000);
+        assert_eq!(schedule.after_total_ms, 30_000);
+        assert_eq!(schedule.work_keys + schedule.after_keys, 60);
     }
 
     // ==================== query_timeline tests ====================
@@ -1703,6 +2819,42 @@ mod tests {
         // Should have buckets for the events
         assert!(!result.buckets.is_empty());
         assert_eq!(result.bucket_min, 30);
+    }
+
+    #[test]
+    fn query_timeline_splits_events_across_bucket_boundaries() {
+        let app = create_utc_test_app();
+        let today = app.config.local_date_today();
+        insert_test_event(
+            &app.conn,
+            &format!("{}T10:55:00+00:00", today),
+            "code",
+            "productive",
+            600_000,
+            0,
+            0,
+            100,
+            0,
+        )
+        .expect("cross-bucket event");
+
+        let result = query_timeline(&app, 0, 15).expect("timeline");
+
+        assert_eq!(result.buckets.len(), 2);
+        assert_eq!(result.buckets[0].hour, 10);
+        assert_eq!(result.buckets[0].minute, 45);
+        assert_eq!(result.buckets[0].productive_ms, 300_000);
+        assert_eq!(result.buckets[1].hour, 11);
+        assert_eq!(result.buckets[1].minute, 0);
+        assert_eq!(result.buckets[1].productive_ms, 300_000);
+        assert_eq!(
+            result
+                .buckets
+                .iter()
+                .map(|bucket| bucket.keystrokes)
+                .sum::<i64>(),
+            100
+        );
     }
 
     // ==================== query_report_range tests ====================

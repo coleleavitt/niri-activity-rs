@@ -1,13 +1,10 @@
 //! Export functions for CSV, JSON, and heatmap output.
 
-use std::str::FromStr;
-
 use chrono::Timelike;
-use rusqlite::params;
 use serde::Serialize;
 
+use super::interval::load_human_intervals;
 use super::query::query_report_range;
-use super::types::Metrics;
 use super::{App, TimeRange, UNTIL_SENTINEL, day_end_utc, day_start_utc};
 use crate::config::Category;
 use crate::error::Error;
@@ -30,32 +27,7 @@ pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
         }
         let start = day_start_utc(&app.config, date)?;
         let end = day_end_utc(&app.config, date)?;
-        let mut stmt = app.conn.prepare("SELECT category, SUM(active_ms), COALESCE(SUM(passive_ms),0), SUM(idle_ms) FROM events WHERE timestamp >= ?1 AND timestamp < ?2 GROUP BY category")?;
-        let mut m = Metrics::default();
-        for row in stmt.query_map(params![&start, &end], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })? {
-            let (cat_raw, active_ms, passive_ms, idle_ms) = row?;
-            let total = active_ms.saturating_add(passive_ms);
-            m.total_ms = m.total_ms.saturating_add(total);
-            match Category::from_str(&cat_raw).unwrap_or(Category::Neutral) {
-                Category::Productive => {
-                    m.productive_ms = m.productive_ms.saturating_add(total);
-                    m.productive_active_ms = m.productive_active_ms.saturating_add(active_ms);
-                    m.productive_passive_ms = m.productive_passive_ms.saturating_add(passive_ms);
-                    m.productive_idle_ms = m.productive_idle_ms.saturating_add(idle_ms);
-                }
-                Category::Unproductive => {
-                    m.unproductive_ms = m.unproductive_ms.saturating_add(total);
-                }
-                Category::Neutral => m.neutral_ms = m.neutral_ms.saturating_add(total),
-            }
-        }
+        let m = super::query::metrics_between(&app.conn, &app.config, &start, &end)?;
         let prod_ratio = if m.total_ms > 0 {
             format!("{:.1}%", m.productive_ms as f64 / m.total_ms as f64 * 100.0)
         } else {
@@ -144,46 +116,41 @@ pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
 pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
     let bounds = range.resolve(&app.config)?;
     let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
-    let mut stmt = app.conn.prepare("SELECT timestamp, category, active_ms + COALESCE(passive_ms,0) as total_ms, keystrokes FROM events WHERE timestamp >= ?1 AND timestamp < ?2")?;
     let mut heatmap: std::collections::BTreeMap<(String, u32), HeatmapCell> =
         std::collections::BTreeMap::new();
-    for row in stmt.query_map(params![&bounds.since_utc, until_utc], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-        ))
-    })? {
-        let (timestamp, cat_raw, total_ms, keystrokes) = row?;
-        let Some(dt) = app.config.parse_timestamp_to_local(&timestamp) else {
-            continue;
-        };
-        let date = dt.format("%Y-%m-%d").to_string();
-        let hour = dt.hour();
-        let cat = Category::from_str(&cat_raw).unwrap_or(Category::Neutral);
-        let cell = heatmap
-            .entry((date.clone(), hour))
-            .or_insert_with(|| HeatmapCell {
-                date,
-                hour,
-                productive_ms: 0,
-                unproductive_ms: 0,
-                neutral_ms: 0,
-                total_ms: 0,
-                keystrokes: 0,
-            });
-        match cat {
-            Category::Productive => {
-                cell.productive_ms = cell.productive_ms.saturating_add(total_ms);
+    for event in load_human_intervals(&app.conn, &app.config, &bounds.since_utc, until_utc)? {
+        for slice in event.minute_slices() {
+            let Some(timestamp) = slice.local_start(&app.config) else {
+                continue;
+            };
+            let date = timestamp.format("%Y-%m-%d").to_string();
+            let hour = timestamp.hour();
+            let total_ms = slice.active_ms.saturating_add(slice.passive_ms);
+            let cell = heatmap
+                .entry((date.clone(), hour))
+                .or_insert_with(|| HeatmapCell {
+                    date,
+                    hour,
+                    productive_ms: 0,
+                    unproductive_ms: 0,
+                    neutral_ms: 0,
+                    total_ms: 0,
+                    keystrokes: 0,
+                });
+            match slice.category {
+                Category::Productive => {
+                    cell.productive_ms = cell.productive_ms.saturating_add(total_ms);
+                }
+                Category::Unproductive => {
+                    cell.unproductive_ms = cell.unproductive_ms.saturating_add(total_ms);
+                }
+                Category::Neutral => {
+                    cell.neutral_ms = cell.neutral_ms.saturating_add(total_ms);
+                }
             }
-            Category::Unproductive => {
-                cell.unproductive_ms = cell.unproductive_ms.saturating_add(total_ms);
-            }
-            Category::Neutral => cell.neutral_ms = cell.neutral_ms.saturating_add(total_ms),
+            cell.total_ms = cell.total_ms.saturating_add(total_ms);
+            cell.keystrokes = cell.keystrokes.saturating_add(slice.keystrokes);
         }
-        cell.total_ms = cell.total_ms.saturating_add(total_ms);
-        cell.keystrokes = cell.keystrokes.saturating_add(keystrokes);
     }
     let json = serde_json::to_string_pretty(&heatmap.into_values().collect::<Vec<_>>())
         .map_err(|e| Error::NiriError(format!("JSON serialization failed: {}", e)))?;

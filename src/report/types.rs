@@ -49,6 +49,9 @@ pub struct CategoryBreakdown {
     pub total_ms: i64,
     pub active_ms: i64,
     pub idle_ms: i64,
+    /// Time in this category that overlapped an agent working. Overlaps the
+    /// other figures rather than partitioning them.
+    pub agent_ms: i64,
 }
 
 #[derive(Serialize)]
@@ -267,6 +270,14 @@ pub struct ReportData {
     pub active_ms: i64,
     pub passive_ms: i64,
     pub idle_ms: i64,
+    /// Time an agent was working, overlapping the three figures above.
+    pub agent_ms: i64,
+    /// Time in events recorded before agent tracking existed, where a zero
+    /// `agent_ms` means "never measured" rather than "no agent ran".
+    pub unmeasured_agent_ms: i64,
+    /// Agent time moved into `productive` from other categories. Zero when
+    /// `agent_activity.counts_as_productive` is off.
+    pub agent_credited_ms: i64,
     pub total_keys: i64,
     pub total_clicks: i64,
     pub total_scroll: i64,

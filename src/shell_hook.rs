@@ -48,10 +48,10 @@ fi
 }
 
 fn fish_hook() -> String {
-    r#"function __niri_activity_pwd --on-event fish_prompt
+    r"function __niri_activity_pwd --on-event fish_prompt
     printf '%s\n' $PWD > (set -q XDG_DATA_HOME; and echo $XDG_DATA_HOME; or echo $HOME/.local/share)/niri-activity-rs/current_pwd
 end
-"#
+"
     .to_string()
 }
 

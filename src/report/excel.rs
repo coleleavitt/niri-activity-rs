@@ -3,13 +3,11 @@
 
 #[cfg(feature = "excel-extra-sheets")]
 use std::collections::HashMap;
-use std::str::FromStr;
 
 #[cfg(not(feature = "excel-extra-sheets"))]
 use chrono::NaiveDate;
 #[cfg(feature = "excel-extra-sheets")]
 use chrono::{Datelike, NaiveDate};
-use rusqlite::params;
 #[cfg(feature = "excel-extra-sheets")]
 use rust_xlsxwriter::{
     Color, ConditionalFormat3ColorScale, Format, Sparkline, SparklineType, Workbook,
@@ -17,9 +15,12 @@ use rust_xlsxwriter::{
 #[cfg(not(feature = "excel-extra-sheets"))]
 use rust_xlsxwriter::{Color, ConditionalFormat3ColorScale, Format, Workbook};
 
+#[cfg(feature = "excel-extra-sheets")]
+use super::interval::load_human_intervals;
 use super::types::Metrics;
 use super::{App, TimeBounds, TimeRange};
-use crate::config::Category;
+#[cfg(feature = "excel-extra-sheets")]
+use crate::config::{Category, Config};
 use crate::error::Error;
 use crate::fmt::fmt_hms;
 
@@ -58,37 +59,28 @@ struct TopApp {
 /// Query the top N apps by total time in a UTC window.
 fn query_top_apps(
     conn: &rusqlite::Connection,
+    config: &Config,
     since_utc: &str,
     until_utc: &str,
     limit: u32,
 ) -> Result<Vec<TopApp>, Error> {
-    let mut stmt = conn.prepare(
-        "SELECT app_id, MAX(category) AS category, SUM(active_ms + COALESCE(passive_ms,0) + idle_ms) AS total
-         FROM events
-         WHERE timestamp >= ?1 AND timestamp < ?2
-         GROUP BY app_id
-         ORDER BY total DESC
-         LIMIT ?3",
-    )?;
+    let mut totals: HashMap<(String, Category), i64> = HashMap::new();
+    for event in load_human_intervals(conn, config, since_utc, until_utc)? {
+        let event_total = event.total_ms();
+        let total = totals.entry((event.app_id, event.category)).or_default();
+        *total = total.saturating_add(event_total);
+    }
 
-    let rows = stmt.query_map(params![since_utc, until_utc, limit], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
-        ))
-    })?;
-
-    let mut apps = Vec::new();
-    for r in rows {
-        let (app_id, cat_raw, total_ms) = r?;
-        let category = Category::from_str(&cat_raw).unwrap_or(Category::Neutral);
-        apps.push(TopApp {
+    let mut apps = totals
+        .into_iter()
+        .map(|((app_id, category), total_ms)| TopApp {
             app_id,
             category,
             total_ms,
-        });
-    }
+        })
+        .collect::<Vec<_>>();
+    apps.sort_by_key(|app| std::cmp::Reverse(app.total_ms));
+    apps.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(apps)
 }
 
@@ -227,44 +219,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         let day_start = super::day_start_utc(&app.config, date)?;
         let day_end = super::day_end_utc(&app.config, date)?;
 
-        let mut stmt = app.conn.prepare(
-            "SELECT category, SUM(active_ms), COALESCE(SUM(passive_ms),0), SUM(idle_ms)
-             FROM events
-             WHERE timestamp >= ?1 AND timestamp < ?2
-             GROUP BY category",
-        )?;
-
-        let mut m = Metrics::default();
-
-        let rows_iter = stmt.query_map(params![&day_start, &day_end], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-            ))
-        })?;
-
-        for r in rows_iter {
-            let (category_raw, active_ms, passive_ms, idle_ms) = r?;
-            let total = active_ms.saturating_add(passive_ms);
-            m.total_ms = m.total_ms.saturating_add(total);
-
-            match Category::from_str(&category_raw).unwrap_or(Category::Neutral) {
-                Category::Productive => {
-                    m.productive_ms = m.productive_ms.saturating_add(total);
-                    m.productive_active_ms = m.productive_active_ms.saturating_add(active_ms);
-                    m.productive_passive_ms = m.productive_passive_ms.saturating_add(passive_ms);
-                    m.productive_idle_ms = m.productive_idle_ms.saturating_add(idle_ms);
-                }
-                Category::Unproductive => {
-                    m.unproductive_ms = m.unproductive_ms.saturating_add(total);
-                }
-                Category::Neutral => {
-                    m.neutral_ms = m.neutral_ms.saturating_add(total);
-                }
-            }
-        }
+        let m = super::query::metrics_between(&app.conn, &app.config, &day_start, &day_end)?;
 
         let is_workday = app
             .config
@@ -650,7 +605,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
             .as_deref()
             .unwrap_or("9999-12-31T23:59:59+00:00");
 
-        let top_apps = query_top_apps(&app.conn, &bounds.since_utc, until_utc, 20)?;
+        let top_apps = query_top_apps(&app.conn, &app.config, &bounds.since_utc, until_utc, 20)?;
 
         let app_sheet = workbook.add_worksheet();
         app_sheet.set_name("App Breakdown").map_err(xlsx_err)?;
@@ -670,14 +625,9 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         }
 
         // Query total time from ALL apps, not just top-20, for accurate percentage
-        let grand_total_ms: i64 = {
-            let mut stmt = app.conn.prepare(
-                "SELECT COALESCE(SUM(active_ms + COALESCE(passive_ms,0) + idle_ms), 0)
-                 FROM events
-                 WHERE timestamp >= ?1 AND timestamp < ?2",
-            )?;
-            stmt.query_row(params![&bounds.since_utc, until_utc], |r| r.get(0))?
-        };
+        let grand_total_ms =
+            super::query::metrics_between(&app.conn, &app.config, &bounds.since_utc, until_utc)?
+                .total_ms;
 
         for (aidx, app_row) in top_apps.iter().enumerate() {
             let arow = (aidx as u32).saturating_add(1);

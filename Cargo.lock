@@ -305,6 +305,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser-profiles"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -802,6 +814,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -960,6 +982,15 @@ dependencies = [
  "r-efi 6.0.0",
  "wasip2",
  "wasip3",
+]
+
+[[package]]
+name = "harness"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1365,6 +1396,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "linkscope"
+version = "0.1.0"
+dependencies = [
+ "linkscope-macros",
+]
+
+[[package]]
+name = "linkscope-macros"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1512,15 +1558,19 @@ name = "niri-activity-rs"
 version = "0.1.0"
 dependencies = [
  "backon",
+ "browser-profiles",
  "chrono",
  "chrono-tz",
  "clap",
  "crossterm",
  "directories",
  "dirs",
+ "filetime",
+ "harness",
  "input",
  "lettre",
  "libc",
+ "linkscope",
  "logind-zbus",
  "niri-ipc",
  "owo-colors",

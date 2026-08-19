@@ -3,7 +3,7 @@
 use owo_colors::OwoColorize;
 
 use super::query::{query_metrics_range, query_report_range, query_timeline, query_today};
-use super::types::{FatigueTrend, FlowQuality, GapType};
+use super::types::{FatigueTrend, FlowQuality, GapType, ReportData};
 use super::{App, MS_PER_HOUR, MS_PER_MIN, TimeRange};
 use crate::config::Category;
 use crate::error::Error;
@@ -314,14 +314,28 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
         } else {
             0
         };
+        let agent_note = if cat.agent_ms > 0 {
+            format!(
+                " (agent: {} {})",
+                fmt_duration(cat.agent_ms),
+                pct(cat.agent_ms, cat.total_ms)
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "  {} {:<14} {} {} {}",
+            "  {} {:<14} {} {} {}{}",
             icon,
             cat_label(cat.category),
             cat_bar(cat.category, filled),
             fmt_duration(cat.total_ms).bold(),
-            format!("(active: {})", pct(cat.active_ms, cat.total_ms)).dimmed()
+            format!("(active: {})", pct(cat.active_ms, cat.total_ms)).dimmed(),
+            agent_note.cyan()
         );
+    }
+
+    if data.agent_ms > 0 || data.unmeasured_agent_ms > 0 {
+        print_agent_summary(&data);
     }
     println!(
         "\n{}",
@@ -733,6 +747,44 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
 }
 
 /// Display a comparison of productivity metrics across multiple time periods.
+/// Report how much of the period had a coding agent working in parallel.
+///
+/// Deliberately reported beside the categories rather than folded into them:
+/// an agent running does not make a film productive, but it does distinguish
+/// waiting on a build from idle scrolling.
+fn print_agent_summary(data: &ReportData) {
+    println!(
+        "\n{}",
+        section_header("── Agent Activity ────────────────────────────────────")
+    );
+
+    let measured_ms = data.total_ms.saturating_sub(data.unmeasured_agent_ms);
+    println!(
+        "  Agent working:      {} {}",
+        fmt_duration(data.agent_ms).cyan().bold(),
+        format!("of {} measured", fmt_duration(measured_ms)).dimmed()
+    );
+
+    if data.agent_credited_ms > 0 {
+        println!(
+            "  Counted productive: {} {}",
+            fmt_duration(data.agent_credited_ms).green().bold(),
+            "agent time credited from other categories".dimmed()
+        );
+    }
+
+    if data.unmeasured_agent_ms > 0 {
+        println!(
+            "  {}",
+            format!(
+                "{} recorded before agent tracking existed, excluded above",
+                fmt_duration(data.unmeasured_agent_ms)
+            )
+            .dimmed()
+        );
+    }
+}
+
 pub fn show_comparison(app: &App, range: TimeRange) -> Result<(), Error> {
     let current_bounds = range.resolve(&app.config)?;
     let current_days = (current_bounds.end_date - current_bounds.start_date)

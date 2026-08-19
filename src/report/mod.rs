@@ -1,11 +1,14 @@
 //! Report generation and export module.
 
+mod browser;
 mod display;
 mod excel;
 mod export;
+mod interval;
 mod query;
 mod types;
 
+pub use browser::{show_activity, show_engagement, show_referrers};
 use chrono::{Datelike, NaiveDate};
 pub use display::{
     generate_report_range, show_comparison, show_metrics_range, show_timeline, show_today,
@@ -32,7 +35,9 @@ pub struct App {
 
 impl App {
     pub fn open() -> Result<App, Error> {
-        let config = load_config()?;
+        let mut config = load_config()?;
+        // Must precede reclassify_all, which rewrites every stored category.
+        config.load_browser_history();
         let db_path = get_data_dir()?.join("activity.db");
         let mut conn = Connection::open(&db_path)?;
         run_migrations(&mut conn, &config)?;

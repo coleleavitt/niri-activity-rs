@@ -6,6 +6,7 @@ mod error;
 mod fmt;
 mod input;
 mod logind;
+mod profiling;
 mod project;
 mod report;
 mod scheduler;
@@ -51,6 +52,31 @@ struct TimeRangeArgs {
     /// End date (YYYY-MM-DD), use with --from
     #[arg(long)]
     to: Option<String>,
+}
+
+/// Which browser-derived view to show.
+#[derive(Debug, Clone, clap::Subcommand)]
+enum BrowserView {
+    /// Compare tracked focus time against browser-measured view time
+    Engagement {
+        #[arg(short, long, default_value = "7")]
+        days: u32,
+        #[command(flatten)]
+        time: TimeRangeArgs,
+        /// Rows to show
+        #[arg(short, long, default_value = "25")]
+        limit: usize,
+    },
+    /// Show which sites lead to which
+    Referrers {
+        #[arg(short, long, default_value = "25")]
+        limit: usize,
+    },
+    /// Show downloads and address-bar searches
+    Activity {
+        #[arg(short, long, default_value = "15")]
+        limit: usize,
+    },
 }
 
 /// Output format for the export subcommand.
@@ -178,8 +204,20 @@ enum Commands {
         #[command(flatten)]
         time: TimeRangeArgs,
     },
+    /// Compare tracking against the browser's own measurements
+    Browser {
+        #[command(subcommand)]
+        view: BrowserView,
+    },
     /// Initialize config file with examples
     Init,
+    /// Reconstruct agent working time for events recorded before agent
+    /// tracking existed, from coding-agent session logs
+    BackfillAgent {
+        /// How many days back to reconstruct
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+    },
     /// Fix false-active records in the database (reclassify active → passive
     /// for events with 0 keystrokes and 0 mouse clicks)
     FixFalseActive {
@@ -231,6 +269,7 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
+    let _linkscope_report = profiling::init_from_env();
 
     // TUI mode takes over the terminal; disable tracing to stderr.
     // For CLI commands, enable tracing with env-filter (RUST_LOG=info default).
@@ -259,6 +298,20 @@ fn main() {
         Some(Commands::Metrics { days, time }) => parse_time_range(days, &time).and_then(|range| {
             report::App::open().and_then(|app| report::show_metrics_range(&app, range))
         }),
+        Some(Commands::Browser { view }) => match view {
+            BrowserView::Engagement { days, time, limit } => parse_time_range(days, &time)
+                .and_then(|range| {
+                    report::App::open().and_then(|app| report::show_engagement(&app, range, limit))
+                }),
+            BrowserView::Referrers { limit } => {
+                report::show_referrers(limit);
+                Ok(())
+            }
+            BrowserView::Activity { limit } => {
+                report::show_activity(limit);
+                Ok(())
+            }
+        },
         Some(Commands::Timeline { days, bucket }) => {
             report::App::open().and_then(|app| report::show_timeline(&app, days, bucket))
         }
@@ -293,6 +346,19 @@ fn main() {
             })
         }),
         Some(Commands::Init) => config::init_config(),
+        Some(Commands::BackfillAgent { days }) => (|| -> Result<(), Error> {
+            let cfg = config::load_config()?;
+            let db_path = config::get_data_dir()?.join("activity.db");
+            let mut conn = rusqlite::Connection::open(&db_path)?;
+            db::init_db(&conn)?;
+            db::run_migrations(&mut conn, &cfg)?;
+
+            let since = chrono::Utc::now().timestamp() - i64::from(days) * 86_400;
+            println!("Reconstructing agent activity from the last {days} days...");
+            let filled = db::backfill_agent_ms(&mut conn, since)?;
+            println!("Backfilled agent time for {filled} events.");
+            Ok(())
+        })(),
         Some(Commands::FixFalseActive { dry_run }) => (|| -> Result<(), Error> {
             let cfg = config::load_config()?;
             let data_dir = config::get_data_dir()?;
