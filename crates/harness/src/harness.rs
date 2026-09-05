@@ -112,6 +112,10 @@ impl Harness {
                 // streaming and tool execution. The old ~/.jfc/audit path was
                 // project-relative in JFC and wrong for most working directories.
                 Signal::LogDir("~/.config/jfc/logs"),
+                // Keep the daemon subtree as an independent signal. A bounded
+                // root scan may truncate before reaching it, while last_activity
+                // must still observe recent background-agent writes.
+                Signal::LogDir("~/.config/jfc/logs/daemon/agents"),
             ],
             Harness::Jcode => &[Signal::LogDir("~/.jcode/logs")],
             Harness::Amp => &[Signal::LogDir("~/.amp/file-changes")],
@@ -172,6 +176,13 @@ mod tests {
         let signals = Harness::ClaudeCode.signals();
         assert!(signals.contains(&Signal::LogDir("~/.claude/transcripts")));
         assert!(signals.contains(&Signal::LogDir("~/.claude/projects")));
+    }
+
+    #[test]
+    fn jfc_keeps_daemon_agents_as_a_dedicated_signal() {
+        let signals = Harness::Jfc.signals();
+        assert!(signals.contains(&Signal::LogDir("~/.config/jfc/logs")));
+        assert!(signals.contains(&Signal::LogDir("~/.config/jfc/logs/daemon/agents")));
     }
 
     #[test]

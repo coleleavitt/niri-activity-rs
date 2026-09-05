@@ -11,6 +11,7 @@ mod project;
 mod report;
 mod scheduler;
 mod shell_hook;
+mod terminal;
 mod theme;
 mod tui;
 mod watcher;

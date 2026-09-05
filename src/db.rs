@@ -821,17 +821,6 @@ pub fn reclassify_with_thresholds(
     Ok((updated, total_rows))
 }
 
-/// Terminal app IDs that may contain project info in their window titles.
-const TERMINAL_APP_IDS: &[&str] = &[
-    "Alacritty",
-    "kitty",
-    "foot",
-    "org.wezfurlong.wezterm",
-    "wezterm",
-    "alacritty",
-    "org.codeberg.dnkl.foot",
-];
-
 /// Backfill the `project` column for terminal events that have NULL project.
 ///
 /// Processes rows in batches for performance, applying
@@ -853,13 +842,13 @@ fn backfill_projects_in_batches(
 ) -> Result<(i64, i64), Error> {
     use crate::project::detect_project_from_title;
 
-    let placeholders: String = TERMINAL_APP_IDS
+    let placeholders: String = crate::terminal::APP_IDS
         .iter()
         .enumerate()
         .map(|(i, _)| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(", ");
-    let terminal_params: Vec<&dyn rusqlite::types::ToSql> = TERMINAL_APP_IDS
+    let terminal_params: Vec<&dyn rusqlite::types::ToSql> = crate::terminal::APP_IDS
         .iter()
         .map(|s| s as &dyn rusqlite::types::ToSql)
         .collect();
@@ -875,7 +864,7 @@ fn backfill_projects_in_batches(
     }
     println!("Found {total} terminal events with NULL project");
 
-    let cursor_param = TERMINAL_APP_IDS.len() + 1;
+    let cursor_param = crate::terminal::APP_IDS.len() + 1;
     let limit_param = cursor_param + 1;
     let select_sql = format!(
         "SELECT id, title

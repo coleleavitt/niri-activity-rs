@@ -1161,23 +1161,10 @@ fn flush_on_disconnect(
 /// stale.
 const PWD_FILE_FRESHNESS_SECS: u64 = 30;
 
-/// App IDs whose focused window can safely consume the global shell-hook state.
-const TERMINAL_APP_IDS: &[&str] = &[
-    "Alacritty",
-    "kitty",
-    "foot",
-    "org.wezfurlong.wezterm",
-    "wezterm",
-    "alacritty",
-    "org.codeberg.dnkl.foot",
-];
-
-fn is_terminal_app(app_id: &str) -> bool {
-    TERMINAL_APP_IDS.contains(&app_id)
-}
-
 fn terminal_fallback<T>(app_id: &str, fallback: impl FnOnce() -> Option<T>) -> Option<T> {
-    is_terminal_app(app_id).then(fallback).flatten()
+    crate::terminal::is_terminal_app(app_id)
+        .then(fallback)
+        .flatten()
 }
 
 /// Detect the current project by checking /proc/PID/cwd first, then the shell
@@ -1198,7 +1185,7 @@ fn detect_project(config: &Config, app_id: &str, title: &str, pid: Option<i32>) 
     }
 
     // 3. Title-based detection (terminal patterns)
-    if is_terminal_app(app_id) {
+    if crate::terminal::is_terminal_app(app_id) {
         if let Some(name) = project::detect_project_from_title(title) {
             // OC sessions and compound names always pass through
             if name.contains(':') || name.contains(' ') {

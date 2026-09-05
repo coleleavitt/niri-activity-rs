@@ -290,14 +290,12 @@ mod tests {
     }
 
     #[test]
-    fn lock_health_is_independent_of_sleep_listener_health() {
-        let sleep_degraded = AtomicBool::new(true);
+    fn healthy_unlocked_state_reports_lock_monitor_health() {
         let monitor = LogindMonitor {
             lock_state: Arc::new(AtomicU8::new(LOCK_STATE_HEALTHY_UNLOCKED)),
             suspend_resumed: Arc::new(AtomicBool::new(false)),
         };
 
-        assert!(sleep_degraded.load(Ordering::Acquire));
         assert!(!monitor.is_locked());
         assert!(!monitor.is_lock_degraded());
     }

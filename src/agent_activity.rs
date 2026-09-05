@@ -81,7 +81,7 @@ impl AgentMonitor {
         // Away decision is enforced in watcher::compute_activity_state, but we
         // gate here too so agent-title never marks activity past recency.
         if idle_duration_ms < self.process_recency_ms
-            && focused_app_id.is_some_and(is_terminal_app)
+            && focused_app_id.is_some_and(crate::terminal::is_terminal_app)
             && focused_title.is_some_and(jfc_streaming_title_active)
         {
             linkscope::record_items("agent.title_active", 1);
@@ -304,19 +304,6 @@ fn matches_single_wildcard(name: &str, pattern: &str) -> bool {
         && name.len() >= prefix.len().saturating_add(suffix.len())
         && name.starts_with(prefix)
         && name.ends_with(suffix)
-}
-
-fn is_terminal_app(app_id: &str) -> bool {
-    matches!(
-        app_id,
-        "Alacritty"
-            | "alacritty"
-            | "kitty"
-            | "foot"
-            | "org.codeberg.dnkl.foot"
-            | "wezterm"
-            | "org.wezfurlong.wezterm"
-    )
 }
 
 fn jfc_streaming_title_active(title: &str) -> bool {
