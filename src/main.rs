@@ -1,252 +1,688 @@
-use std::thread;
-use std::time::Duration;
+mod agent_activity;
+mod config;
+mod db;
+mod email;
+mod error;
+mod fmt;
+mod input;
+mod logind;
+mod profiling;
+mod project;
+mod report;
+mod scheduler;
+mod shell_hook;
+mod terminal;
+mod theme;
+mod tui;
+mod watcher;
 
-use chrono::{DateTime, Utc};
+use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
-use niri_ipc::{socket::Socket, Request, Response};
-use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use tracing_subscriber::EnvFilter;
 
-#[derive(Error, Debug)]
-pub enum Error {
-    #[error("niri ipc error: {0}")]
-    NiriIpc(#[from] std::io::Error),
-    #[error("niri returned error: {0}")]
-    NiriError(String),
-    #[error("database error: {0}")]
-    Database(#[from] rusqlite::Error),
-    #[error("unexpected response from niri")]
-    UnexpectedResponse,
+use crate::error::Error;
+
+// Time constants
+const MS_PER_HOUR: i64 = 3_600_000;
+const MS_PER_MIN: i64 = 60_000;
+
+/// Shared time-range arguments flattened into subcommands that need them.
+#[derive(Debug, Clone, clap::Args)]
+struct TimeRangeArgs {
+    #[arg(long, conflicts_with_all = ["today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month", "from", "to"])]
+    aligned: bool,
+    #[arg(long, conflicts_with_all = ["aligned", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month", "from", "to"])]
+    today: bool,
+    #[arg(long, conflicts_with_all = ["aligned", "today", "last_week", "this_week", "last_month", "this_month", "week", "month", "from", "to"])]
+    yesterday: bool,
+    #[arg(long, conflicts_with_all = ["aligned", "today", "yesterday", "this_week", "last_month", "this_month", "week", "month", "from", "to"])]
+    last_week: bool,
+    #[arg(long, conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "last_month", "this_month", "week", "month", "from", "to"])]
+    this_week: bool,
+    #[arg(long, conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "this_week", "this_month", "week", "month", "from", "to"])]
+    last_month: bool,
+    #[arg(long, conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "this_week", "last_month", "week", "month", "from", "to"])]
+    this_month: bool,
+    #[arg(long, conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "this_week", "last_month", "this_month", "month", "from", "to"])]
+    week: bool,
+    #[arg(long, conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "from", "to"])]
+    month: bool,
+    /// Start date (YYYY-MM-DD), use with --to
+    #[arg(long, requires = "to", conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month"])]
+    from: Option<String>,
+    /// End date (YYYY-MM-DD), use with --from
+    #[arg(long, requires = "from", conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month"])]
+    to: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WindowEvent {
-    pub timestamp: DateTime<Utc>,
-    pub app_id: Option<String>,
-    pub title: Option<String>,
-    pub duration_ms: i64,
+impl TimeRangeArgs {
+    fn is_selected(&self) -> bool {
+        self.aligned
+            || self.today
+            || self.yesterday
+            || self.last_week
+            || self.this_week
+            || self.last_month
+            || self.this_month
+            || self.week
+            || self.month
+            || self.from.is_some()
+            || self.to.is_some()
+    }
+}
+
+/// Which browser-derived view to show.
+#[derive(Debug, Clone, clap::Subcommand)]
+enum BrowserView {
+    /// Show Firefox's lifetime cumulative engagement by domain
+    Engagement {
+        /// Rows to show
+        #[arg(short, long, default_value = "25")]
+        limit: usize,
+    },
+    /// Show which sites lead to which
+    Referrers {
+        #[arg(short, long, default_value = "25")]
+        limit: usize,
+    },
+    /// Show downloads and address-bar searches
+    Activity {
+        #[arg(short, long, default_value = "15")]
+        limit: usize,
+    },
+}
+
+/// Output format for the export subcommand.
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum ExportFormat {
+    Csv,
+    Xlsx,
+    Json,
+    Heatmap,
+    Cron,
+}
+
+fn parse_time_range(days: u32, time: &TimeRangeArgs) -> Result<report::TimeRange, Error> {
+    if let (Some(from_str), Some(to_str)) = (&time.from, &time.to) {
+        let start = NaiveDate::parse_from_str(from_str, "%Y-%m-%d")
+            .map_err(|e| Error::InvalidArgument(format!("invalid --from date: {}", e)))?;
+        let end = NaiveDate::parse_from_str(to_str, "%Y-%m-%d")
+            .map_err(|e| Error::InvalidArgument(format!("invalid --to date: {}", e)))?;
+        if start > end {
+            return Err(Error::InvalidArgument(format!(
+                "--from date ({}) must be on or before --to date ({})",
+                from_str, to_str
+            )));
+        }
+        return Ok(report::TimeRange::DateRange(start, end));
+    }
+    if time.from.is_some() || time.to.is_some() {
+        return Err(Error::InvalidArgument(
+            "--from and --to must be used together".into(),
+        ));
+    }
+
+    const MAX_DAYS: u32 = 10_000;
+    if days > MAX_DAYS {
+        return Err(Error::InvalidArgument(format!(
+            "--days {} exceeds maximum of {}",
+            days, MAX_DAYS
+        )));
+    }
+
+    Ok(if time.today {
+        report::TimeRange::Days(0)
+    } else if time.yesterday {
+        report::TimeRange::Yesterday
+    } else if time.last_week || time.week {
+        report::TimeRange::LastWeek
+    } else if time.this_week {
+        report::TimeRange::ThisWeek
+    } else if time.last_month || time.month {
+        report::TimeRange::LastMonth
+    } else if time.this_month {
+        report::TimeRange::ThisMonth
+    } else if time.aligned {
+        if days == 0 {
+            return Err(Error::InvalidArgument(
+                "--aligned requires --days >= 1".into(),
+            ));
+        }
+        report::TimeRange::DaysAligned(days)
+    } else {
+        report::TimeRange::Days(days)
+    })
+}
+
+fn email_time_range(
+    days: Option<u32>,
+    time: &TimeRangeArgs,
+) -> Result<Option<report::TimeRange>, Error> {
+    if days.is_some() || time.is_selected() {
+        parse_time_range(days.unwrap_or(7), time).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 #[derive(Parser)]
-#[command(name = "actitivty-rs")]
+#[command(name = "niri-activity-rs")]
 #[command(about = "Track window focus on Niri compositor")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Start the watcher daemon
     Watch {
-        /// Poll interval in milliseconds
-        #[arg(short, long, default_value = "5000")]
-        interval: u64,
+        /// Suppress per-event output (still logs untracked apps)
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Show today's activity
     Today,
-    /// Show activity summary
-    Summary {
-        /// Number of days to show
+    /// Show productivity metrics
+    Metrics {
+        #[arg(short, long, default_value = "1")]
+        days: u32,
+        #[command(flatten)]
+        time: TimeRangeArgs,
+    },
+    /// Show activity timeline in 15-min buckets
+    Timeline {
+        /// Number of days back (0 = today)
+        #[arg(short, long, default_value = "0")]
+        days: u32,
+        /// Bucket size in minutes
+        #[arg(short, long, default_value = "15")]
+        bucket: u32,
+    },
+    /// Generate a full activity report
+    Report {
+        #[arg(short, long, default_value = "1")]
+        days: u32,
+        #[command(flatten)]
+        time: TimeRangeArgs,
+        /// Compare current period with previous period of same length
+        #[arg(long)]
+        compare: bool,
+    },
+    /// Export data in CSV or Excel format
+    Export {
+        #[arg(short, long, default_value = "30")]
+        days: u32,
+        #[command(flatten)]
+        time: TimeRangeArgs,
+        /// Output format (csv, xlsx, json, heatmap, or cron)
+        #[arg(short, long, default_value = "csv")]
+        format: ExportFormat,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Launch interactive TUI dashboard
+    Tui {
         #[arg(short, long, default_value = "7")]
         days: u32,
+        #[command(flatten)]
+        time: TimeRangeArgs,
     },
-}
-
-fn get_db_path() -> std::path::PathBuf {
-    let dirs = directories::ProjectDirs::from("", "", "actitivty-rs")
-        .expect("Could not determine data directory");
-    let data_dir = dirs.data_dir();
-    std::fs::create_dir_all(data_dir).expect("Could not create data directory");
-    data_dir.join("activity.db")
-}
-
-fn init_db(conn: &Connection) -> Result<(), Error> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY,
-            timestamp TEXT NOT NULL,
-            app_id TEXT,
-            title TEXT,
-            duration_ms INTEGER NOT NULL
-        )",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)",
-        [],
-    )?;
-    Ok(())
-}
-
-fn get_focused_window() -> Result<Option<(String, String)>, Error> {
-    let mut socket = Socket::connect()?;
-    let reply = socket.send(Request::FocusedWindow)?;
-
-    match reply {
-        Ok(Response::FocusedWindow(Some(window))) => {
-            let app_id = window.app_id.unwrap_or_else(|| "unknown".to_string());
-            let title = window.title.unwrap_or_else(|| "".to_string());
-            Ok(Some((app_id, title)))
-        }
-        Ok(Response::FocusedWindow(None)) => Ok(None),
-        Ok(_) => Err(Error::UnexpectedResponse),
-        Err(e) => Err(Error::NiriError(e)),
-    }
-}
-
-fn watch(interval_ms: u64) -> Result<(), Error> {
-    let db_path = get_db_path();
-    println!("Database: {}", db_path.display());
-
-    let conn = Connection::open(&db_path)?;
-    init_db(&conn)?;
-
-    let interval = Duration::from_millis(interval_ms);
-    let mut last_window: Option<(String, String)> = None;
-    let mut last_change = Utc::now();
-
-    println!("Watching window focus (interval: {}ms)...", interval_ms);
-    println!("Press Ctrl+C to stop\n");
-
-    loop {
-        match get_focused_window() {
-            Ok(current) => {
-                let now = Utc::now();
-
-                if current != last_window {
-                    if let Some((ref app_id, ref title)) = last_window {
-                        let duration = (now - last_change).num_milliseconds();
-
-                        conn.execute(
-                            "INSERT INTO events (timestamp, app_id, title, duration_ms) VALUES (?1, ?2, ?3, ?4)",
-                            params![last_change.to_rfc3339(), app_id, title, duration],
-                        )?;
-
-                        println!(
-                            "[{}] {} - \"{}\" ({}ms)",
-                            last_change.format("%H:%M:%S"),
-                            app_id,
-                            truncate(title, 50),
-                            duration
-                        );
-                    }
-
-                    last_window = current;
-                    last_change = now;
-                }
-            }
-            Err(e) => {
-                eprintln!("Error getting focused window: {}", e);
-            }
-        }
-
-        thread::sleep(interval);
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
-    }
-}
-
-fn show_today() -> Result<(), Error> {
-    let db_path = get_db_path();
-    let conn = Connection::open(&db_path)?;
-
-    let today = Utc::now().format("%Y-%m-%d").to_string();
-
-    let mut stmt = conn.prepare(
-        "SELECT app_id, SUM(duration_ms) as total_ms 
-         FROM events 
-         WHERE timestamp >= ?1 
-         GROUP BY app_id 
-         ORDER BY total_ms DESC",
-    )?;
-
-    let rows = stmt.query_map([&today], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-
-    println!("Activity for today ({}):\n", today);
-    println!("{:<30} {:>10}", "Application", "Time");
-    println!("{}", "-".repeat(42));
-
-    for row in rows {
-        let (app_id, total_ms) = row?;
-        let hours = total_ms / 3_600_000;
-        let mins = (total_ms % 3_600_000) / 60_000;
-        let secs = (total_ms % 60_000) / 1000;
-
-        println!("{:<30} {:>2}h {:>2}m {:>2}s", app_id, hours, mins, secs);
-    }
-
-    Ok(())
-}
-
-fn show_summary(days: u32) -> Result<(), Error> {
-    let db_path = get_db_path();
-    let conn = Connection::open(&db_path)?;
-
-    let since = (Utc::now() - chrono::Duration::days(days as i64))
-        .format("%Y-%m-%d")
-        .to_string();
-
-    let mut stmt = conn.prepare(
-        "SELECT DATE(timestamp) as day, app_id, SUM(duration_ms) as total_ms 
-         FROM events 
-         WHERE timestamp >= ?1 
-         GROUP BY day, app_id 
-         ORDER BY day DESC, total_ms DESC",
-    )?;
-
-    let rows = stmt.query_map([&since], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    })?;
-
-    let mut current_day = String::new();
-
-    for row in rows {
-        let (day, app_id, total_ms) = row?;
-
-        if day != current_day {
-            if !current_day.is_empty() {
-                println!();
-            }
-            println!("=== {} ===", day);
-            current_day = day;
-        }
-
-        let hours = total_ms / 3_600_000;
-        let mins = (total_ms % 3_600_000) / 60_000;
-
-        if hours > 0 || mins >= 1 {
-            println!("  {:<28} {:>2}h {:>2}m", app_id, hours, mins);
-        }
-    }
-
-    Ok(())
+    /// Compare tracking against the browser's own measurements
+    Browser {
+        #[command(subcommand)]
+        view: BrowserView,
+    },
+    /// Initialize config file with examples
+    Init,
+    /// Reconstruct agent working time for events recorded before agent
+    /// tracking existed, from coding-agent session logs
+    BackfillAgent {
+        /// How many days back to reconstruct
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+    },
+    /// Fix false-active records in the database (reclassify active → passive
+    /// for events with 0 keystrokes and 0 mouse clicks)
+    FixFalseActive {
+        /// Only show what would be fixed, don't modify the database
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Reclassify active/passive/idle times using new thresholds (only for
+    /// events with input_offsets)
+    ReclassifyThresholds {
+        /// Seconds of no input before Active → Passive (default: use config
+        /// value)
+        #[arg(long)]
+        idle_threshold: Option<u64>,
+        /// Seconds of no input before Passive → Idle (default: use config
+        /// value)
+        #[arg(long)]
+        deep_idle: Option<u64>,
+    },
+    /// Output shell hook code for $PWD capture
+    ShellHook {
+        /// Shell type: bash, zsh, or fish (default: bash)
+        #[arg(default_value = "bash")]
+        shell: String,
+    },
+    /// Backfill the project column for historical terminal events using title
+    /// detection
+    BackfillProjects,
+    /// Send activity report via email
+    Email {
+        #[arg(short, long, conflicts_with_all = ["today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month", "from", "to", "weekly", "monthly", "test", "secure"])]
+        days: Option<u32>,
+        #[command(flatten)]
+        time: TimeRangeArgs,
+        /// Send weekly report (last Saturday-Friday)
+        #[arg(long, conflicts_with_all = [
+                    "monthly",
+                    "days",
+                    "aligned",
+                    "today",
+                    "yesterday",
+                    "last_week",
+                    "this_week",
+                    "last_month",
+                    "this_month",
+                    "week",
+                    "month",
+                    "from",
+                    "to",
+                    "test",
+                    "secure",
+                ])]
+        weekly: bool,
+        /// Send monthly report (last full month)
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "weekly",
+                "days",
+                "aligned",
+                "today",
+                "yesterday",
+                "last_week",
+                "this_week",
+                "last_month",
+                "this_month",
+                "week",
+                "month",
+                "from",
+                "to",
+                "test",
+                "secure",
+            ]
+        )]
+        monthly: bool,
+        /// Test email configuration
+        #[arg(long, conflicts_with_all = ["weekly", "monthly", "days", "aligned", "today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month", "from", "to", "secure"])]
+        test: bool,
+        /// Secure config file permissions (chmod 600)
+        #[arg(long, conflicts_with_all = ["weekly", "monthly", "days", "aligned", "today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month", "from", "to", "test"])]
+        secure: bool,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
+    let _linkscope_report = profiling::init_from_env();
 
-    let result = match cli.command {
-        Commands::Watch { interval } => watch(interval),
-        Commands::Today => show_today(),
-        Commands::Summary { days } => show_summary(days),
+    // TUI mode takes over the terminal; disable tracing to stderr.
+    // For CLI commands, enable tracing with env-filter (RUST_LOG=info default).
+    let is_tui = matches!(cli.command, None | Some(Commands::Tui { .. }));
+    if !is_tui {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
+    // Load env file (SMTP creds etc.) before any threads spawn.
+    if let Err(e) = config::load_env_file() {
+        tracing::warn!("failed to load env file: {e}");
+    }
+
+    let result: Result<(), Error> = match cli.command {
+        None => tui::run_tui_range(report::TimeRange::Days(7)),
+        Some(Commands::Tui { days, time }) => {
+            parse_time_range(days, &time).and_then(tui::run_tui_range)
+        }
+        Some(Commands::Watch { quiet }) => watcher::watch(quiet),
+        Some(Commands::Today) => report::App::open().and_then(|app| report::show_today(&app)),
+        Some(Commands::Metrics { days, time }) => parse_time_range(days, &time).and_then(|range| {
+            report::App::open().and_then(|app| report::show_metrics_range(&app, range))
+        }),
+        Some(Commands::Browser { view }) => match view {
+            BrowserView::Engagement { limit } => report::show_engagement(limit),
+            BrowserView::Referrers { limit } => {
+                report::show_referrers(limit);
+                Ok(())
+            }
+            BrowserView::Activity { limit } => {
+                report::show_activity(limit);
+                Ok(())
+            }
+        },
+        Some(Commands::Timeline { days, bucket }) => {
+            report::App::open().and_then(|app| report::show_timeline(&app, days, bucket))
+        }
+        Some(Commands::Report {
+            days,
+            time,
+            compare,
+        }) => parse_time_range(days, &time).and_then(|range| {
+            report::App::open().and_then(|app| {
+                if compare {
+                    report::show_comparison(&app, range)
+                } else {
+                    report::generate_report_range(&app, range)
+                }
+            })
+        }),
+        Some(Commands::Export {
+            days,
+            time,
+            format,
+            output,
+        }) => parse_time_range(days, &time).and_then(|range| {
+            report::App::open().and_then(|app| match format {
+                ExportFormat::Xlsx => {
+                    let path = output.unwrap_or_else(|| "activity_report.xlsx".to_string());
+                    report::export_xlsx_range(&app, range, &path)
+                }
+                ExportFormat::Json => report::export_json_range(&app, range),
+                ExportFormat::Heatmap => report::export_heatmap_range(&app, range),
+                ExportFormat::Cron => report::export_cron_summary(&app, range),
+                ExportFormat::Csv => report::export_csv_range(&app, range),
+            })
+        }),
+        Some(Commands::Init) => config::init_config(),
+        Some(Commands::BackfillAgent { days }) => (|| -> Result<(), Error> {
+            let cfg = config::load_config()?;
+            let db_path = config::get_data_dir()?.join("activity.db");
+            let mut conn = rusqlite::Connection::open(&db_path)?;
+            db::init_db(&conn)?;
+            db::run_migrations(&mut conn, &cfg)?;
+
+            let since = chrono::Utc::now().timestamp() - i64::from(days) * 86_400;
+            println!("Reconstructing agent activity from the last {days} days...");
+            let filled = db::backfill_agent_ms(&mut conn, since)?;
+            println!("Settled agent-time measurement for {filled} events.");
+            Ok(())
+        })(),
+        Some(Commands::FixFalseActive { dry_run }) => (|| -> Result<(), Error> {
+            let cfg = config::load_config()?;
+            let data_dir = config::get_data_dir()?;
+            let db_path = data_dir.join("activity.db");
+            let mut conn = rusqlite::Connection::open(&db_path)?;
+            db::init_db(&conn)?;
+            db::run_migrations(&mut conn, &cfg)?;
+            let input_active_ms = cfg.input_active_secs.saturating_mul(1000);
+
+            if dry_run {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM events
+                          WHERE keystrokes = 0
+                            AND mouse_clicks = 0
+                            AND active_ms > ?1",
+                    rusqlite::params![i64::try_from(input_active_ms).unwrap_or(i64::MAX)],
+                    |row| row.get(0),
+                )?;
+                let total_ms: i64 = conn.query_row(
+                    "SELECT COALESCE(SUM(active_ms), 0) FROM events
+                          WHERE keystrokes = 0
+                            AND mouse_clicks = 0
+                            AND active_ms > ?1",
+                    rusqlite::params![i64::try_from(input_active_ms).unwrap_or(i64::MAX)],
+                    |row| row.get(0),
+                )?;
+                let hours = total_ms / MS_PER_HOUR;
+                let mins = (total_ms % MS_PER_HOUR) / MS_PER_MIN;
+                println!(
+                    "[dry-run] Would reclassify {} events ({} false-active → passive, {}h {}m total)",
+                    count, count, hours, mins
+                );
+            } else {
+                let fixed = db::fix_false_active(&conn, input_active_ms)?;
+                println!(
+                    "Fixed {} false-active events (active_ms → passive_ms)",
+                    fixed
+                );
+            }
+            Ok(())
+        })(),
+        Some(Commands::ReclassifyThresholds {
+            idle_threshold,
+            deep_idle,
+        }) => (|| -> Result<(), Error> {
+            let cfg = config::load_config()?;
+            let idle_secs = idle_threshold.unwrap_or(cfg.idle_threshold_secs);
+            let deep_secs = deep_idle.unwrap_or(cfg.deep_idle_secs);
+
+            let data_dir = config::get_data_dir()?;
+            let db_path = data_dir.join("activity.db");
+            let mut conn = rusqlite::Connection::open(&db_path)?;
+            db::run_migrations(&mut conn, &cfg)?;
+
+            let (updated, total) = db::reclassify_with_thresholds(&mut conn, idle_secs, deep_secs)?;
+            println!(
+                "Reclassified {}/{} events with input_offsets (idle={}s, deep_idle={}s)",
+                updated, total, idle_secs, deep_secs
+            );
+            if total == 0 {
+                println!(
+                    "Note: No events have input_offsets stored yet. Only future events will support retroactive reclassification."
+                );
+            }
+            Ok(())
+        })(),
+        Some(Commands::ShellHook { shell }) => shell_hook::print_hook(&shell),
+        Some(Commands::BackfillProjects) => (|| -> Result<(), Error> {
+            let cfg = config::load_config()?;
+            let data_dir = config::get_data_dir()?;
+            let db_path = data_dir.join("activity.db");
+            let mut conn = rusqlite::Connection::open(&db_path)?;
+            db::init_db(&conn)?;
+            db::run_migrations(&mut conn, &cfg)?;
+
+            let (total, detected) = db::backfill_projects(&mut conn, &cfg.project_aliases)?;
+            if total > 0 {
+                println!(
+                    "Done! Backfilled {} total events, {} with project detected ({:.1}%)",
+                    total,
+                    detected,
+                    (detected as f64 / total as f64) * 100.0
+                );
+            }
+            Ok(())
+        })(),
+        Some(Commands::Email {
+            days,
+            time,
+            weekly,
+            monthly,
+            test,
+            secure,
+        }) => (|| -> Result<(), Error> {
+            if secure {
+                let config_path = config::get_config_path()?;
+                email::secure_config_permissions(&config_path)?;
+            }
+            if test {
+                let cfg = config::load_config()?;
+                email::test_email_config(&cfg)?;
+            } else if let Some(range) = email_time_range(days, &time)? {
+                let period_name = if let (Some(from), Some(to)) = (&time.from, &time.to) {
+                    format!("Custom ({} to {})", from, to)
+                } else {
+                    "Custom".to_string()
+                };
+                report::App::open()
+                    .and_then(|app| email::send_report(&app, range, &period_name))?;
+            } else if weekly {
+                report::App::open().and_then(|app| email::send_weekly_report(&app))?;
+            } else if monthly {
+                report::App::open().and_then(|app| email::send_monthly_report(&app))?;
+            } else if !secure {
+                return Err(Error::InvalidArgument(
+                    "Specify a time range, --days, --weekly, --monthly, --test, or --secure".into(),
+                ));
+            }
+            Ok(())
+        })(),
     };
 
     if let Err(e) = result {
+        // Use eprintln! instead of tracing::error! because TUI mode
+        // doesn't initialize a tracing subscriber, making tracing a no-op
         eprintln!("Error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_email(args: &[&str]) -> (Option<u32>, TimeRangeArgs, bool, bool) {
+        let cli = Cli::try_parse_from(
+            std::iter::once("niri-activity-rs")
+                .chain(std::iter::once("email"))
+                .chain(args.iter().copied()),
+        )
+        .expect("email arguments should parse");
+
+        match cli.command.expect("email command should be present") {
+            Commands::Email {
+                days,
+                time,
+                weekly,
+                monthly,
+                ..
+            } => (days, time, weekly, monthly),
+            _ => panic!("expected email command"),
+        }
+    }
+
+    #[test]
+    fn every_email_time_selector_dispatches_a_range() {
+        let selectors: &[&[&str]] = &[
+            &["--aligned"],
+            &["--today"],
+            &["--yesterday"],
+            &["--last-week"],
+            &["--this-week"],
+            &["--last-month"],
+            &["--this-month"],
+            &["--week"],
+            &["--month"],
+            &["--from", "2026-01-01", "--to", "2026-01-02"],
+            &["--days", "7"],
+        ];
+
+        for args in selectors {
+            let (days, time, weekly, monthly) = parse_email(args);
+            assert!(
+                !weekly && !monthly,
+                "unexpected scheduled mode for {args:?}"
+            );
+            assert!(
+                email_time_range(days, &time)
+                    .unwrap_or_else(|error| panic!("range failed for {args:?}: {error}"))
+                    .is_some(),
+                "selector did not dispatch a range: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn email_without_a_range_does_not_use_the_default_days() {
+        let (days, time, _, _) = parse_email(&[]);
+        assert!(days.is_none());
+        assert!(email_time_range(days, &time).unwrap().is_none());
+    }
+
+    #[test]
+    fn time_range_selectors_conflict_instead_of_using_branch_priority() {
+        for args in [
+            vec!["niri-activity-rs", "email", "--today", "--yesterday"],
+            vec!["niri-activity-rs", "email", "--last-week", "--this-month"],
+            vec!["niri-activity-rs", "email", "--days", "7", "--today"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(
+            Cli::try_parse_from(["niri-activity-rs", "email", "--days", "7", "--aligned"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn email_test_and_secure_are_exclusive_actions() {
+        for action in ["--weekly", "--monthly", "--today", "--secure"] {
+            assert!(Cli::try_parse_from(["niri-activity-rs", "email", "--test", action]).is_err());
+        }
+        assert!(
+            Cli::try_parse_from(["niri-activity-rs", "email", "--test", "--days", "7"]).is_err()
+        );
+    }
+
+    #[test]
+    fn email_scheduled_modes_conflict_with_range_selectors() {
+        assert!(
+            Cli::try_parse_from(["niri-activity-rs", "email", "--weekly", "--monthly"]).is_err()
+        );
+
+        for scheduled in ["--weekly", "--monthly"] {
+            for range in [
+                "--days",
+                "--aligned",
+                "--today",
+                "--yesterday",
+                "--last-week",
+                "--this-week",
+                "--last-month",
+                "--this-month",
+                "--week",
+                "--month",
+                "--from",
+                "--to",
+            ] {
+                let mut args = vec!["niri-activity-rs", "email", scheduled, range];
+                match range {
+                    "--days" => args.push("7"),
+                    "--from" | "--to" => args.push("2026-01-01"),
+                    _ => {}
+                }
+                assert!(
+                    Cli::try_parse_from(args).is_err(),
+                    "{scheduled} should conflict with {range}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn browser_engagement_is_explicitly_lifetime_only() {
+        assert!(
+            Cli::try_parse_from(["niri-activity-rs", "browser", "engagement", "--limit", "10"])
+                .is_ok()
+        );
+        for range_option in ["--days", "--today", "--from"] {
+            assert!(
+                Cli::try_parse_from([
+                    "niri-activity-rs",
+                    "browser",
+                    "engagement",
+                    range_option,
+                    "7",
+                ])
+                .is_err(),
+                "{range_option} must not imply interval engagement"
+            );
+        }
     }
 }

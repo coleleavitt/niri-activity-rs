@@ -1,0 +1,67 @@
+TASK 1: Establish Baseline & Release Profile
+==============================================
+Status: ✓ COMPLETED
+
+CHECKLIST VERIFICATION
+======================
+
+✓ All 11 existing tests pass (baseline verified)
+  - Test run: 2026-04-02
+  - Result: 11 passed; 0 failed
+  - Tests: glob_contains, glob_suffix, title_rule_substring_default, glob_prefix,
+           glob_middle, classify_glob_fallback, glob_exact_match,
+           title_rule_regex_case_insensitive, classify_exact_before_glob,
+           title_rule_regex, title_rule_app_scoped_regex
+
+✓ Cargo.toml has rust-version = "1.85" in [package] section
+  - Location: Line 5
+  - Value: rust-version = "1.85"
+
+✓ Cargo.toml has [profile.release] section with required settings
+  - opt-level = 3 (maximum optimization)
+  - lto = "thin" (thin LTO for safety with bundled SQLite)
+  - codegen-units = 1 (single codegen unit for better optimization)
+  - strip = "symbols" (strip symbols from binary)
+
+✓ cargo build --release succeeds
+  - Build time: 1m 07s
+  - Status: SUCCESS
+  - Warnings: 3 unused constants (non-blocking)
+
+✓ Binary size recorded
+  - Path: target/release/niri-activity-rs
+  - Size: 11M (11 MB)
+  - Status: Successfully created and stripped
+
+✓ Verification: cargo test passes
+  - All 11 tests pass
+  - No failures
+
+✓ Verification: cargo build --release passes
+  - Binary successfully created
+  - Symbols stripped as configured
+
+✓ Commit created
+  - Hash: 02ca55b
+  - Message: "build: add release profile optimizations and declare MSRV"
+  - Files changed: Cargo.toml
+
+CONFIGURATION DETAILS
+====================
+
+Release Profile Rationale:
+- opt-level = 3: Maximum optimization for production binary
+- lto = "thin": Thin LTO provides good optimization without excessive compile time,
+  safer with bundled SQLite C code (full LTO can cause issues)
+- codegen-units = 1: Single codegen unit enables cross-module optimization
+- strip = "symbols": Removes debug symbols to reduce binary size
+
+MSRV Declaration:
+- Rust 1.85 declared as minimum supported Rust version
+- Ensures compatibility with stable Rust toolchain
+
+EVIDENCE FILES
+==============
+- task-1-baseline-tests.txt: Baseline test results
+- task-1-release-build.txt: Release build results and binary size
+- task-1-summary.txt: This summary document
