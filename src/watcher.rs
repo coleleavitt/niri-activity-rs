@@ -346,6 +346,10 @@ fn handle_shutdown(
 
 /// Handle suspend/resume detection via wall-clock jump or D-Bus signal.
 /// Returns true if resume was detected and handled.
+///
+/// The boundary inputs stay explicit because they come from distinct clocks and
+/// monitors; bundling them would hide the accounting invariants at this seam.
+#[allow(clippy::too_many_arguments)]
 fn handle_suspend_resume(
     state: &mut WatchState,
     logind: &crate::logind::LogindMonitor,
@@ -431,6 +435,10 @@ fn handle_suspend_resume(
 }
 
 /// Handle lock/unlock state transitions. Returns true if state changed.
+///
+/// The explicit monitor and clock inputs make fail-closed lock transitions and
+/// pre-boundary accounting visible at the call site.
+#[allow(clippy::too_many_arguments)]
 fn handle_lock_unlock(
     state: &mut WatchState,
     logind: &crate::logind::LogindMonitor,

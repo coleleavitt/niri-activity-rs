@@ -1591,6 +1591,7 @@ mod tests {
     }
 
     /// Inserts a test event with configurable fields.
+    #[allow(clippy::too_many_arguments)]
     fn insert_test_event(
         conn: &Connection,
         timestamp: &str,
