@@ -423,7 +423,8 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
         }
     }
 
-    // If there are trailing digits without a unit suffix, the input is malformed
+    // If there are trailing digits without a unit suffix, the input is
+    // malformed
     if !current_num.is_empty() {
         return None;
     }
@@ -933,13 +934,49 @@ impl Config {
             .map(|rule| rule.category)
     }
 
+    /// Whether an app is a web browser, so domain rules (which map a page title
+    /// to the host it was served from via browser history) may apply. Any
+    /// non-browser window whose title happens to equal a page title seen in
+    /// history must NOT be reclassified by a domain rule.
+    ///
+    /// Browser identity is intentionally fail-closed. App-scoped title rules
+    /// can target terminals and editors too, so they are not proof that an app
+    /// owns browser history. Unknown browser IDs must be added explicitly.
+    fn is_browser_app(app_id: &str) -> bool {
+        const KNOWN_BROWSER_APPS: &[&str] = &[
+            "zen",
+            "zen-twilight",
+            "zen-unofficial",
+            "firefox",
+            "firefox-bin",
+            "firefox-esr",
+            "librewolf",
+            "chromium",
+            "chromium-browser",
+            "google-chrome",
+            "google-chrome-stable",
+            "brave-browser",
+            "camoufox",
+            "tor browser",
+            "epiphany",
+            "vivaldi-stable",
+        ];
+        KNOWN_BROWSER_APPS
+            .iter()
+            .any(|browser| browser.eq_ignore_ascii_case(app_id))
+    }
+
     pub fn classify(&self, app_id: &str, title: &str) -> Category {
         let title_lower = title.to_lowercase();
         let explicit_cat = self.app_category(app_id);
 
         // Domain beats title: the host a page was served from is a fact, while
-        // its title is a claim.
-        if let Some(cat) = self.domain_category(title) {
+        // its title is a claim. Only trust the domain map for actual browser
+        // windows — otherwise a non-browser window sharing a page title would
+        // be silently reclassified.
+        if Self::is_browser_app(app_id)
+            && let Some(cat) = self.domain_category(title)
+        {
             return cat;
         }
 
@@ -1098,11 +1135,13 @@ pub(crate) fn load_env_file() -> Result<(), Error> {
                     continue;
                 }
 
-                // SAFETY: This is called from main() immediately after Cli::parse(),
-                // before watch() spawns any threads (signal_hook, input monitor, logind).
+                // SAFETY: This is called from main() immediately after
+                // Cli::parse(), before watch() spawns any
+                // threads (signal_hook, input monitor, logind).
                 // std::env::set_var is only unsafe in multi-threaded contexts.
-                // Do NOT move this call to after watcher::watch() or any thread spawn.
-                // SAFETY: Called before any threads are spawned (single-threaded context).
+                // Do NOT move this call to after watcher::watch() or any thread
+                // spawn. SAFETY: Called before any threads are
+                // spawned (single-threaded context).
                 #[allow(unsafe_code)]
                 unsafe {
                     std::env::set_var(key, value);
@@ -1444,6 +1483,22 @@ mod tests {
             vec![("Phish", "notyoutube.com")],
         );
         assert_eq!(config.classify("zen", "Phish"), Category::Neutral);
+    }
+
+    #[test]
+    fn domain_rule_does_not_apply_to_non_browser_windows() {
+        // A terminal/editor whose title happens to equal a page title seen in
+        // browser history must NOT be reclassified by a domain rule
+        // Only real browser apps get domain treatment.
+        let config = domain_config(
+            vec![("youtube.com", Category::Unproductive)],
+            vec![("Some Video", "www.youtube.com")],
+        );
+        // Browser app: domain rule applies.
+        assert_eq!(config.classify("zen", "Some Video"), Category::Unproductive);
+        // Non-browser app with the same title: domain rule must NOT apply.
+        assert_eq!(config.classify("foot", "Some Video"), Category::Neutral);
+        assert_eq!(config.classify("code", "Some Video"), Category::Neutral);
     }
 
     #[test]

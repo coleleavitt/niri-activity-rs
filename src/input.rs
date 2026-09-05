@@ -187,8 +187,9 @@ struct IntervalTracker {
 
 impl IntervalTracker {
     fn new(config: &JigglerConfig) -> Self {
-        // Hard cap: even at 1 event/ms for a 5-min window, 300k entries is extreme.
-        // 10_000 is generous for jiggler detection (typically ~1/sec over 2 min = 120).
+        // Hard cap: even at 1 event/ms for a 5-min window, 300k entries is
+        // extreme. 10_000 is generous for jiggler detection (typically
+        // ~1/sec over 2 min = 120).
         const MAX_TRACKER_CAPACITY: usize = 10_000;
         Self {
             timestamps_ms: VecDeque::with_capacity(256),
@@ -229,8 +230,9 @@ impl IntervalTracker {
             None => return false,
         };
         let span_ms = last.saturating_sub(first);
-        // Require events spread across at least 60 seconds — bursts after idle recovery
-        // or rapid clicking shouldn't trigger jiggler detection.
+        // Require events spread across at least 60 seconds — bursts after idle
+        // recovery or rapid clicking shouldn't trigger jiggler
+        // detection.
         const MIN_SPAN_MS: u64 = 60_000;
         if span_ms < MIN_SPAN_MS {
             return false;

@@ -28,6 +28,11 @@ use crate::scheduler::check_scheduled_reports;
 // Duration constants
 const FLUSH_INTERVAL_SECS: u64 = 300; // 5 minutes
 const HEARTBEAT_CHECK_INTERVAL_SECS: u64 = 30;
+// Minimum spacing between title-only session flushes. Animated terminal titles
+// (spinner frames, clocks, progress) can change ~1/second; without this
+// debounce each change wrote a new events row, the production "flush storm"
+// that produced ~86k junk rows/day. App switches are never debounced.
+const TITLE_FLUSH_DEBOUNCE_SECS: u64 = 60;
 
 // Niri connection backoff constants (separate from flush/suspend semantics)
 const NIRI_BACKOFF_MAX_INTERVAL_SECS: u64 = 300;
@@ -183,6 +188,9 @@ struct WatchState {
     last_heartbeat_check: Instant,
     input_thread_warned: bool,
     last_schedule_check: Instant,
+    /// Instant of the most recent title-only session flush, for debouncing
+    /// animated-title churn (see TITLE_FLUSH_DEBOUNCE_SECS).
+    last_title_flush: Instant,
 }
 
 impl WatchState {
@@ -211,6 +219,7 @@ impl WatchState {
             last_heartbeat_check: now_instant,
             input_thread_warned: false,
             last_schedule_check: now_instant,
+            last_title_flush: now_instant,
         }
     }
 
@@ -243,6 +252,21 @@ impl WatchState {
         self.input_baseline_ms = input_baseline;
         self.session_start_mono_ms = session_mono;
         self.last_seen_input_ms = input_baseline;
+        self.input_offsets.clear();
+    }
+
+    /// Begin a new persisted event segment without changing human-presence
+    /// state. Used for title-only rollovers: a title is metadata, not input.
+    fn start_new_event_segment(
+        &mut self,
+        new_focus_start: chrono::DateTime<chrono::Utc>,
+        now_instant: Instant,
+        session_start_mono_ms: u64,
+    ) {
+        self.focus_start = new_focus_start;
+        self.reset_accumulators();
+        self.last_flush = now_instant;
+        self.session_start_mono_ms = session_start_mono_ms;
         self.input_offsets.clear();
     }
 
@@ -523,11 +547,11 @@ fn handle_idle_transitions(
         state.last_seen_input_ms = last_input_ms;
     }
 
-    let idle_duration_ms = if last_input_ms > state.input_baseline_ms {
-        now_ms.saturating_sub(last_input_ms)
-    } else {
-        now_ms.saturating_sub(state.session_start_mono_ms)
-    };
+    // Both values share the monitor-wide monotonic clock. Session/focus/title
+    // boundaries are metadata changes, not human input, and must never reset
+    // the presence clock (an animated title otherwise prevents Away
+    // indefinitely).
+    let idle_duration_ms = now_ms.saturating_sub(last_input_ms);
 
     let focused_title = state
         .focused_id
@@ -572,10 +596,16 @@ fn compute_activity_state(
     agent_active: bool,
     thresholds: &IdleThresholds,
 ) -> ActivityState {
-    if agent_active {
-        ActivityState::Active
-    } else if idle_duration_ms > thresholds.away_ms {
+    // Human presence takes priority: once the user has been away past the
+    // threshold, agent activity alone must NOT keep the session "present".
+    // Agent work is still recorded separately as `agent_ms`; it just cannot
+    // hold the human-presence state past away_ms of no human input. This
+    // prevents an overnight coding agent from logging the machine as active
+    // while the user is asleep (see docs/SLEEP_DETECTION.lean, bug B1).
+    if idle_duration_ms > thresholds.away_ms {
         ActivityState::Away
+    } else if agent_active {
+        ActivityState::Active
     } else if idle_duration_ms > thresholds.deep_idle_ms {
         ActivityState::Idle
     } else if idle_duration_ms > thresholds.idle_ms {
@@ -812,12 +842,86 @@ fn handle_window_closed(
     Ok(())
 }
 
-fn should_flush_metadata_change(state: &WatchState, id: u64, next: &WindowInfo) -> bool {
-    state.focused_id == Some(id)
-        && state
-            .windows
-            .get(&id)
-            .is_some_and(|current| current.app_id != next.app_id || current.title != next.title)
+/// Kind of metadata change on the focused window, used to decide whether to
+/// close the current session (write an events row) and start a new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataChange {
+    /// No change to the focused window's app_id or title.
+    None,
+    /// The focused app changed (real context switch) — always a session
+    /// boundary.
+    AppChanged,
+    /// Only the window title changed (e.g. browser page nav, or a terminal
+    /// updating its title). Honor at most once per debounce interval so an
+    /// animated title (spinner/clock/progress) cannot create a session — and a
+    /// DB row — every tick. This was the production "flush storm" root cause
+    /// (see docs/SLEEP_DETECTION.lean bug B1 notes).
+    TitleChanged,
+}
+
+fn classify_metadata_change(state: &WatchState, id: u64, next: &WindowInfo) -> MetadataChange {
+    if state.focused_id != Some(id) {
+        return MetadataChange::None;
+    }
+    match state.windows.get(&id) {
+        Some(current) if current.app_id != next.app_id => MetadataChange::AppChanged,
+        Some(current) if current.title != next.title => MetadataChange::TitleChanged,
+        _ => MetadataChange::None,
+    }
+}
+
+/// Decide whether a metadata change should trigger a session flush now.
+/// App changes always flush. Title-only changes are debounced so animated
+/// titles cannot flush every tick.
+fn should_flush_metadata_change(
+    change: MetadataChange,
+    now_instant: Instant,
+    last_title_flush: Instant,
+) -> bool {
+    match change {
+        MetadataChange::None => false,
+        MetadataChange::AppChanged => true,
+        MetadataChange::TitleChanged => {
+            now_instant.duration_since(last_title_flush)
+                >= Duration::from_secs(TITLE_FLUSH_DEBOUNCE_SECS)
+        }
+    }
+}
+
+fn handle_title_changed(
+    state: &mut WatchState,
+    ctx: &mut NiriEventContext<'_>,
+) -> Result<(), Error> {
+    if state.is_locked {
+        return Ok(());
+    }
+
+    tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_title_changed");
+    let input = ctx.input_stats.snapshot();
+    let jiggler = ctx.input_stats.jiggler_detected();
+    let info = state
+        .focused_id
+        .and_then(|id| state.windows.get(&id))
+        .cloned();
+    if let Some(ref info) = info {
+        let flushed = flush_session(
+            ctx.flush_ctx,
+            Some(info),
+            &mut state.make_accum(),
+            &input,
+            jiggler,
+            FlushReset::NoReset,
+        )?;
+        log_untracked_app(info, ctx);
+        print_focus_change_status(info, &flushed, &input, jiggler, state.focus_start, ctx);
+    }
+
+    state.start_new_event_segment(
+        ctx.now,
+        ctx.now_instant,
+        millis_u64(ctx.monitor_start.elapsed()),
+    );
+    Ok(())
 }
 
 fn handle_focus_changed(
@@ -981,7 +1085,8 @@ const PWD_FILE_FRESHNESS_SECS: u64 = 30;
 /// Detect the current project by checking /proc/PID/cwd first, then the shell
 /// pwd file, then window title parsing. Applies project aliases from config.
 fn detect_project(config: &Config, app_id: &str, title: &str, pid: Option<i32>) -> Option<String> {
-    // 1. Try /proc/PID/cwd (most reliable — no shell hook needed, always current)
+    // 1. Try /proc/PID/cwd (most reliable — no shell hook needed, always
+    //    current)
     if let Some(project) = proc_cwd_project(pid) {
         return Some(apply_alias(config, project));
     }
@@ -1005,8 +1110,8 @@ fn detect_project(config: &Config, app_id: &str, title: &str, pid: Option<i32>) 
                 return Some(apply_alias(config, resolved));
             }
         }
-        // Accept the name — it came from detect_project_from_path (full path titles)
-        // or is a legitimate basename from a shell prompt
+        // Accept the name — it came from detect_project_from_path (full path
+        // titles) or is a legitimate basename from a shell prompt
         return Some(apply_alias(config, name));
     }
 
@@ -1382,7 +1487,8 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 quiet,
             )?;
 
-            // Check scheduled reports every 5 minutes (piggybacks on flush interval)
+            // Check scheduled reports every 5 minutes (piggybacks on flush
+            // interval)
             if now_instant.duration_since(state.last_schedule_check)
                 >= Duration::from_secs(FLUSH_INTERVAL_SECS)
             {
@@ -1442,8 +1548,18 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             Event::WindowOpenedOrChanged { window } => {
                 let _linkscope_event = linkscope::phase("watch.event.window_changed");
                 let info = WindowInfo::from(&window);
-                if should_flush_metadata_change(&state, window.id, &info) {
-                    handle_focus_changed(&mut state, &mut niri_ctx, Some(window.id))?;
+                let change = classify_metadata_change(&state, window.id, &info);
+                if should_flush_metadata_change(change, now_instant, state.last_title_flush) {
+                    match change {
+                        MetadataChange::AppChanged => {
+                            handle_focus_changed(&mut state, &mut niri_ctx, Some(window.id))?;
+                        }
+                        MetadataChange::TitleChanged => {
+                            handle_title_changed(&mut state, &mut niri_ctx)?;
+                            state.last_title_flush = now_instant;
+                        }
+                        MetadataChange::None => {}
+                    }
                 }
                 state.windows.insert(window.id, info);
             }
@@ -1481,10 +1597,23 @@ mod tests {
     }
 
     #[test]
-    fn compute_activity_state_counts_agent_work_while_user_is_away() {
+    fn compute_activity_state_counts_agent_work_while_user_is_briefly_idle() {
+        // Agent activity keeps the session Active while the user is only
+        // briefly idle (below the away threshold) — e.g. reading while an
+        // agent works.
+        assert_eq!(
+            compute_activity_state(60_000, true, &thresholds()),
+            ActivityState::Active
+        );
+    }
+
+    #[test]
+    fn compute_activity_state_goes_away_despite_agent_when_human_is_gone() {
+        // Once the human has been idle past away_ms, agent activity must NOT
+        // keep the session present (docs/SLEEP_DETECTION.lean bug B1).
         assert_eq!(
             compute_activity_state(3_600_000, true, &thresholds()),
-            ActivityState::Active
+            ActivityState::Away
         );
     }
 
@@ -1499,6 +1628,60 @@ mod tests {
         assert_eq!(state.session_start_mono_ms, 9_500_000);
         assert_eq!(state.last_seen_input_ms, 9_500_000);
         assert_eq!(state.input_offsets, vec![0]);
+    }
+
+    #[test]
+    fn title_rollover_preserves_human_presence_state() {
+        let mut state = WatchState::new(10_000, 5_000);
+        state.current_state = ActivityState::Idle;
+        state.accumulated_active_ms = 10;
+        state.accumulated_passive_ms = 20;
+        state.accumulated_idle_ms = 30;
+        state.accumulated_agent_ms = 40;
+        state.input_offsets = vec![100, 200];
+        let presence_check = state.last_idle_check;
+        let first = Instant::now();
+
+        state.start_new_event_segment(Utc::now(), first, 60_000);
+        state.start_new_event_segment(Utc::now(), first, 120_000);
+
+        assert_eq!(state.current_state, ActivityState::Idle);
+        assert_eq!(state.last_idle_check, presence_check);
+        assert_eq!(state.input_baseline_ms, 10_000);
+        assert_eq!(state.last_seen_input_ms, 10_000);
+        assert_eq!(state.session_start_mono_ms, 120_000);
+        assert_eq!(state.accumulated_active_ms, 0);
+        assert_eq!(state.accumulated_passive_ms, 0);
+        assert_eq!(state.accumulated_idle_ms, 0);
+        assert_eq!(state.accumulated_agent_ms, 0);
+        assert_eq!(state.input_offsets, Vec::<u32>::new());
+    }
+
+    #[test]
+    fn title_rollovers_do_not_delay_away_without_input() {
+        let last_input_ms = 1_000;
+        let mut state = WatchState::new(last_input_ms, last_input_ms);
+        for now_ms in [60_000, 121_001, 301_001, 1_801_001] {
+            state.start_new_event_segment(Utc::now(), Instant::now(), now_ms);
+            let idle_ms = now_ms.saturating_sub(last_input_ms);
+            let expected = if idle_ms > thresholds().away_ms {
+                ActivityState::Away
+            } else if idle_ms > thresholds().deep_idle_ms {
+                ActivityState::Idle
+            } else if idle_ms > thresholds().idle_ms {
+                ActivityState::Passive
+            } else {
+                ActivityState::Active
+            };
+            assert_eq!(
+                compute_activity_state(idle_ms, false, &thresholds()),
+                expected
+            );
+        }
+        assert_eq!(
+            compute_activity_state(1_800_001, true, &thresholds()),
+            ActivityState::Away
+        );
     }
 
     fn advanced_state(current: ActivityState, agent_active: bool) -> WatchState {
@@ -1545,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_metadata_change_requires_a_session_flush() {
+    fn classify_metadata_change_distinguishes_app_title_and_noise() {
         let mut state = WatchState::new(0, 0);
         state.focused_id = Some(7);
         state.windows.insert(
@@ -1557,9 +1740,14 @@ mod tests {
             },
         );
 
-        let changed = WindowInfo {
+        let title_changed = WindowInfo {
             app_id: "zen".to_string(),
             title: "YouTube".to_string(),
+            pid: Some(10),
+        };
+        let app_changed = WindowInfo {
+            app_id: "foot".to_string(),
+            title: "GitHub".to_string(),
             pid: Some(10),
         };
         let pid_only = WindowInfo {
@@ -1568,8 +1756,55 @@ mod tests {
             pid: Some(11),
         };
 
-        assert!(should_flush_metadata_change(&state, 7, &changed));
-        assert!(!should_flush_metadata_change(&state, 7, &pid_only));
-        assert!(!should_flush_metadata_change(&state, 8, &changed));
+        assert_eq!(
+            classify_metadata_change(&state, 7, &title_changed),
+            MetadataChange::TitleChanged
+        );
+        assert_eq!(
+            classify_metadata_change(&state, 7, &app_changed),
+            MetadataChange::AppChanged
+        );
+        assert_eq!(
+            classify_metadata_change(&state, 7, &pid_only),
+            MetadataChange::None
+        );
+        // Not the focused window -> no change.
+        assert_eq!(
+            classify_metadata_change(&state, 8, &title_changed),
+            MetadataChange::None
+        );
+    }
+
+    #[test]
+    fn app_change_always_flushes_but_title_change_is_debounced() {
+        let now = Instant::now();
+        // App switches always flush, regardless of timing.
+        assert!(should_flush_metadata_change(
+            MetadataChange::AppChanged,
+            now,
+            now
+        ));
+        // A title change right after the previous title flush is suppressed
+        // (this is what stops the spinner-title flush storm).
+        assert!(!should_flush_metadata_change(
+            MetadataChange::TitleChanged,
+            now,
+            now
+        ));
+        // A title change after the debounce window is honored.
+        let later = now
+            .checked_add(Duration::from_secs(TITLE_FLUSH_DEBOUNCE_SECS + 1))
+            .expect("instant math");
+        assert!(should_flush_metadata_change(
+            MetadataChange::TitleChanged,
+            later,
+            now
+        ));
+        // No metadata change never flushes.
+        assert!(!should_flush_metadata_change(
+            MetadataChange::None,
+            later,
+            now
+        ));
     }
 }

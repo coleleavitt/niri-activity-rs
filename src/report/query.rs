@@ -973,16 +973,14 @@ fn query_gaps(
             });
         if should_merge {
             if let Some(prev) = merged.last_mut() {
+                // Extend the displayed span to cover the whole rest period so
+                // the entry reads "sleep_start -> final wake", but accumulate
+                // only the ACTUAL no-input gap durations. The brief awake
+                // bridge between the two gaps is real awake time and must NOT
+                // be counted as sleep/away.
                 prev.gap_end.clone_from(&gap.gap_end);
                 prev.gap_type = GapType::Sleep;
-                if let (Some(s), Some(e)) = (
-                    config.parse_timestamp_to_local(&prev.gap_start),
-                    config.parse_timestamp_to_local(&gap.gap_end),
-                ) {
-                    prev.duration_ms = e.signed_duration_since(s).num_milliseconds();
-                } else {
-                    prev.duration_ms += gap.duration_ms;
-                }
+                prev.duration_ms = prev.duration_ms.saturating_add(gap.duration_ms);
             }
         } else {
             merged.push(gap);
@@ -1210,7 +1208,7 @@ fn query_flow_sessions(rows: &[EventInterval], config: &Config) -> FlowSummary {
                 finalize(b, config, &mut sessions);
                 current = Some(SessionBuilder {
                     app_id: row.app_id.clone(),
-                    start_ts: timestamp.clone(),
+                    start_ts: timestamp,
                     duration_ms: row.active_ms,
                     keystrokes: row.keystrokes,
                     backspaces: row.granular.backspace_count,

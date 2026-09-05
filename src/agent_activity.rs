@@ -69,7 +69,15 @@ impl AgentMonitor {
             return false;
         }
 
-        if focused_title.is_some_and(jfc_streaming_title_active) {
+        // A streaming-agent title only counts while the user was recently
+        // present. Terminal titles can get stuck on a spinner frame, so a
+        // stale title must not pin the session Active forever while the user
+        // is idle/asleep (see docs/SLEEP_DETECTION.lean, bug B1). The final
+        // Away decision is enforced in watcher::compute_activity_state, but we
+        // gate here too so agent-title never marks activity past recency.
+        if idle_duration_ms < self.process_recency_ms
+            && focused_title.is_some_and(jfc_streaming_title_active)
+        {
             linkscope::record_items("agent.title_active", 1);
             return true;
         }
@@ -402,10 +410,24 @@ mod tests {
     }
 
     #[test]
-    fn jfc_streaming_title_counts_as_active() {
+    fn jfc_streaming_title_counts_as_active_when_user_recently_present() {
         let mut monitor = monitor_with_window(60_000);
 
+        // process_recency_ms is 300_000 (5 min); a recent user gets the title
+        // credit.
         assert!(monitor.is_active(
+            60 * 1000,
+            Some("\u{25cf} jfc \u{00b7} claude-sonnet \u{00b7} jfc")
+        ));
+    }
+
+    #[test]
+    fn jfc_streaming_title_is_ignored_once_user_is_long_idle() {
+        let mut monitor = monitor_with_window(60_000);
+
+        // A stale spinner title must not pin Active after the user has been
+        // idle past the recency window (docs/SLEEP_DETECTION.lean bug B1).
+        assert!(!monitor.is_active(
             10 * 60 * 1000,
             Some("\u{25cf} jfc \u{00b7} claude-sonnet \u{00b7} jfc")
         ));

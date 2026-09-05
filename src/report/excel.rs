@@ -308,7 +308,8 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
             .write_number_with_format(row, 8, prod_active_pct, pct_fmt)
             .map_err(xlsx_err)?;
 
-        // Cols 9-11 (avg/days) written in totals pass below; leave blank per-row
+        // Cols 9-11 (avg/days) written in totals pass below; leave blank
+        // per-row
 
         // Daily Δ (col 12) - colored based on productive time change
         let delta_fmt = if *is_workday {
@@ -333,7 +334,8 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         row = row.saturating_add(1);
     }
 
-    // ── Totals row ──────────────────────────────────────────────────────────────
+    // ── Totals row
+    // ──────────────────────────────────────────────────────────────
     let mut daily_total = Metrics::default();
 
     for (_, m, _is_workday) in &daily_metrics {
@@ -624,7 +626,8 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
                 .map_err(xlsx_err)?;
         }
 
-        // Query total time from ALL apps, not just top-20, for accurate percentage
+        // Query total time from ALL apps, not just top-20, for accurate
+        // percentage
         let grand_total_ms =
             super::query::metrics_between(&app.conn, &app.config, &bounds.since_utc, until_utc)?
                 .total_ms;

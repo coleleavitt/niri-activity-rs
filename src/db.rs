@@ -392,24 +392,51 @@ pub fn reclassify_all(conn: &mut Connection, config: &Config) -> Result<(), Erro
 
 /// Fill `agent_ms` for events recorded before agent tracking existed.
 ///
+/// Upper bound on rows one backfill pass will load/update, bounding memory and
+/// write-lock duration. The heal loop advances across passes, so a large first
+/// run still converges over several passes instead of one unbounded scan.
+const MAX_AGENT_BACKFILL_ROWS: usize = 50_000;
+
+/// Rows recent enough that the live watcher may still fill their agent_ms are
+/// left alone by the healer, so heal and the daemon do not fight over them.
+/// Only events older than this are considered "settled" and get a measured
+/// value (including a measured 0), which is what lets heal converge.
+const AGENT_HEAL_GRACE_SECS: i64 = 900; // 15 minutes
+
 /// Reconstructs agent activity from harness logs and intersects it with each
 /// session's own span, so a five-minute focus that overlapped two busy minutes
 /// is credited two minutes rather than five.
+///
+/// Bounded to `MAX_AGENT_BACKFILL_ROWS` and ordered oldest-first so repeated
+/// passes make forward progress. `before_secs` excludes rows too recent to
+/// have settled (the live watcher may still measure them).
 fn events_needing_agent_ms(
     conn: &Connection,
     since_secs: i64,
+    before_secs: i64,
 ) -> Result<Vec<(i64, String, i64)>, Error> {
     let since_rfc3339 = chrono::DateTime::from_timestamp(since_secs, 0)
         .unwrap_or_else(Utc::now)
         .to_rfc3339();
+    let before_rfc3339 = chrono::DateTime::from_timestamp(before_secs, 0)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339();
     let mut stmt = conn.prepare(
         "SELECT id, timestamp, active_ms + COALESCE(passive_ms,0) + idle_ms
-           FROM events WHERE agent_ms IS NULL AND timestamp >= ?1",
+           FROM events
+          WHERE agent_ms IS NULL AND timestamp >= ?1 AND timestamp < ?2
+          ORDER BY timestamp
+          LIMIT ?3",
     )?;
     let rows = stmt
-        .query_map(params![&since_rfc3339], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)?))
-        })?
+        .query_map(
+            params![
+                &since_rfc3339,
+                &before_rfc3339,
+                i64::try_from(MAX_AGENT_BACKFILL_ROWS).unwrap_or(i64::MAX)
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)?)),
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -420,6 +447,11 @@ fn events_needing_agent_ms(
 /// daemon that was down for a day and one down for a month both heal without
 /// a configured lookback. Returns `Ok(0)` immediately when nothing is pending,
 /// which the partial index makes effectively free.
+///
+/// Converges: settled rows (older than the grace window) always receive a
+/// measured value — a measured 0 when no agent ran — so they stop being NULL
+/// and are not rescanned on the next startup. Only rows inside the grace window
+/// stay NULL, and those are few.
 pub fn heal_missing_agent_ms(conn: &mut Connection) -> Result<i64, Error> {
     // MIN over an empty set yields one row holding NULL, so the Option is the
     // "nothing pending" signal rather than a missing row.
@@ -439,30 +471,43 @@ pub fn heal_missing_agent_ms(conn: &mut Connection) -> Result<i64, Error> {
 }
 
 pub fn backfill_agent_ms(conn: &mut Connection, since_secs: i64) -> Result<i64, Error> {
-    let until_secs = Utc::now().timestamp();
-    let busy = harness::busy_minutes(since_secs, until_secs);
-    if busy.is_empty() {
+    let now_secs = Utc::now().timestamp();
+    // Settle boundary: rows newer than this may still be filled by the live
+    // watcher, so the healer leaves them NULL to avoid a race.
+    let before_secs = now_secs.saturating_sub(AGENT_HEAL_GRACE_SECS);
+    if before_secs <= since_secs {
         return Ok(0);
     }
 
-    // Only events inside the scanned window can be measured. Writing 0 to an
-    // event outside it would claim no agent ran, when the truth is that no
-    // log was read for that time.
-    let rows = events_needing_agent_ms(conn, since_secs)?;
+    let busy = harness::busy_minutes(since_secs, before_secs);
+
+    // A row too old for the live watcher and outside any agent-busy interval
+    // gets a measured 0. Distinguishing "measured 0" from "never scanned" is
+    // exactly what makes heal converge; without it, no-agent nights stayed
+    // NULL forever and the healer rescanned all of history on every startup.
+    let rows = events_needing_agent_ms(conn, since_secs, before_secs)?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
     let tx = conn.transaction()?;
     let mut filled = 0i64;
-    for (id, timestamp, span_ms) in &rows {
-        let Ok(start) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
-            continue;
-        };
-        let start_ms = start.timestamp_millis();
-        let agent_ms = busy.overlap_ms(start_ms, start_ms.saturating_add(*span_ms));
-        tx.execute(
-            "UPDATE events SET agent_ms = ?1 WHERE id = ?2",
-            params![agent_ms, id],
-        )?;
-        if agent_ms > 0 {
-            filled = filled.saturating_add(1);
+    {
+        let mut stmt = tx.prepare("UPDATE events SET agent_ms = ?1 WHERE id = ?2")?;
+        for (id, timestamp, span_ms) in &rows {
+            let agent_ms = match chrono::DateTime::parse_from_rfc3339(timestamp) {
+                Ok(start) => {
+                    let start_ms = start.timestamp_millis();
+                    busy.overlap_ms(start_ms, start_ms.saturating_add(*span_ms))
+                }
+                // Unparseable timestamp: still settle it with a measured 0 so
+                // it does not wedge the healer at this row forever.
+                Err(_) => 0,
+            };
+            stmt.execute(params![agent_ms, id])?;
+            if agent_ms > 0 {
+                filled = filled.saturating_add(1);
+            }
         }
     }
     tx.commit()?;
@@ -928,7 +973,12 @@ mod tests {
             .expect("fixed date")
             .timestamp();
 
-        let eligible = events_needing_agent_ms(&conn, since).expect("query");
+        // Far-future settle boundary so the window itself, not the grace
+        // window, is what limits eligibility in this test.
+        let before = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00+00:00")
+            .expect("fixed date")
+            .timestamp();
+        let eligible = events_needing_agent_ms(&conn, since, before).expect("query");
         assert_eq!(
             eligible.len(),
             1,
@@ -966,7 +1016,66 @@ mod tests {
     #[test]
     fn backfill_considers_every_event_when_the_window_is_wide_enough() {
         let conn = db_with_events(&["2026-02-02T12:00:00+00:00", "2026-08-16T12:00:00+00:00"]);
-        let rows = events_needing_agent_ms(&conn, 0).expect("query");
+        let before = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00+00:00")
+            .expect("fixed date")
+            .timestamp();
+        let rows = events_needing_agent_ms(&conn, 0, before).expect("query");
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn backfill_settles_old_rows_to_measured_zero_so_heal_converges() {
+        // Two rows well in the past (older than the grace window) with no agent
+        // activity. After backfill they must have agent_ms = 0 (measured), not
+        // NULL, so the healer does not rescan them forever. This is the
+        // convergence fix for unmeasured no-agent rows.
+        let mut conn = db_with_events(&["2026-01-01T00:00:00+00:00", "2026-01-01T00:01:00+00:00"]);
+        let before_null: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_ms IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(before_null, 2);
+
+        // Scan from the start of that day; there is no harness activity in
+        // tests, so every settled row should get a measured 0.
+        let since = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
+            .expect("fixed")
+            .timestamp();
+        backfill_agent_ms(&mut conn, since).expect("backfill");
+
+        let still_null: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_ms IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(still_null, 0, "settled rows must be measured, not NULL");
+
+        // A second heal pass finds nothing pending and is a no-op.
+        let second = heal_missing_agent_ms(&mut conn).expect("heal");
+        assert_eq!(second, 0, "heal converges: nothing left to scan");
+    }
+
+    #[test]
+    fn backfill_leaves_recent_rows_null_for_the_live_watcher() {
+        // A row inside the grace window must stay NULL so the live daemon, not
+        // the healer, measures it (avoids a race).
+        let now = Utc::now();
+        let recent = now.to_rfc3339();
+        let mut conn = db_with_events(&[&recent]);
+        let since = now.timestamp() - 3600;
+        backfill_agent_ms(&mut conn, since).expect("backfill");
+        let null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_ms IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(null_count, 1, "recent row left for the live watcher");
     }
 }

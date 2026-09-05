@@ -169,8 +169,8 @@ pub fn detect_project_from_app_title(app_id: &str, title: &str) -> Option<String
 
 fn parse_jetbrains_title(title: &str) -> Option<String> {
     // JetBrains uses " – " (en-dash) or " - " as separator
-    // Pattern: "project_name – file.rs" or "project_name [~/path/to/project] – ..."
-    // The project name is always the first segment
+    // Pattern: "project_name – file.rs" or "project_name [~/path/to/project] –
+    // ..." The project name is always the first segment
     let separator = if title.contains(" \u{2013} ") {
         " \u{2013} "
     } else {
@@ -265,7 +265,8 @@ pub fn detect_git_branch(path: &Path) -> Option<String> {
         if git_dir.exists() {
             // Read .git/HEAD
             let head_path = if git_dir.is_file() {
-                // Worktree: .git is a file with "gitdir: /path/to/real/.git/worktrees/name"
+                // Worktree: .git is a file with "gitdir:
+                // /path/to/real/.git/worktrees/name"
                 let content = std::fs::read_to_string(&git_dir).ok()?;
                 let gitdir = content.strip_prefix("gitdir: ")?.trim();
                 PathBuf::from(gitdir).join("HEAD")
@@ -307,7 +308,8 @@ pub fn resolve_project_in_search_dirs(basename: &str, search_dirs: &[PathBuf]) -
             if let Some(name) = detect_project_from_path(&candidate) {
                 return Some(name);
             }
-            // Even without markers, if the directory exists in a search_dir, trust it
+            // Even without markers, if the directory exists in a search_dir,
+            // trust it
             return Some(basename.to_string());
         }
     }
@@ -631,7 +633,8 @@ mod tests {
         )
         .unwrap();
 
-        // The worktree directory has a .git file pointing to the worktree gitdir
+        // The worktree directory has a .git file pointing to the worktree
+        // gitdir
         let wt_dir = tmp.path().join("worktree-dir");
         fs::create_dir_all(&wt_dir).unwrap();
         fs::write(
