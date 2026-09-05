@@ -1876,7 +1876,7 @@ mod tests {
         let mut state = WatchState::new(0, 0);
         state.current_state = current;
         state.last_idle_check = Instant::now()
-            .checked_sub(Duration::from_millis(1000))
+            .checked_sub(Duration::from_secs(1))
             .expect("instant predates process start");
         accumulate_state_time(&mut state, Instant::now(), agent_active);
         state
