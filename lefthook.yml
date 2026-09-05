@@ -4,7 +4,6 @@
 # from .github/workflows/ci.yml using the stable toolchain explicitly, so a
 # different local default toolchain cannot hide CI-only Clippy diagnostics.
 pre-commit:
-  piped: true
   commands:
     format:
       run: cargo fmt --all -- --check
@@ -14,7 +13,6 @@ pre-commit:
       fail_text: "Locked workspace check failed."
 
 pre-push:
-  piped: true
   commands:
     clippy:
       run: cargo +stable clippy --locked --workspace --all-targets --all-features -- -D warnings

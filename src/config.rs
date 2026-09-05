@@ -1133,6 +1133,12 @@ fn validate_agent_activity_config(config: &AgentActivityConfig) -> Result<(), Er
                 .into(),
         ));
     }
+    if config.enabled && config.activity_window_secs == 0 {
+        return Err(Error::InvalidArgument(
+            "agent_activity.activity_window_secs must be at least 1 when agent activity is enabled"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1381,6 +1387,33 @@ regex = true
                 .timezone,
             Some(chrono_tz::America::New_York)
         );
+    }
+
+    fn parse_and_validate_agent_activity(toml: &str) -> Result<(), Error> {
+        let raw: RawConfig = toml::from_str(toml).expect("test config must parse");
+        validate_agent_activity_config(&raw.agent_activity)
+    }
+
+    #[test]
+    fn enabled_agent_activity_rejects_zero_activity_window() {
+        let error = parse_and_validate_agent_activity(
+            "[agent_activity]\nenabled = true\nactivity_window_secs = 0\n",
+        )
+        .expect_err("a zero window makes every timestamp stale");
+
+        assert!(
+            error
+                .to_string()
+                .contains("agent_activity.activity_window_secs must be at least 1")
+        );
+    }
+
+    #[test]
+    fn disabled_agent_activity_allows_zero_activity_window() {
+        parse_and_validate_agent_activity(
+            "[agent_activity]\nenabled = false\nactivity_window_secs = 0\n",
+        )
+        .expect("disabled agent settings are inert");
     }
 
     fn parse_and_validate_jiggler(toml: &str) -> Result<(), Error> {

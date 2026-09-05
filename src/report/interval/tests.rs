@@ -110,3 +110,44 @@ fn complementary_clips_telescope_each_presence_dimension() {
     assert_eq!(left.passive_ms + right.passive_ms, event.passive_ms);
     assert_eq!(left.idle_ms + right.idle_ms, event.idle_ms);
 }
+
+#[test]
+fn every_partition_conserves_each_presence_dimension_and_slice_duration() {
+    for total in 1..=24 {
+        for active in 0..=total {
+            for passive in 0..=total - active {
+                let idle = total - active - passive;
+                let event = event(0, active, passive, idle);
+                let mut allocated = (0, 0, 0);
+                for start in 0..total {
+                    let slice = event.slice(start, start + 1);
+                    assert_eq!(slice.total_ms(), 1, "{active}/{passive}/{idle} at {start}");
+                    allocated.0 += slice.active_ms;
+                    allocated.1 += slice.passive_ms;
+                    allocated.2 += slice.idle_ms;
+                }
+                assert_eq!(allocated, (active, passive, idle));
+            }
+        }
+    }
+}
+
+#[test]
+fn arbitrary_slice_boundaries_conserve_presence() {
+    let event = event(0, 7, 5, 11);
+    let boundaries = [0, 1, 4, 9, 10, 17, 23];
+    let slices = boundaries
+        .windows(2)
+        .map(|bounds| event.slice(bounds[0], bounds[1]))
+        .collect::<Vec<_>>();
+
+    assert!(
+        slices
+            .iter()
+            .zip(boundaries.windows(2))
+            .all(|(slice, bounds)| { slice.total_ms() == bounds[1] - bounds[0] })
+    );
+    assert_eq!(slices.iter().map(|slice| slice.active_ms).sum::<i64>(), 7);
+    assert_eq!(slices.iter().map(|slice| slice.passive_ms).sum::<i64>(), 5);
+    assert_eq!(slices.iter().map(|slice| slice.idle_ms).sum::<i64>(), 11);
+}

@@ -108,11 +108,10 @@ impl Harness {
                 Signal::LogDir("~/.gjc/agent/sessions"),
             ],
             Harness::Jfc => &[
-                // Foreground structured logs are appended throughout streaming and
-                // tool execution. The old ~/.jfc/audit path was project-relative
-                // in JFC and therefore wrong for almost every working directory.
+                // Foreground and daemon logs beneath this root are appended during
+                // streaming and tool execution. The old ~/.jfc/audit path was
+                // project-relative in JFC and wrong for most working directories.
                 Signal::LogDir("~/.config/jfc/logs"),
-                Signal::LogDir("~/.config/jfc/logs/daemon/agents"),
             ],
             Harness::Jcode => &[Signal::LogDir("~/.jcode/logs")],
             Harness::Amp => &[Signal::LogDir("~/.amp/file-changes")],

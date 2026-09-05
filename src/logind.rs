@@ -21,7 +21,6 @@ use crate::error::Error;
 pub struct LogindMonitor {
     lock_state: Arc<AtomicU8>,
     suspend_resumed: Arc<AtomicBool>,
-    sleep_degraded: Arc<AtomicBool>,
 }
 
 impl LogindMonitor {
@@ -37,10 +36,9 @@ impl LogindMonitor {
     }
 
     /// Whether lock monitoring is currently fail-closed due to an unavailable
-    /// or unreadable logind stream.
-    pub fn is_degraded(&self) -> bool {
+    /// or unreadable `LockedHint` stream.
+    pub fn is_lock_degraded(&self) -> bool {
         self.lock_state.load(Ordering::Acquire) == LOCK_STATE_DEGRADED
-            || self.sleep_degraded.load(Ordering::Acquire)
     }
 }
 
@@ -273,7 +271,6 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
     Ok(LogindMonitor {
         lock_state,
         suspend_resumed,
-        sleep_degraded,
     })
 }
 
@@ -286,11 +283,23 @@ mod tests {
         let monitor = LogindMonitor {
             lock_state: Arc::new(AtomicU8::new(LOCK_STATE_DEGRADED)),
             suspend_resumed: Arc::new(AtomicBool::new(false)),
-            sleep_degraded: Arc::new(AtomicBool::new(true)),
         };
 
         assert!(monitor.is_locked());
-        assert!(monitor.is_degraded());
+        assert!(monitor.is_lock_degraded());
+    }
+
+    #[test]
+    fn lock_health_is_independent_of_sleep_listener_health() {
+        let sleep_degraded = AtomicBool::new(true);
+        let monitor = LogindMonitor {
+            lock_state: Arc::new(AtomicU8::new(LOCK_STATE_HEALTHY_UNLOCKED)),
+            suspend_resumed: Arc::new(AtomicBool::new(false)),
+        };
+
+        assert!(sleep_degraded.load(Ordering::Acquire));
+        assert!(!monitor.is_locked());
+        assert!(!monitor.is_lock_degraded());
     }
 
     #[test]

@@ -979,7 +979,7 @@ mod tests {
         assert!(app.today.is_some());
         assert!(app.metrics.is_some());
         assert!(app.timeline.is_some());
-        assert!((app.mouse_dpi - 1_200.0).abs() < f64::EPSILON);
+        assert!((app.mouse_dpi - 1_200.0).abs() < 1e-6);
         assert_eq!(app.schedule_start, "09:00");
         assert_eq!(app.schedule_end, "17:00");
         assert_eq!(

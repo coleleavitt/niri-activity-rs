@@ -80,7 +80,11 @@ pub(crate) fn parse_rfc3339(s: &str) -> Option<i64> {
     let num = |from: usize, to: usize| s.get(from..to)?.parse::<i64>().ok();
     let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (hour, min, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    if !(1..=12).contains(&month) || hour > 23 || min > 59 || sec > 59 {
+    if !(1..=12).contains(&month)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&min)
+        || !(0..=59).contains(&sec)
+    {
         return None;
     }
     let leap = year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
@@ -120,7 +124,7 @@ pub(crate) fn parse_rfc3339(s: &str) -> Option<i64> {
         {
             let hours = s.get(zone + 1..zone + 3)?.parse::<i64>().ok()?;
             let minutes = s.get(zone + 4..zone + 6)?.parse::<i64>().ok()?;
-            if hours > 23 || minutes > 59 {
+            if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
                 return None;
             }
             let seconds = hours * 3_600 + minutes * 60;
@@ -299,6 +303,11 @@ mod tests {
         );
         assert_eq!(parse_rfc3339("2026-01-01T00:00:00"), None);
         assert_eq!(parse_rfc3339("2026-01-01T00:00:00+24:00"), None);
+        assert_eq!(parse_rfc3339("2026-01-01T00:00:00--1:00"), None);
+        assert_eq!(parse_rfc3339("2026-01-01T00:00:00+-1:00"), None);
+        assert_eq!(parse_rfc3339("2026-01-01T-1:00:00Z"), None);
+        assert_eq!(parse_rfc3339("2026-01-01T00:-1:00Z"), None);
+        assert_eq!(parse_rfc3339("2026-01-01T00:00:-1Z"), None);
         assert_eq!(parse_rfc3339("2026-02-30T00:00:00Z"), None);
         assert_eq!(parse_rfc3339("not a date"), None);
         assert_eq!(parse_rfc3339("2026-01-01"), None);

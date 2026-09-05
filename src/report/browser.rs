@@ -50,16 +50,49 @@ fn tracked_by_domain_between(
     Ok(totals)
 }
 
-/// Browser engagement cannot be compared to a bounded tracker range.
+/// Show Firefox's lifetime cumulative engagement counters by domain.
 ///
-/// Firefox exposes lifetime cumulative counters. Its created/updated
-/// timestamps do not say when the accumulated engagement occurred, so using
-/// them as interval bounds would silently overcount arbitrary history.
-pub fn show_engagement(_app: &App, _range: TimeRange, _limit: usize) -> Result<(), Error> {
-    Err(Error::InvalidArgument(
-        "bounded browser engagement is unsupported: Firefox exposes lifetime aggregate counters, not interval engagement"
-            .to_string(),
-    ))
+/// These values deliberately have no reporting-range argument. Firefox's
+/// created/updated timestamps do not bound the time accumulated by a counter,
+/// so presenting the counters as interval engagement would be misleading.
+pub fn show_engagement(limit: usize) -> Result<(), Error> {
+    let totals = browser_profiles::lifetime_engagement_by_domain()
+        .map_err(|error| Error::NiriError(format!("Failed to read browser engagement: {error}")))?;
+    let mut rows: Vec<_> = totals.into_iter().collect();
+    rows.sort_by_key(|(_, (view_time, _))| std::cmp::Reverse(*view_time));
+
+    println!(
+        "{}
+",
+        "Lifetime browser engagement".cyan().bold()
+    );
+    println!(
+        "{}",
+        "Firefox-family cumulative counters; not a date-range report.".dimmed()
+    );
+    if rows.is_empty() {
+        println!("{}", "No Firefox engagement data found.".yellow());
+        return Ok(());
+    }
+
+    println!(
+        "
+{:>10}  {:>10}  {}",
+        "View time".bold(),
+        "Keys".bold(),
+        "Domain".bold()
+    );
+    println!("{}", "─".repeat(66).dimmed());
+    for (domain, (view_time, key_presses)) in rows.into_iter().take(limit) {
+        let millis = i64::try_from(view_time.as_millis()).unwrap_or(i64::MAX);
+        println!(
+            "{:>10}  {:>10}  {}",
+            crate::fmt::fmt_duration(millis),
+            key_presses,
+            truncate(&domain, 42)
+        );
+    }
+    Ok(())
 }
 
 /// Show which sites lead to which, revealing how a destination is reached.
@@ -186,17 +219,5 @@ mod tests {
         .expect("tracked totals");
 
         assert_eq!(totals.get("example.com"), Some(&60_000));
-    }
-
-    #[test]
-    fn bounded_engagement_fails_closed() {
-        let conn = rusqlite::Connection::open_in_memory().expect("database");
-        let app = App {
-            config: Config::default(),
-            conn,
-        };
-        let error = show_engagement(&app, TimeRange::Days(7), 25).expect_err("unsupported");
-
-        assert!(error.to_string().contains("lifetime aggregate counters"));
     }
 }

@@ -441,17 +441,25 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
             project_entry.active_ms = project_entry.active_ms.saturating_add(event.active_ms);
             project_entry.keys = project_entry.keys.saturating_add(event.keystrokes);
             project_entry.clicks = project_entry.clicks.saturating_add(event.mouse_clicks);
+            let credit = StateCredit::for_event(&app.config, event).total_ms;
             match event.category {
                 Category::Productive => {
                     project_entry.productive_ms =
                         project_entry.productive_ms.saturating_add(event_total);
                 }
                 Category::Neutral => {
-                    project_entry.neutral_ms = project_entry.neutral_ms.saturating_add(event_total);
+                    project_entry.neutral_ms = project_entry
+                        .neutral_ms
+                        .saturating_add(event_total.saturating_sub(credit));
+                    project_entry.productive_ms =
+                        project_entry.productive_ms.saturating_add(credit);
                 }
                 Category::Unproductive => {
-                    project_entry.unproductive_ms =
-                        project_entry.unproductive_ms.saturating_add(event_total);
+                    project_entry.unproductive_ms = project_entry
+                        .unproductive_ms
+                        .saturating_add(event_total.saturating_sub(credit));
+                    project_entry.productive_ms =
+                        project_entry.productive_ms.saturating_add(credit);
                 }
             }
         }
@@ -3031,6 +3039,84 @@ mod tests {
         assert_eq!(mixed.productive_ms, 120_000);
         assert_eq!(mixed.neutral_ms, 0);
         assert_eq!(mixed.unproductive_ms, 30_000);
+    }
+
+    #[test]
+    fn projects_apply_agent_credit_consistently_with_report_categories() {
+        let mut app = create_utc_test_app();
+        app.config.agent_activity.counts_as_productive = true;
+        let today = app.config.local_date_today();
+        let timestamp = format!("{}T10:00:00+00:00", today);
+        for (app_id, category, duration, agent_ms) in [
+            ("neutral-agent", "neutral", 60_000, 20_000),
+            ("unproductive-agent", "unproductive", 30_000, 10_000),
+        ] {
+            insert_test_event(
+                &app.conn, &timestamp, app_id, category, duration, 0, 0, 0, 0,
+            )
+            .expect("project event");
+            app.conn
+                .execute(
+                    "UPDATE events SET project = 'credited-project', agent_ms = ?1 WHERE app_id = ?2",
+                    params![agent_ms, app_id],
+                )
+                .expect("project and agent time");
+        }
+
+        let report = query_report_range(&app, TimeRange::Days(0)).expect("report");
+        let project = report
+            .projects
+            .iter()
+            .find(|project| project.project == "credited-project")
+            .expect("credited project");
+        assert_eq!(project.total_ms, 90_000);
+        assert_eq!(project.productive_ms, 30_000);
+        assert_eq!(project.neutral_ms, 40_000);
+        assert_eq!(project.unproductive_ms, 20_000);
+        assert_eq!(
+            project.productive_ms + project.neutral_ms + project.unproductive_ms,
+            project.total_ms
+        );
+        assert_eq!(
+            total_of(&report.categories, Category::Productive),
+            project.productive_ms
+        );
+    }
+
+    #[test]
+    fn projects_leave_categories_raw_when_agent_credit_is_disabled() {
+        let mut app = create_utc_test_app();
+        app.config.agent_activity.counts_as_productive = false;
+        let today = app.config.local_date_today();
+        let timestamp = format!("{}T10:00:00+00:00", today);
+        insert_test_event(
+            &app.conn,
+            &timestamp,
+            "neutral-agent",
+            "neutral",
+            60_000,
+            0,
+            0,
+            0,
+            0,
+        )
+        .expect("project event");
+        app.conn
+            .execute(
+                "UPDATE events SET project = 'raw-project', agent_ms = 20_000",
+                [],
+            )
+            .expect("project and agent time");
+
+        let report = query_report_range(&app, TimeRange::Days(0)).expect("report");
+        let project = report
+            .projects
+            .iter()
+            .find(|project| project.project == "raw-project")
+            .expect("raw project");
+        assert_eq!(project.productive_ms, 0);
+        assert_eq!(project.neutral_ms, 60_000);
+        assert_eq!(project.unproductive_ms, 0);
     }
 
     #[test]

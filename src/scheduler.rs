@@ -21,6 +21,7 @@ const MAX_MONTHLY: u32 = 3;
 // and before `sent` was committed. SMTP has no portable idempotency primitive;
 // strict exactly-once delivery needs provider support keyed by period/job ID.
 const CLAIM_LEASE: Duration = Duration::from_secs(24 * 60 * 60);
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
@@ -271,6 +272,12 @@ fn record_failure(conn: &Connection, job: &Job, owner: &str, error: &Error) -> R
     Ok(())
 }
 
+fn open_scheduler_db(db_path: &PathBuf) -> Result<Connection, Error> {
+    let conn = Connection::open(db_path)?;
+    conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+    Ok(conn)
+}
+
 fn run_worker_once(db_path: &PathBuf, quiet: bool, stop: &AtomicBool) -> Result<(), Error> {
     let config = crate::config::load_config()?;
     if !config.email.enabled {
@@ -278,7 +285,7 @@ fn run_worker_once(db_path: &PathBuf, quiet: bool, stop: &AtomicBool) -> Result<
     }
     let today = config.local_now().date_naive();
     let jobs = candidate_jobs(today);
-    let mut conn = Connection::open(db_path)?;
+    let mut conn = open_scheduler_db(db_path)?;
     ensure_jobs(&conn, &jobs)?;
     let owner = format!(
         "{}:{}",
@@ -409,6 +416,17 @@ mod tests {
         gate.wait();
         drop(tx);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn scheduler_connection_has_bounded_busy_timeout() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let conn = open_scheduler_db(&file.path().to_path_buf()).unwrap();
+        let timeout_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(timeout_ms, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
     }
 
     #[test]

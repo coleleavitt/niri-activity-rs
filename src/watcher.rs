@@ -451,7 +451,7 @@ fn handle_lock_unlock(
 ) -> Result<bool, Error> {
     let locked_now = logind.is_locked();
 
-    let logind_degraded = logind.is_degraded();
+    let logind_degraded = logind.is_lock_degraded();
     if logind_degraded && !state.logind_warned {
         tracing::warn!("logind lock monitoring degraded; fail-closed locked state is active");
         state.logind_warned = true;
@@ -585,11 +585,12 @@ fn handle_idle_transitions(
     // indefinitely).
     let idle_duration_ms = now_ms.saturating_sub(last_input_ms);
 
-    let focused_title = state
-        .focused_id
-        .and_then(|id| state.windows.get(&id))
-        .map(|info| info.title.as_str());
-    let agent_active = agent_monitor.is_active(idle_duration_ms, focused_title);
+    let focused = state.focused_id.and_then(|id| state.windows.get(&id));
+    let agent_active = agent_monitor.is_active(
+        idle_duration_ms,
+        focused.map(|info| info.app_id.as_str()),
+        focused.map(|info| info.title.as_str()),
+    );
     let new_state = compute_activity_state(idle_duration_ms, agent_active, thresholds);
 
     if new_state == ActivityState::Away && state.current_state != ActivityState::Away {
@@ -713,11 +714,12 @@ fn detect_agent_activity(
 ) -> bool {
     let now_ms = millis_u64(monitor_start.elapsed());
     let idle_duration_ms = now_ms.saturating_sub(input_stats.last_activity_ms());
-    let focused_title = state
-        .focused_id
-        .and_then(|id| state.windows.get(&id))
-        .map(|info| info.title.as_str());
-    agent_monitor.is_active(idle_duration_ms, focused_title)
+    let focused = state.focused_id.and_then(|id| state.windows.get(&id));
+    agent_monitor.is_active(
+        idle_duration_ms,
+        focused.map(|info| info.app_id.as_str()),
+        focused.map(|info| info.title.as_str()),
+    )
 }
 
 /// Close the monotonic accounting interval immediately before a boundary

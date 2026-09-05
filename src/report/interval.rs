@@ -78,6 +78,23 @@ impl EventInterval {
         let total_ms = self.total_ms();
         let start_offset = slice_start_ms.saturating_sub(self.start_ms);
         let end_offset = slice_end_ms.saturating_sub(self.start_ms);
+        let slice_total = slice_end_ms.saturating_sub(slice_start_ms);
+        let presence_at = |offset: i64| {
+            let elapsed = offset.clamp(0, total_ms);
+            let active = proportional_at(self.active_ms, elapsed, total_ms);
+            let remaining = elapsed.saturating_sub(active);
+            let passive_idle = self.passive_ms.saturating_add(self.idle_ms);
+            let passive = proportional_at(self.passive_ms, remaining, passive_idle);
+            (active, passive, remaining.saturating_sub(passive))
+        };
+        let start_presence = presence_at(start_offset);
+        let end_presence = presence_at(end_offset);
+        let active_ms = end_presence.0.saturating_sub(start_presence.0);
+        let passive_ms = end_presence.1.saturating_sub(start_presence.1);
+        let idle_ms = slice_total
+            .saturating_sub(active_ms)
+            .saturating_sub(passive_ms);
+
         Self {
             source_start_ms: self.source_start_ms,
             start_ms: slice_start_ms,
@@ -85,9 +102,9 @@ impl EventInterval {
             title: self.title.clone(),
             category: self.category,
             project: self.project.clone(),
-            active_ms: proportional_between(self.active_ms, start_offset, end_offset, total_ms),
-            passive_ms: proportional_between(self.passive_ms, start_offset, end_offset, total_ms),
-            idle_ms: proportional_between(self.idle_ms, start_offset, end_offset, total_ms),
+            active_ms,
+            passive_ms,
+            idle_ms,
             agent_ms: self
                 .agent_ms
                 .map(|agent_ms| proportional_between(agent_ms, start_offset, end_offset, total_ms)),
@@ -114,6 +131,14 @@ impl EventInterval {
             jiggler_detected: self.jiggler_detected,
         }
     }
+}
+
+fn proportional_at(value: i64, offset: i64, total: i64) -> i64 {
+    if value <= 0 || total <= 0 || offset <= 0 {
+        return 0;
+    }
+    let numerator = i128::from(value) * i128::from(offset.min(total));
+    i64::try_from(numerator / i128::from(total)).unwrap_or(i64::MAX)
 }
 
 pub(super) fn load_overlapping(

@@ -96,18 +96,33 @@ const MAX_LOG_TREE_DEPTH: usize = 16;
 
 /// Visit regular files under `root` without following symlinks.
 ///
-/// Returning `true` stops the walk. Entry and depth budgets guarantee a stale
-/// or adversarial history tree cannot stall the watcher indefinitely.
-fn walk_log_files(root: &Path, mut visit: impl FnMut(&Path) -> bool) -> bool {
+/// A matching visitor stops the walk. Entry and depth budgets guarantee a
+/// stale or adversarial history tree cannot stall the watcher indefinitely.
+/// Truncation is distinct from a complete scan that found no match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkOutcome {
+    Found,
+    Complete,
+    Truncated,
+}
+
+fn walk_log_files(root: &Path, visit: impl FnMut(&Path) -> bool) -> WalkOutcome {
+    walk_log_files_with_budget(root, MAX_LOG_TREE_ENTRIES, visit)
+}
+
+fn walk_log_files_with_budget(
+    root: &Path,
+    mut remaining: usize,
+    mut visit: impl FnMut(&Path) -> bool,
+) -> WalkOutcome {
     let mut stack = vec![(root.to_path_buf(), 0usize)];
-    let mut remaining = MAX_LOG_TREE_ENTRIES;
     while let Some((current, depth)) = stack.pop() {
         let Ok(entries) = fs::read_dir(current) else {
             continue;
         };
         for entry in entries.flatten() {
             if remaining == 0 {
-                return false;
+                return WalkOutcome::Truncated;
             }
             remaining -= 1;
             let Ok(file_type) = entry.file_type() else {
@@ -115,19 +130,22 @@ fn walk_log_files(root: &Path, mut visit: impl FnMut(&Path) -> bool) -> bool {
             };
             if file_type.is_file() {
                 if visit(&entry.path()) {
-                    return true;
+                    return WalkOutcome::Found;
                 }
             } else if file_type.is_dir() && depth < MAX_LOG_TREE_DEPTH {
                 stack.push((entry.path(), depth + 1));
             }
         }
     }
-    false
+    WalkOutcome::Complete
 }
 
 /// Whether any regular file beneath a directory was written recently.
 fn dir_written_within(dir: &Path, window: Duration) -> bool {
-    walk_log_files(dir, |path| written_within(path, window))
+    // An incomplete bounded scan cannot prove inactivity. Treat truncation as
+    // active so a large or adversarial tree cannot hide a working agent.
+    window != Duration::ZERO
+        && walk_log_files(dir, |path| written_within(path, window)) != WalkOutcome::Complete
 }
 
 fn consider_file(path: &Path, consider: &mut impl FnMut(SystemTime)) {
@@ -272,6 +290,17 @@ mod tests {
             .and_then(|m| m.modified())
             .expect("wal time");
         assert!(latest >= wal_time);
+    }
+
+    #[test]
+    fn truncated_scan_cannot_report_complete_inactivity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        touch(&dir.path().join("stale-one.jsonl"));
+        touch(&dir.path().join("stale-two.jsonl"));
+
+        let outcome = walk_log_files_with_budget(dir.path(), 1, |_| false);
+        assert_eq!(outcome, WalkOutcome::Truncated);
+        assert_ne!(outcome, WalkOutcome::Complete);
     }
 
     #[test]

@@ -188,7 +188,14 @@ impl Browser {
                 "Firefox",
             ],
             Browser::Zen => &["Zen Browser", "Zen Twilight", "Twilight", "Zen"],
-            Browser::Chrome => &["Google Chrome", "Google Chrome Canary"],
+            // Chromium's branded string table defines channel-specific
+            // browser-window title formats for Beta, Dev, and Canary.
+            Browser::Chrome => &[
+                "Google Chrome",
+                "Google Chrome Beta",
+                "Google Chrome Dev",
+                "Google Chrome Canary",
+            ],
             Browser::Chromium => &["Chromium"],
             Browser::TorBrowser => &["Tor Browser"],
             Browser::LibreWolf => &["LibreWolf"],
@@ -275,11 +282,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chrome_discovers_supported_linux_channel_roots() {
+    fn chrome_linux_channels_strip_their_channel_window_brands() {
         let roots = Browser::Chrome.profile_roots();
-        assert!(roots.contains(&".config/google-chrome"));
-        assert!(roots.contains(&".config/google-chrome-beta"));
-        assert!(roots.contains(&".config/google-chrome-unstable"));
+        for root in [
+            ".config/google-chrome",
+            ".config/google-chrome-beta",
+            ".config/google-chrome-unstable",
+        ] {
+            assert!(roots.contains(&root));
+        }
+
+        for brand in [
+            "Google Chrome",
+            "Google Chrome Beta",
+            "Google Chrome Dev",
+            "Google Chrome Canary",
+        ] {
+            let title = format!("Rust Docs - {brand}");
+            assert_eq!(strip_window_suffix(&title), "Rust Docs", "for {title:?}");
+        }
     }
 
     #[test]

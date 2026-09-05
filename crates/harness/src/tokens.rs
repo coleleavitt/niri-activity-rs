@@ -222,14 +222,16 @@ fn read_tail(path: &Path, bytes: u64) -> Option<(String, bool)> {
 fn parse_codex_tail(tail: &str, truncated: bool, since: i64, until: i64) -> Option<TokenUsage> {
     let mut text = tail;
     if truncated {
-        text = text.split_once('\n')?.1;
+        let (first, rest) = text.split_once('\n')?;
+        // The byte boundary can land either within a record or exactly at its
+        // start. Keep a complete first record; discard only an invalid prefix.
+        if serde_json::from_str::<serde_json::Value>(first).is_err() {
+            text = rest;
+        }
     }
-    // A writer may be in the middle of the final JSON object. Only newline-
-    // terminated records are committed enough to inspect.
-    let complete_end = text.rfind('\n')? + 1;
     let mut total = TokenUsage::default();
     let mut found = false;
-    for line in text[..complete_end].lines() {
+    for line in text.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
@@ -335,6 +337,24 @@ mod tests {
         let usage =
             parse_codex_tail(&tail, true, 1_767_225_600, 1_767_225_700).expect("middle event");
         assert_eq!(usage.generated(), 5);
+    }
+
+    #[test]
+    fn accepts_a_complete_final_record_without_a_newline() {
+        let tail = codex_line("2026-01-01T00:00:00Z", 1, 5, 2);
+        let usage = parse_codex_tail(&tail, false, 1_767_225_600, 1_767_225_700)
+            .expect("complete final event");
+        assert_eq!(usage.generated(), 5);
+    }
+
+    #[test]
+    fn keeps_a_complete_first_record_at_a_truncated_tail_boundary() {
+        let first = codex_line("2026-01-01T00:00:00Z", 1, 5, 2);
+        let second = codex_line("2026-01-01T00:01:00Z", 2, 7, 3);
+        let tail = format!("{first}\n{second}");
+        let usage = parse_codex_tail(&tail, true, 1_767_225_600, 1_767_225_700)
+            .expect("both complete events");
+        assert_eq!(usage.generated(), 12);
     }
 
     #[test]

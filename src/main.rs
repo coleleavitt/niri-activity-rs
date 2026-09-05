@@ -73,12 +73,8 @@ impl TimeRangeArgs {
 /// Which browser-derived view to show.
 #[derive(Debug, Clone, clap::Subcommand)]
 enum BrowserView {
-    /// Compare tracked focus time against browser-measured view time
+    /// Show Firefox's lifetime cumulative engagement by domain
     Engagement {
-        #[arg(short, long, default_value = "7")]
-        days: u32,
-        #[command(flatten)]
-        time: TimeRangeArgs,
         /// Rows to show
         #[arg(short, long, default_value = "25")]
         limit: usize,
@@ -361,10 +357,7 @@ fn main() {
             report::App::open().and_then(|app| report::show_metrics_range(&app, range))
         }),
         Some(Commands::Browser { view }) => match view {
-            BrowserView::Engagement { days, time, limit } => parse_time_range(days, &time)
-                .and_then(|range| {
-                    report::App::open().and_then(|app| report::show_engagement(&app, range, limit))
-                }),
+            BrowserView::Engagement { limit } => report::show_engagement(limit),
             BrowserView::Referrers { limit } => {
                 report::show_referrers(limit);
                 Ok(())
@@ -669,6 +662,26 @@ mod tests {
                     "{scheduled} should conflict with {range}"
                 );
             }
+        }
+    }
+    #[test]
+    fn browser_engagement_is_explicitly_lifetime_only() {
+        assert!(
+            Cli::try_parse_from(["niri-activity-rs", "browser", "engagement", "--limit", "10"])
+                .is_ok()
+        );
+        for range_option in ["--days", "--today", "--from"] {
+            assert!(
+                Cli::try_parse_from([
+                    "niri-activity-rs",
+                    "browser",
+                    "engagement",
+                    range_option,
+                    "7",
+                ])
+                .is_err(),
+                "{range_option} must not imply interval engagement"
+            );
         }
     }
 }

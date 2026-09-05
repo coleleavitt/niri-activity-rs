@@ -62,7 +62,12 @@ impl AgentMonitor {
         }
     }
 
-    pub fn is_active(&mut self, idle_duration_ms: u64, focused_title: Option<&str>) -> bool {
+    pub fn is_active(
+        &mut self,
+        idle_duration_ms: u64,
+        focused_app_id: Option<&str>,
+        focused_title: Option<&str>,
+    ) -> bool {
         let _linkscope_agent_active = linkscope::phase("agent.is_active");
         linkscope::record_items("agent.is_active", 1);
         if !self.enabled {
@@ -76,6 +81,7 @@ impl AgentMonitor {
         // Away decision is enforced in watcher::compute_activity_state, but we
         // gate here too so agent-title never marks activity past recency.
         if idle_duration_ms < self.process_recency_ms
+            && focused_app_id.is_some_and(is_terminal_app)
             && focused_title.is_some_and(jfc_streaming_title_active)
         {
             linkscope::record_items("agent.title_active", 1);
@@ -300,16 +306,44 @@ fn matches_single_wildcard(name: &str, pattern: &str) -> bool {
         && name.ends_with(suffix)
 }
 
+fn is_terminal_app(app_id: &str) -> bool {
+    matches!(
+        app_id,
+        "Alacritty"
+            | "alacritty"
+            | "kitty"
+            | "foot"
+            | "org.codeberg.dnkl.foot"
+            | "wezterm"
+            | "org.wezfurlong.wezterm"
+    )
+}
+
 fn jfc_streaming_title_active(title: &str) -> bool {
     let Some(rest) = title.trim_start().strip_prefix("\u{25cf} ") else {
         return false;
     };
+    let mut fields = rest.split(" \u{00b7} ");
+    let Some(first) = fields.next() else {
+        return false;
+    };
+    let Some(model) = fields.next() else {
+        return false;
+    };
+    let Some(third) = fields.next() else {
+        return false;
+    };
+    if fields.next().is_some() || first.is_empty() || model.is_empty() || third.is_empty() {
+        return false;
+    }
 
     // Current JFC: `● <session> · <model> · jfc`.
     // Older installed versions used `● jfc · <model> · <project>`.
-    // The dot is weak, latch-prone evidence, so callers additionally apply the
+    // Match every field in either grammar. A suffix/prefix-only check lets an
+    // unrelated custom terminal title masquerade as JFC activity.
+    // The dot remains latch-prone evidence, so callers additionally apply the
     // short process-recency window rather than trusting it until Away.
-    rest.ends_with(" \u{00b7} jfc") || rest.starts_with("jfc \u{00b7} ")
+    third == "jfc" || first == "jfc"
 }
 
 #[cfg(test)]
@@ -393,7 +427,7 @@ mod tests {
         // Comparing against the crate rather than asserting `true` keeps this
         // honest on a machine with no agents installed, where both are false.
         assert_eq!(
-            monitor.is_active(0, None),
+            monitor.is_active(0, None, None),
             harness::any_active(window),
             "with no database or process configured, is_active must be decided \
              solely by harness detection"
@@ -433,6 +467,7 @@ mod tests {
         // credit.
         assert!(monitor.is_active(
             60 * 1000,
+            Some("foot"),
             Some("\u{25cf} my session \u{00b7} claude-sonnet \u{00b7} jfc")
         ));
     }
@@ -445,20 +480,42 @@ mod tests {
         // idle past the recency window (docs/SLEEP_DETECTION.lean bug B1).
         assert!(!monitor.is_active(
             10 * 60 * 1000,
+            Some("foot"),
             Some("\u{25cf} my session \u{00b7} claude-sonnet \u{00b7} jfc")
         ));
     }
 
     #[test]
-    fn jfc_streaming_title_supports_legacy_versions_but_rejects_lookalikes() {
+    fn jfc_streaming_title_supports_complete_current_and_legacy_grammars() {
+        assert!(jfc_streaming_title_active(
+            "\u{25cf} session \u{00b7} claude-sonnet \u{00b7} jfc"
+        ));
         assert!(jfc_streaming_title_active(
             "\u{25cf} jfc \u{00b7} claude-sonnet \u{00b7} project"
         ));
-        assert!(!jfc_streaming_title_active(
-            "\u{25cf} session \u{00b7} claude-sonnet \u{00b7} jfc extra"
-        ));
-        assert!(!jfc_streaming_title_active(
-            "session \u{00b7} claude-sonnet \u{00b7} jfc"
+    }
+
+    #[test]
+    fn jfc_streaming_title_rejects_partial_and_lookalike_grammars() {
+        for title in [
+            "\u{25cf} session \u{00b7} claude-sonnet \u{00b7} jfc extra",
+            "\u{25cf} session \u{00b7} extra \u{00b7} claude-sonnet \u{00b7} jfc",
+            "\u{25cf} session \u{00b7}  \u{00b7} jfc",
+            "\u{25cf} jfc \u{00b7} claude-sonnet",
+            "session \u{00b7} claude-sonnet \u{00b7} jfc",
+        ] {
+            assert!(!jfc_streaming_title_active(title), "accepted {title:?}");
+        }
+    }
+
+    #[test]
+    fn jfc_streaming_title_requires_a_supported_terminal_app() {
+        let mut monitor = monitor_with_window(60_000);
+
+        assert!(!monitor.is_active(
+            60 * 1000,
+            Some("zen"),
+            Some("\u{25cf} my session \u{00b7} claude-sonnet \u{00b7} jfc")
         ));
     }
 
@@ -468,6 +525,7 @@ mod tests {
 
         assert!(!monitor.is_active(
             10 * 60 * 1000,
+            Some("foot"),
             Some("jfc \u{00b7} claude-sonnet \u{00b7} jfc")
         ));
     }
