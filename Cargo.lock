@@ -989,6 +989,7 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "serde_json",
  "tempfile",
 ]
 
@@ -1397,6 +1398,7 @@ dependencies = [
 [[package]]
 name = "linkscope"
 version = "0.1.0"
+source = "git+https://github.com/Miasin-Labs/linkscope.git?rev=3c76713b531a5bf75d41e89ce132a33f42f31f5f#3c76713b531a5bf75d41e89ce132a33f42f31f5f"
 dependencies = [
  "linkscope-macros",
 ]
@@ -1404,6 +1406,7 @@ dependencies = [
 [[package]]
 name = "linkscope-macros"
 version = "0.1.0"
+source = "git+https://github.com/Miasin-Labs/linkscope.git?rev=3c76713b531a5bf75d41e89ce132a33f42f31f5f#3c76713b531a5bf75d41e89ce132a33f42f31f5f"
 dependencies = [
  "quote",
  "syn 2.0.117",
@@ -1592,6 +1595,8 @@ dependencies = [
 [[package]]
 name = "niri-ipc"
 version = "26.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a4adbddf4037ce047854d36a60b5bf80a7990b8db2f0a0b9ede7534b0bae09a"
 dependencies = [
  "serde",
  "serde_json",

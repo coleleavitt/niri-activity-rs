@@ -9,7 +9,7 @@ edition = "2024"
 rust-version = "1.85"
 
 [dependencies]
-niri-ipc = { path = "../niri/niri-ipc" }
+niri-ipc = "=26.4.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4.44", features = ["serde"] }
@@ -36,7 +36,7 @@ tempfile = "3.27.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 dirs = "6.0.0"
-linkscope = { path = "../linkscope" }
+linkscope = { git = "https://github.com/Miasin-Labs/linkscope.git", rev = "3c76713b531a5bf75d41e89ce132a33f42f31f5f" }
 browser-profiles = { path = "crates/browser-profiles" }
 harness = { path = "crates/harness" }
 
