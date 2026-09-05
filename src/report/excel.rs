@@ -47,8 +47,28 @@ fn fmt_delta_hms(delta_ms: i64) -> String {
     format!("{sign}{h}:{m:02}")
 }
 
+fn workday_averages(daily: &[(NaiveDate, Metrics, bool)]) -> (i64, i64) {
+    let (total_ms, productive_ms, workdays) = daily
+        .iter()
+        .filter(|(_, _, is_workday)| *is_workday)
+        .fold((0_i64, 0_i64, 0_i64), |acc, (_, metrics, _)| {
+            (
+                acc.0.saturating_add(metrics.total_ms),
+                acc.1.saturating_add(metrics.productive_ms),
+                acc.2.saturating_add(1),
+            )
+        });
+
+    if workdays == 0 {
+        (0, 0)
+    } else {
+        (total_ms / workdays, productive_ms / workdays)
+    }
+}
+
 #[cfg(feature = "excel-extra-sheets")]
 /// Row from a top-apps query.
+#[derive(Debug, PartialEq, Eq)]
 struct TopApp {
     app_id: String,
     category: Category,
@@ -56,7 +76,60 @@ struct TopApp {
 }
 
 #[cfg(feature = "excel-extra-sheets")]
-/// Query the top N apps by total time in a UTC window.
+fn category_sort_key(category: Category) -> u8 {
+    match category {
+        Category::Productive => 0,
+        Category::Unproductive => 1,
+        Category::Neutral => 2,
+    }
+}
+
+#[cfg(feature = "excel-extra-sheets")]
+fn rank_top_apps(
+    entries: impl IntoIterator<Item = (String, Category, i64)>,
+    limit: u32,
+) -> Vec<TopApp> {
+    let mut totals: HashMap<String, (i64, HashMap<Category, i64>)> = HashMap::new();
+    for (app_id, category, total_ms) in entries {
+        let (app_total, category_totals) = totals.entry(app_id).or_default();
+        *app_total = app_total.saturating_add(total_ms);
+        let category_total = category_totals.entry(category).or_default();
+        *category_total = category_total.saturating_add(total_ms);
+    }
+
+    let mut apps = totals
+        .into_iter()
+        .map(|(app_id, (total_ms, category_totals))| {
+            let category = category_totals
+                .into_iter()
+                .max_by(
+                    |(left_category, left_total), (right_category, right_total)| {
+                        left_total.cmp(right_total).then_with(|| {
+                            category_sort_key(*right_category)
+                                .cmp(&category_sort_key(*left_category))
+                        })
+                    },
+                )
+                .map_or(Category::Neutral, |(category, _)| category);
+            TopApp {
+                app_id,
+                category,
+                total_ms,
+            }
+        })
+        .collect::<Vec<_>>();
+    apps.sort_by(|left, right| {
+        right
+            .total_ms
+            .cmp(&left.total_ms)
+            .then_with(|| left.app_id.cmp(&right.app_id))
+    });
+    apps.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    apps
+}
+
+#[cfg(feature = "excel-extra-sheets")]
+/// Query the top N distinct apps by total time in a UTC window.
 fn query_top_apps(
     conn: &rusqlite::Connection,
     config: &Config,
@@ -64,24 +137,13 @@ fn query_top_apps(
     until_utc: &str,
     limit: u32,
 ) -> Result<Vec<TopApp>, Error> {
-    let mut totals: HashMap<(String, Category), i64> = HashMap::new();
-    for event in load_human_intervals(conn, config, since_utc, until_utc)? {
-        let event_total = event.total_ms();
-        let total = totals.entry((event.app_id, event.category)).or_default();
-        *total = total.saturating_add(event_total);
-    }
-
-    let mut apps = totals
+    let entries = load_human_intervals(conn, config, since_utc, until_utc)?
         .into_iter()
-        .map(|((app_id, category), total_ms)| TopApp {
-            app_id,
-            category,
-            total_ms,
-        })
-        .collect::<Vec<_>>();
-    apps.sort_by_key(|app| std::cmp::Reverse(app.total_ms));
-    apps.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    Ok(apps)
+        .map(|event| {
+            let total_ms = event.total_ms();
+            (event.app_id, event.category, total_ms)
+        });
+    Ok(rank_top_apps(entries, limit))
 }
 
 #[cfg(feature = "excel-extra-sheets")]
@@ -388,16 +450,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         0.0
     };
 
-    let avg_total_ms = if workdays > 0 {
-        daily_total.total_ms / workdays
-    } else {
-        0
-    };
-    let avg_productive_ms = if workdays > 0 {
-        daily_total.productive_ms / workdays
-    } else {
-        0
-    };
+    let (avg_total_ms, avg_productive_ms) = workday_averages(&daily_metrics);
 
     daily_sheet
         .write_string_with_format(row, 0, "TOTAL", &total_fmt)
@@ -679,4 +732,104 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
 
     println!("Exported to {path}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics(total_ms: i64, productive_ms: i64) -> Metrics {
+        Metrics {
+            total_ms,
+            productive_ms,
+            ..Metrics::default()
+        }
+    }
+
+    #[test]
+    fn workday_average_excludes_non_workday_activity() {
+        let daily = vec![
+            (
+                NaiveDate::from_ymd_opt(2026, 9, 7).expect("valid date"),
+                metrics(
+                    8 * i64::try_from(MS_PER_HOUR).expect("hour fits i64"),
+                    6 * i64::try_from(MS_PER_HOUR).expect("hour fits i64"),
+                ),
+                true,
+            ),
+            (
+                NaiveDate::from_ymd_opt(2026, 9, 6).expect("valid date"),
+                metrics(
+                    4 * i64::try_from(MS_PER_HOUR).expect("hour fits i64"),
+                    3 * i64::try_from(MS_PER_HOUR).expect("hour fits i64"),
+                ),
+                false,
+            ),
+        ];
+
+        assert_eq!(
+            workday_averages(&daily),
+            (
+                8 * i64::try_from(MS_PER_HOUR).expect("hour fits i64"),
+                6 * i64::try_from(MS_PER_HOUR).expect("hour fits i64")
+            )
+        );
+    }
+
+    #[test]
+    fn workday_average_is_zero_without_workdays() {
+        let daily = vec![(
+            NaiveDate::from_ymd_opt(2026, 9, 6).expect("valid date"),
+            metrics(
+                i64::try_from(MS_PER_HOUR).expect("hour fits i64"),
+                i64::try_from(MS_PER_HOUR).expect("hour fits i64"),
+            ),
+            false,
+        )];
+
+        assert_eq!(workday_averages(&daily), (0, 0));
+    }
+
+    #[cfg(feature = "excel-extra-sheets")]
+    #[test]
+    fn top_apps_limit_counts_distinct_apps() {
+        let mut entries = vec![
+            ("multi".to_string(), Category::Productive, 60),
+            ("multi".to_string(), Category::Unproductive, 50),
+        ];
+        entries.extend((0..20).map(|index| {
+            (
+                format!("app-{index:02}"),
+                Category::Neutral,
+                100 - i64::from(index),
+            )
+        }));
+
+        let apps = rank_top_apps(entries, 20);
+
+        assert_eq!(apps.len(), 20);
+        assert_eq!(apps.iter().filter(|app| app.app_id == "multi").count(), 1);
+        let multi = apps
+            .iter()
+            .find(|app| app.app_id == "multi")
+            .expect("combined app should rank");
+        assert_eq!(multi.total_ms, 110);
+        assert_eq!(multi.category, Category::Productive);
+        assert!(!apps.iter().any(|app| app.app_id == "app-19"));
+    }
+
+    #[cfg(feature = "excel-extra-sheets")]
+    #[test]
+    fn dominant_category_tie_break_is_deterministic() {
+        let apps = rank_top_apps(
+            [
+                ("app".to_string(), Category::Neutral, 10),
+                ("app".to_string(), Category::Unproductive, 10),
+                ("app".to_string(), Category::Productive, 10),
+            ],
+            1,
+        );
+
+        assert_eq!(apps[0].category, Category::Productive);
+    }
 }

@@ -294,14 +294,22 @@ fn matches_single_wildcard(name: &str, pattern: &str) -> bool {
     let Some((prefix, suffix)) = pattern.split_once('*') else {
         return name == pattern;
     };
-    !suffix.contains('*') && name.starts_with(prefix) && name.ends_with(suffix)
+    !suffix.contains('*')
+        && name.len() >= prefix.len().saturating_add(suffix.len())
+        && name.starts_with(prefix)
+        && name.ends_with(suffix)
 }
 
 fn jfc_streaming_title_active(title: &str) -> bool {
-    title
-        .trim_start()
-        .strip_prefix("\u{25cf} ")
-        .is_some_and(|rest| rest.starts_with("jfc \u{00b7} "))
+    let Some(rest) = title.trim_start().strip_prefix("\u{25cf} ") else {
+        return false;
+    };
+
+    // Current JFC: `● <session> · <model> · jfc`.
+    // Older installed versions used `● jfc · <model> · <project>`.
+    // The dot is weak, latch-prone evidence, so callers additionally apply the
+    // short process-recency window rather than trusting it until Away.
+    rest.ends_with(" \u{00b7} jfc") || rest.starts_with("jfc \u{00b7} ")
 }
 
 #[cfg(test)]
@@ -410,6 +418,14 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_prefix_and_suffix_must_not_overlap() {
+        assert!(matches_single_wildcard("opencode.db", "opencode*.db"));
+        assert!(matches_single_wildcard("opencode-2.db", "opencode*.db"));
+        assert!(!matches_single_wildcard("abc", "ab*bc"));
+        assert!(!matches_single_wildcard("anything", "a*b*c"));
+    }
+
+    #[test]
     fn jfc_streaming_title_counts_as_active_when_user_recently_present() {
         let mut monitor = monitor_with_window(60_000);
 
@@ -417,7 +433,7 @@ mod tests {
         // credit.
         assert!(monitor.is_active(
             60 * 1000,
-            Some("\u{25cf} jfc \u{00b7} claude-sonnet \u{00b7} jfc")
+            Some("\u{25cf} my session \u{00b7} claude-sonnet \u{00b7} jfc")
         ));
     }
 
@@ -429,7 +445,20 @@ mod tests {
         // idle past the recency window (docs/SLEEP_DETECTION.lean bug B1).
         assert!(!monitor.is_active(
             10 * 60 * 1000,
-            Some("\u{25cf} jfc \u{00b7} claude-sonnet \u{00b7} jfc")
+            Some("\u{25cf} my session \u{00b7} claude-sonnet \u{00b7} jfc")
+        ));
+    }
+
+    #[test]
+    fn jfc_streaming_title_supports_legacy_versions_but_rejects_lookalikes() {
+        assert!(jfc_streaming_title_active(
+            "\u{25cf} jfc \u{00b7} claude-sonnet \u{00b7} project"
+        ));
+        assert!(!jfc_streaming_title_active(
+            "\u{25cf} session \u{00b7} claude-sonnet \u{00b7} jfc extra"
+        ));
+        assert!(!jfc_streaming_title_active(
+            "session \u{00b7} claude-sonnet \u{00b7} jfc"
         ));
     }
 

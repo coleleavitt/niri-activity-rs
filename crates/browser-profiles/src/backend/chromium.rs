@@ -20,9 +20,14 @@ const VISITS: &str = "SELECT u.url, u.title, v.visit_time, v.transition, r.url, 
                       WHERE u.url IS NOT NULL \
                       ORDER BY v.visit_time";
 
-const DOWNLOADS: &str = "SELECT tab_url, target_path, mime_type, total_bytes, \
-                                received_bytes, referrer, start_time, end_time \
-                         FROM downloads";
+const DOWNLOADS: &str = "SELECT COALESCE(\
+                                (SELECT c.url FROM downloads_url_chains c \
+                                 WHERE c.id = d.id \
+                                 ORDER BY c.chain_index DESC LIMIT 1), \
+                                d.tab_url), \
+                                d.target_path, d.mime_type, d.total_bytes, \
+                                d.received_bytes, d.tab_url, d.start_time, d.end_time \
+                         FROM downloads d";
 
 const SEARCH_TERMS: &str = "SELECT k.term, u.url, u.last_visit_time \
                             FROM keyword_search_terms k \
@@ -132,8 +137,12 @@ mod tests {
                 mime_type TEXT, total_bytes INTEGER, received_bytes INTEGER, referrer TEXT,
                 start_time INTEGER, end_time INTEGER);
              INSERT INTO downloads VALUES
-                (1,'https://example.com/dl','/home/u/f.zip','application/zip',100,100,
-                 'https://example.com/a',{t},{t});
+                (1,'https://example.com/a','/home/u/f.zip','application/zip',100,100,
+                 'https://cdn.example.com/redirect',{t},{t});
+             CREATE TABLE downloads_url_chains (id INTEGER, chain_index INTEGER, url TEXT);
+             INSERT INTO downloads_url_chains VALUES
+                (1,0,'https://example.com/download'),
+                (1,1,'https://cdn.example.com/final.zip');
 
              CREATE TABLE keyword_search_terms (keyword_id INTEGER, url_id INTEGER,
                 term TEXT, normalized_term TEXT);
@@ -180,6 +189,7 @@ mod tests {
         assert_eq!(dls.len(), 1);
         assert_eq!(dls[0].mime_type.as_deref(), Some("application/zip"));
         assert_eq!(dls[0].target_path, PathBuf::from("/home/u/f.zip"));
+        assert_eq!(dls[0].url, "https://cdn.example.com/final.zip");
         assert_eq!(dls[0].referrer.as_deref(), Some("https://example.com/a"));
     }
 

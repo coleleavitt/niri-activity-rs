@@ -650,45 +650,48 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-impl From<RawConfig> for Config {
-    fn from(raw: RawConfig) -> Self {
+impl TryFrom<RawConfig> for Config {
+    type Error = Error;
+
+    fn try_from(raw: RawConfig) -> Result<Self, Self::Error> {
         let title_rules = raw
             .title_rules
             .into_iter()
-            .filter_map(|r| {
+            .enumerate()
+            .map(|(index, r)| {
                 let compiled = if r.regex {
-                    match regex::RegexBuilder::new(&r.pattern)
-                        .case_insensitive(true)
-                        .build()
-                    {
-                        Ok(re) => Some(re),
-                        Err(e) => {
-                            tracing::warn!("Skipping title rule with invalid regex: {}", e);
-                            return None;
-                        }
-                    }
+                    Some(
+                        regex::RegexBuilder::new(&r.pattern)
+                            .case_insensitive(true)
+                            .build()
+                            .map_err(|error| {
+                                Error::InvalidArgument(format!(
+                                    "invalid title_rules[{index}] regex {:?}: {error}",
+                                    r.pattern
+                                ))
+                            })?,
+                    )
                 } else {
                     None
                 };
-                Some(TitleRule {
+                Ok(TitleRule {
                     pattern: r.pattern,
                     category: r.category,
                     app: r.app,
                     compiled,
                 })
             })
-            .collect();
-        let timezone = raw.timezone.and_then(|tz_str| {
-            if let Ok(tz) = tz_str.parse::<Tz>() {
-                Some(tz)
-            } else {
-                tracing::warn!(
-                    "Warning: invalid timezone '{}', using system timezone",
-                    tz_str
-                );
-                None
-            }
-        });
+            .collect::<Result<Vec<_>, Error>>()?;
+        let timezone = raw
+            .timezone
+            .map(|timezone| {
+                timezone.parse::<Tz>().map_err(|error| {
+                    Error::InvalidArgument(format!(
+                        "invalid configured timezone {timezone:?}: {error}"
+                    ))
+                })
+            })
+            .transpose()?;
 
         let project_search_dirs = raw
             .projects
@@ -698,7 +701,7 @@ impl From<RawConfig> for Config {
             .collect();
         let project_aliases = raw.projects.aliases;
 
-        Self {
+        Ok(Self {
             idle_threshold_secs: raw.idle_threshold_secs,
             deep_idle_secs: raw.deep_idle_secs,
             away_threshold_secs: raw.away_threshold_secs,
@@ -727,7 +730,7 @@ impl From<RawConfig> for Config {
                 })
                 .collect(),
             title_domains: HashMap::new(),
-        }
+        })
     }
 }
 
@@ -799,35 +802,39 @@ impl Default for SleepConfig {
 }
 
 fn glob_match(pattern: &str, value: &str) -> bool {
-    if !pattern.contains('*') {
-        return pattern == value;
+    if pattern.is_empty() {
+        return value.is_empty();
     }
-    if pattern == "*" {
+
+    let anchored_start = !pattern.starts_with('*');
+    let anchored_end = !pattern.ends_with('*');
+    let segments = pattern.split('*').filter(|segment| !segment.is_empty());
+    let mut cursor = 0usize;
+    let mut first = true;
+    let mut last_end = 0usize;
+
+    for segment in segments {
+        let remainder = &value[cursor..];
+        let relative = if first && anchored_start {
+            remainder.starts_with(segment).then_some(0)
+        } else {
+            remainder.find(segment)
+        };
+        let Some(relative) = relative else {
+            return false;
+        };
+        cursor = cursor
+            .saturating_add(relative)
+            .saturating_add(segment.len());
+        last_end = cursor;
+        first = false;
+    }
+
+    if first {
+        // One or more `*` characters and no literal segments.
         return true;
     }
-    match (pattern.starts_with('*'), pattern.ends_with('*')) {
-        (true, true) => {
-            let inner = pattern.trim_start_matches('*').trim_end_matches('*');
-            value.contains(inner)
-        }
-        (true, false) => {
-            let suffix = pattern.trim_start_matches('*');
-            value.ends_with(suffix)
-        }
-        (false, true) => {
-            let prefix = pattern.trim_end_matches('*');
-            value.starts_with(prefix)
-        }
-        (false, false) => {
-            if let Some((prefix, suffix)) = pattern.split_once('*') {
-                prefix.len() + suffix.len() <= value.len()
-                    && value.starts_with(prefix)
-                    && value.ends_with(suffix)
-            } else {
-                pattern == value
-            }
-        }
-    }
+    !anchored_end || last_end == value.len()
 }
 
 impl Config {
@@ -888,9 +895,9 @@ impl Config {
                 return Some(cat);
             }
         }
-        let app_id_lower = app_id.to_lowercase();
+        let app_id_lower = app_id.to_ascii_lowercase();
         for (pattern, &cat) in &self.categories {
-            if pattern.contains('*') && glob_match(pattern, &app_id_lower) {
+            if pattern.contains('*') && glob_match(&pattern.to_ascii_lowercase(), &app_id_lower) {
                 return Some(cat);
             }
         }
@@ -934,38 +941,6 @@ impl Config {
             .map(|rule| rule.category)
     }
 
-    /// Whether an app is a web browser, so domain rules (which map a page title
-    /// to the host it was served from via browser history) may apply. Any
-    /// non-browser window whose title happens to equal a page title seen in
-    /// history must NOT be reclassified by a domain rule.
-    ///
-    /// Browser identity is intentionally fail-closed. App-scoped title rules
-    /// can target terminals and editors too, so they are not proof that an app
-    /// owns browser history. Unknown browser IDs must be added explicitly.
-    fn is_browser_app(app_id: &str) -> bool {
-        const KNOWN_BROWSER_APPS: &[&str] = &[
-            "zen",
-            "zen-twilight",
-            "zen-unofficial",
-            "firefox",
-            "firefox-bin",
-            "firefox-esr",
-            "librewolf",
-            "chromium",
-            "chromium-browser",
-            "google-chrome",
-            "google-chrome-stable",
-            "brave-browser",
-            "camoufox",
-            "tor browser",
-            "epiphany",
-            "vivaldi-stable",
-        ];
-        KNOWN_BROWSER_APPS
-            .iter()
-            .any(|browser| browser.eq_ignore_ascii_case(app_id))
-    }
-
     pub fn classify(&self, app_id: &str, title: &str) -> Category {
         let title_lower = title.to_lowercase();
         let explicit_cat = self.app_category(app_id);
@@ -974,7 +949,7 @@ impl Config {
         // its title is a claim. Only trust the domain map for actual browser
         // windows — otherwise a non-browser window sharing a page title would
         // be silently reclassified.
-        if Self::is_browser_app(app_id)
+        if browser_profiles::is_browser_app_id(app_id)
             && let Some(cat) = self.domain_category(title)
         {
             return cat;
@@ -1151,13 +1126,42 @@ pub(crate) fn load_env_file() -> Result<(), Error> {
     }
     Ok(())
 }
+fn validate_agent_activity_config(config: &AgentActivityConfig) -> Result<(), Error> {
+    if config.enabled && config.poll_interval_secs == 0 {
+        return Err(Error::InvalidArgument(
+            "agent_activity.poll_interval_secs must be at least 1 when agent activity is enabled"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_jiggler_config(config: &JigglerConfig) -> Result<(), Error> {
+    if !config.enabled {
+        return Ok(());
+    }
+    if config.window_secs < 60 {
+        return Err(Error::InvalidArgument(
+            "jiggler.window_secs must be at least 60 when jiggler detection is enabled".into(),
+        ));
+    }
+    if config.min_events < 2 {
+        return Err(Error::InvalidArgument(
+            "jiggler.min_events must be at least 2 when jiggler detection is enabled".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Load configuration from file, or return defaults if file does not exist.
 pub fn load_config() -> Result<Config, Error> {
     let config_path = get_config_path()?;
     if config_path.exists() {
         let content = fs::read_to_string(&config_path)?;
         let raw: RawConfig = toml::from_str(&content)?;
-        Ok(Config::from(raw))
+        validate_jiggler_config(&raw.jiggler)?;
+        validate_agent_activity_config(&raw.agent_activity)?;
+        Config::try_from(raw)
     } else {
         Ok(Config::default())
     }
@@ -1322,7 +1326,106 @@ mod tests {
 
     #[test]
     fn generated_config_is_valid_toml() {
-        toml::from_str::<RawConfig>(DEFAULT_CONFIG).expect("generated config must parse");
+        let raw = toml::from_str::<RawConfig>(DEFAULT_CONFIG).expect("generated config must parse");
+        Config::try_from(raw).expect("generated config must compile");
+    }
+
+    fn parse_config(toml: &str) -> Result<Config, Error> {
+        let raw: RawConfig = toml::from_str(toml).expect("test config must parse");
+        Config::try_from(raw)
+    }
+
+    #[test]
+    fn invalid_title_rule_regex_rejects_entire_config() {
+        let error = parse_config(
+            r#"
+[[title_rules]]
+pattern = "valid"
+category = "productive"
+
+[[title_rules]]
+pattern = "[invalid"
+category = "unproductive"
+regex = true
+"#,
+        )
+        .expect_err("an invalid later rule must not leave a partial rule set");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid title_rules[1] regex"),
+            "{message}"
+        );
+        assert!(message.contains("[invalid"), "{message}");
+    }
+
+    #[test]
+    fn invalid_configured_timezone_is_rejected() {
+        let error = parse_config(r#"timezone = "Mars/Olympus_Mons""#)
+            .expect_err("an explicitly configured invalid timezone must fail closed");
+
+        let message = error.to_string();
+        assert!(message.contains("invalid configured timezone"), "{message}");
+        assert!(message.contains("Mars/Olympus_Mons"), "{message}");
+    }
+
+    #[test]
+    fn omitted_and_valid_timezones_are_accepted() {
+        assert_eq!(
+            parse_config("").expect("timezone is optional").timezone,
+            None
+        );
+        assert_eq!(
+            parse_config(r#"timezone = "America/New_York""#)
+                .expect("a valid timezone must compile")
+                .timezone,
+            Some(chrono_tz::America::New_York)
+        );
+    }
+
+    fn parse_and_validate_jiggler(toml: &str) -> Result<(), Error> {
+        let raw: RawConfig = toml::from_str(toml).expect("test config must parse");
+        validate_jiggler_config(&raw.jiggler)
+    }
+
+    #[test]
+    fn enabled_jiggler_rejects_window_shorter_than_minimum_span() {
+        let error = parse_and_validate_jiggler(
+            "[jiggler]\nenabled = true\nwindow_secs = 59\nmin_events = 2\n",
+        )
+        .expect_err("a short window makes the 60-second span invariant impossible");
+
+        assert!(
+            error
+                .to_string()
+                .contains("jiggler.window_secs must be at least 60")
+        );
+    }
+
+    #[test]
+    fn enabled_jiggler_accepts_minimum_window() {
+        parse_and_validate_jiggler("[jiggler]\nenabled = true\nwindow_secs = 60\nmin_events = 2\n")
+            .expect("the minimum viable window must be accepted");
+    }
+
+    #[test]
+    fn enabled_jiggler_rejects_fewer_than_two_events() {
+        let error = parse_and_validate_jiggler(
+            "[jiggler]\nenabled = true\nwindow_secs = 60\nmin_events = 1\n",
+        )
+        .expect_err("interval detection requires at least two events");
+
+        assert!(
+            error
+                .to_string()
+                .contains("jiggler.min_events must be at least 2")
+        );
+    }
+
+    #[test]
+    fn disabled_jiggler_allows_inert_detection_values() {
+        parse_and_validate_jiggler("[jiggler]\nenabled = false\nwindow_secs = 0\nmin_events = 0\n")
+            .expect("disabled jiggler settings are inert");
     }
 
     #[test]
@@ -1375,6 +1478,28 @@ mod tests {
         assert!(!glob_match("com.*desktop", "org.pulseaudio.pavucontrol"));
         // * matches zero characters (off-by-one regression test)
         assert!(glob_match("com.*desktop", "com.desktop"));
+    }
+
+    #[test]
+    fn glob_supports_multiple_and_consecutive_wildcards() {
+        assert!(glob_match("*foo*bar*", "prefix-foo-middle-bar-suffix"));
+        assert!(glob_match("foo*bar*baz", "foo-1-bar-2-baz"));
+        assert!(glob_match("foo**bar", "foobar"));
+        assert!(!glob_match("foo*bar*baz", "foo-baz-bar"));
+        assert!(!glob_match("foo*bar", "xfoo-bar"));
+        assert!(!glob_match("foo*bar", "foo-bar-x"));
+    }
+
+    #[test]
+    fn wildcard_category_matching_is_ascii_case_insensitive() {
+        let config = Config {
+            categories: HashMap::from([("JetBrains-*".to_string(), Category::Productive)]),
+            ..Config::default()
+        };
+        assert_eq!(
+            config.app_category("jetbrains-RustRover"),
+            Some(Category::Productive)
+        );
     }
 
     #[test]
@@ -1486,19 +1611,101 @@ mod tests {
     }
 
     #[test]
-    fn domain_rule_does_not_apply_to_non_browser_windows() {
-        // A terminal/editor whose title happens to equal a page title seen in
-        // browser history must NOT be reclassified by a domain rule
-        // Only real browser apps get domain treatment.
+    fn supported_browser_ids_receive_domain_classification() {
         let config = domain_config(
             vec![("youtube.com", Category::Unproductive)],
             vec![("Some Video", "www.youtube.com")],
         );
-        // Browser app: domain rule applies.
-        assert_eq!(config.classify("zen", "Some Video"), Category::Unproductive);
-        // Non-browser app with the same title: domain rule must NOT apply.
-        assert_eq!(config.classify("foot", "Some Video"), Category::Neutral);
-        assert_eq!(config.classify("code", "Some Video"), Category::Neutral);
+        let supported_ids = [
+            // Firefox family.
+            "firefox",
+            "firefox-bin",
+            "firefox-esr",
+            "firefox-nightly",
+            "FirefoxDeveloperEdition",
+            "org.mozilla.firefox",
+            "org.mozilla.FirefoxDeveloperEdition",
+            "org.mozilla.FirefoxNightly",
+            "zen",
+            "zen-browser",
+            "zen-alpha",
+            "zen-twilight",
+            "zen-unofficial",
+            "app.zen_browser.zen",
+            "app.zen_browser.zen-twilight",
+            "LibreWolf",
+            "io.gitlab.librewolf-community",
+            "waterfox",
+            "net.waterfox.waterfox",
+            "Tor Browser",
+            "org.torproject.torbrowser-launcher",
+            "camoufox",
+            // Chromium family.
+            "google-chrome",
+            "google-chrome-stable",
+            "google-chrome-beta",
+            "google-chrome-unstable",
+            "com.google.Chrome",
+            "com.google.ChromeBeta",
+            "com.google.ChromeDev",
+            "chromium",
+            "chromium-browser",
+            "org.chromium.Chromium",
+            "brave-browser",
+            "brave-browser-beta",
+            "brave-browser-dev",
+            "brave-browser-nightly",
+            "com.brave.Browser",
+            "com.brave.Browser.Beta",
+            "com.brave.Browser.Dev",
+            "com.brave.Browser.Nightly",
+            "microsoft-edge",
+            "microsoft-edge-stable",
+            "microsoft-edge-beta",
+            "microsoft-edge-dev",
+            "com.microsoft.Edge",
+            "com.microsoft.Edge.Beta",
+            "com.microsoft.Edge.Dev",
+            "vivaldi-stable",
+            "vivaldi-snapshot",
+            "com.vivaldi.Vivaldi",
+            "opera",
+            "opera-beta",
+            "opera-developer",
+            "com.opera.Opera",
+        ];
+
+        for app_id in supported_ids {
+            assert_eq!(
+                config.classify(app_id, "Some Video"),
+                Category::Unproductive,
+                "supported browser ID {app_id:?} must receive domain classification"
+            );
+        }
+    }
+
+    #[test]
+    fn non_browser_ids_do_not_receive_domain_classification() {
+        let config = domain_config(
+            vec![("youtube.com", Category::Unproductive)],
+            vec![("Some Video", "www.youtube.com")],
+        );
+
+        for app_id in [
+            "foot",
+            "code",
+            "spotify",
+            "firefox-helper",
+            "my-google-chrome-wrapper",
+            "org.mozilla.not-firefox",
+            "",
+        ] {
+            assert_eq!(
+                config.classify(app_id, "Some Video"),
+                Category::Neutral,
+                "non-browser ID {app_id:?} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -1648,7 +1855,7 @@ search_dirs = ["~/RustProjects/active", "~/projects", "/absolute/path"]
 "ers-rs" = "Entity Resolution"
 "#;
         let raw: RawConfig = toml::from_str(toml_str).expect("should parse projects config");
-        let config = Config::from(raw);
+        let config = Config::try_from(raw).expect("config must compile");
 
         // Should have 3 search dirs
         assert_eq!(config.project_search_dirs.len(), 3);
@@ -1704,7 +1911,7 @@ search_dirs = ["~/RustProjects/active", "~/projects", "/absolute/path"]
 idle_threshold_secs = 120
 ";
         let raw: RawConfig = toml::from_str(toml_str).expect("should parse without projects");
-        let config = Config::from(raw);
+        let config = Config::try_from(raw).expect("config must compile");
 
         assert_eq!(config.project_search_dirs, [] as [std::path::PathBuf; 0]);
         assert!(config.project_aliases.is_empty());
@@ -1722,5 +1929,24 @@ idle_threshold_secs = 120
         // Should not start with ~ after expansion
         assert!(!path.to_str().unwrap().starts_with('~'));
         assert!(path.to_str().unwrap().ends_with("some/path"));
+    }
+    #[test]
+    fn enabled_agent_activity_rejects_zero_poll_interval() {
+        let config = AgentActivityConfig {
+            poll_interval_secs: 0,
+            ..AgentActivityConfig::default()
+        };
+        let error = validate_agent_activity_config(&config).expect_err("zero poll interval");
+        assert!(error.to_string().contains("poll_interval_secs"));
+    }
+
+    #[test]
+    fn disabled_agent_activity_allows_inert_zero_poll_interval() {
+        let config = AgentActivityConfig {
+            enabled: false,
+            poll_interval_secs: 0,
+            ..AgentActivityConfig::default()
+        };
+        validate_agent_activity_config(&config).expect("disabled config is inert");
     }
 }

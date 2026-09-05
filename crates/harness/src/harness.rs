@@ -88,7 +88,10 @@ impl Harness {
                 Signal::Database("~/.local/share/opencode/opencode*.db"),
                 Signal::LogDir("~/.local/share/opencode/storage/session"),
             ],
-            Harness::ClaudeCode => &[Signal::LogDir("~/.claude/transcripts")],
+            Harness::ClaudeCode => &[
+                Signal::LogDir("~/.claude/transcripts"),
+                Signal::LogDir("~/.claude/projects"),
+            ],
             Harness::Codex => &[
                 Signal::Database("~/.codex/state_5.sqlite"),
                 Signal::LogFile("~/.codex/history.jsonl"),
@@ -104,7 +107,13 @@ impl Harness {
                 Signal::Database("~/.gjc/agent/history.db"),
                 Signal::LogDir("~/.gjc/agent/sessions"),
             ],
-            Harness::Jfc => &[Signal::LogDir("~/.jfc/audit")],
+            Harness::Jfc => &[
+                // Foreground structured logs are appended throughout streaming and
+                // tool execution. The old ~/.jfc/audit path was project-relative
+                // in JFC and therefore wrong for almost every working directory.
+                Signal::LogDir("~/.config/jfc/logs"),
+                Signal::LogDir("~/.config/jfc/logs/daemon/agents"),
+            ],
             Harness::Jcode => &[Signal::LogDir("~/.jcode/logs")],
             Harness::Amp => &[Signal::LogDir("~/.amp/file-changes")],
             Harness::Cursor => &[Signal::LogDir("~/.cursor/chats")],
@@ -157,6 +166,13 @@ mod tests {
         for h in Harness::ALL {
             assert!(!h.signals().is_empty(), "{h} has no signal to check");
         }
+    }
+
+    #[test]
+    fn claude_checks_transcripts_and_projects() {
+        let signals = Harness::ClaudeCode.signals();
+        assert!(signals.contains(&Signal::LogDir("~/.claude/transcripts")));
+        assert!(signals.contains(&Signal::LogDir("~/.claude/projects")));
     }
 
     #[test]

@@ -238,7 +238,92 @@ fn timestamp(value: i64) -> Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::Ranges;
+    use chrono::{DateTime, Utc};
+    use rusqlite::{Connection, params};
+
+    use super::{EventInterval, GranularInput, Ranges, apply};
+    use crate::config::{Category, Config};
+
+    const START: &str = "2026-05-25T10:00:00+00:00";
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        conn.execute_batch(
+            "CREATE TABLE events (
+                 id INTEGER PRIMARY KEY,
+                 timestamp TEXT NOT NULL,
+                 active_ms INTEGER NOT NULL,
+                 passive_ms INTEGER,
+                 idle_ms INTEGER NOT NULL,
+                 input_offsets BLOB,
+                 keystrokes INTEGER NOT NULL DEFAULT 0,
+                 mouse_clicks INTEGER NOT NULL DEFAULT 0,
+                 scroll_events INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .expect("presence schema");
+        conn
+    }
+
+    fn timestamp(offset_ms: i64) -> String {
+        let start = DateTime::parse_from_rfc3339(START)
+            .expect("valid start")
+            .timestamp_millis();
+        DateTime::<Utc>::from_timestamp_millis(start + offset_ms)
+            .expect("valid timestamp")
+            .to_rfc3339()
+    }
+
+    fn insert_row(conn: &Connection, offset_ms: i64, duration_ms: i64, offsets: Option<&[u32]>) {
+        let blob = offsets.map(|offsets| {
+            offsets
+                .iter()
+                .flat_map(|offset| offset.to_le_bytes())
+                .collect::<Vec<_>>()
+        });
+        conn.execute(
+            "INSERT INTO events
+                 (timestamp, active_ms, passive_ms, idle_ms, input_offsets)
+             VALUES (?1, ?2, 0, 0, ?3)",
+            params![timestamp(offset_ms), duration_ms, blob],
+        )
+        .expect("presence row");
+    }
+
+    fn event(offset_ms: i64, active_ms: i64, passive_ms: i64, idle_ms: i64) -> EventInterval {
+        let start_ms = DateTime::parse_from_rfc3339(START)
+            .expect("valid start")
+            .timestamp_millis()
+            + offset_ms;
+        EventInterval {
+            source_start_ms: start_ms,
+            start_ms,
+            app_id: "foot".to_string(),
+            title: String::new(),
+            category: Category::Productive,
+            project: None,
+            active_ms,
+            passive_ms,
+            idle_ms,
+            agent_ms: Some(0),
+            keystrokes: 0,
+            mouse_clicks: 0,
+            scroll_events: 0,
+            mouse_distance: 0,
+            granular: GranularInput::default(),
+            jiggler_detected: false,
+        }
+    }
+
+    fn totals(events: &[EventInterval]) -> (i64, i64, i64) {
+        events.iter().fold((0, 0, 0), |totals, event| {
+            (
+                totals.0 + event.active_ms,
+                totals.1 + event.passive_ms,
+                totals.2 + event.idle_ms,
+            )
+        })
+    }
 
     #[test]
     fn presence_windows_are_half_open() {
@@ -253,5 +338,51 @@ mod tests {
         let ranges = Ranges::from_points(&[1_000, 60_000], 120_000);
 
         assert_eq!(ranges.overlap(0, 200_000), 179_000);
+    }
+    #[test]
+    fn startup_anchor_covers_leading_segment_before_delayed_input() {
+        for (input_offset, expected) in [
+            (60_000, (180_000, 120_000, 0)),
+            (180_000, (240_000, 60_000, 0)),
+        ] {
+            let conn = setup();
+            insert_row(&conn, 0, 300_000, Some(&[0, input_offset]));
+
+            let intervals = apply(&conn, &Config::default(), vec![event(0, 300_000, 0, 0)])
+                .expect("presence reconstruction");
+
+            assert_eq!(totals(&intervals), expected, "input at {input_offset}ms");
+        }
+    }
+
+    #[test]
+    fn title_rollover_uses_preceding_presence_evidence_without_new_anchor() {
+        let conn = setup();
+        insert_row(&conn, 0, 60_000, Some(&[0]));
+        insert_row(&conn, 60_000, 240_000, Some(&[]));
+
+        let intervals = apply(
+            &conn,
+            &Config::default(),
+            vec![event(0, 60_000, 0, 0), event(60_000, 240_000, 0, 0)],
+        )
+        .expect("presence reconstruction");
+
+        assert_eq!(totals(&intervals), (120_000, 180_000, 0));
+    }
+
+    #[test]
+    fn legacy_row_without_input_evidence_preserves_stored_presence() {
+        let conn = setup();
+        insert_row(&conn, 0, 300_000, None);
+
+        let intervals = apply(
+            &conn,
+            &Config::default(),
+            vec![event(0, 60_000, 120_000, 120_000)],
+        )
+        .expect("presence reconstruction");
+
+        assert_eq!(totals(&intervals), (60_000, 120_000, 120_000));
     }
 }

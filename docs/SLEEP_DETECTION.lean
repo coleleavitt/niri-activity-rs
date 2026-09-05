@@ -113,8 +113,10 @@ compute_activity_state ordering MUST become:
     else                                       -> Active
 i.e. AWAY is tested BEFORE the agent override. Agent activity may still be recorded to
 agent_ms, but it may not hold presence past away_threshold_secs of no human input.
-Additionally: gate `jfc_streaming_title_active` behind idle_duration < away_ms so a
-stale spinner title cannot pin Active forever.
+Additionally: treat the JFC title dot as weak, latch-prone evidence and gate it behind
+idle_duration_ms < process_recency_ms (`process_recency_secs`, default 5 min). Fresh
+renewing log/datastore signals may measure autonomous agent work for longer, but the
+separate Away threshold still wins unconditionally for human presence.
 
 ## 6. Exploratory evidence (not ground truth)
 

@@ -120,8 +120,16 @@ impl VisitType {
     }
 
     /// Chromium `visits.transition`. The core type is the low byte; the upper
-    /// bits are qualifier flags such as redirect chain position.
+    /// bits are qualifier flags. Client and server redirect qualifiers describe
+    /// the navigation cause, while chain-position flags do not.
     pub fn from_chromium(raw: i64) -> Self {
+        const CLIENT_REDIRECT: i64 = 0x4000_0000;
+        const SERVER_REDIRECT: i64 = 0x8000_0000;
+
+        if raw & (CLIENT_REDIRECT | SERVER_REDIRECT) != 0 {
+            return VisitType::Redirect;
+        }
+
         match raw & 0xFF {
             0 => VisitType::Link,
             1 => VisitType::Typed,
@@ -238,11 +246,20 @@ mod tests {
 
     #[test]
     fn firefox_visit_types_map() {
-        assert_eq!(VisitType::from_firefox(1), VisitType::Link);
-        assert_eq!(VisitType::from_firefox(2), VisitType::Typed);
-        assert_eq!(VisitType::from_firefox(5), VisitType::Redirect);
-        assert_eq!(VisitType::from_firefox(6), VisitType::Redirect);
-        assert_eq!(VisitType::from_firefox(9), VisitType::Reload);
+        let expected = [
+            VisitType::Link,
+            VisitType::Typed,
+            VisitType::Bookmark,
+            VisitType::Subframe,
+            VisitType::Redirect,
+            VisitType::Redirect,
+            VisitType::Download,
+            VisitType::Subframe,
+            VisitType::Reload,
+        ];
+        for (raw, expected) in (1..=9).zip(expected) {
+            assert_eq!(VisitType::from_firefox(raw), expected, "visit type {raw}");
+        }
         assert_eq!(VisitType::from_firefox(99), VisitType::Other(99));
     }
 
@@ -252,6 +269,14 @@ mod tests {
         assert_eq!(VisitType::from_chromium(0x1800_0001), VisitType::Typed);
         assert_eq!(VisitType::from_chromium(0), VisitType::Link);
         assert_eq!(VisitType::from_chromium(8), VisitType::Reload);
+    }
+
+    #[test]
+    fn chromium_redirect_qualifiers_override_core_but_chain_flags_do_not() {
+        assert_eq!(VisitType::from_chromium(0x4000_0000), VisitType::Redirect);
+        assert_eq!(VisitType::from_chromium(0x8000_0001), VisitType::Redirect);
+        assert_eq!(VisitType::from_chromium(0x1000_0001), VisitType::Typed);
+        assert_eq!(VisitType::from_chromium(0x2000_0000), VisitType::Link);
     }
 
     #[test]

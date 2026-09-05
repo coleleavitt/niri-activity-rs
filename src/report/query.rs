@@ -433,11 +433,27 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
                         active_ms: 0,
                         keys: 0,
                         clicks: 0,
+                        productive_ms: 0,
+                        neutral_ms: 0,
+                        unproductive_ms: 0,
                     });
             project_entry.total_ms = project_entry.total_ms.saturating_add(event_total);
             project_entry.active_ms = project_entry.active_ms.saturating_add(event.active_ms);
             project_entry.keys = project_entry.keys.saturating_add(event.keystrokes);
             project_entry.clicks = project_entry.clicks.saturating_add(event.mouse_clicks);
+            match event.category {
+                Category::Productive => {
+                    project_entry.productive_ms =
+                        project_entry.productive_ms.saturating_add(event_total);
+                }
+                Category::Neutral => {
+                    project_entry.neutral_ms = project_entry.neutral_ms.saturating_add(event_total);
+                }
+                Category::Unproductive => {
+                    project_entry.unproductive_ms =
+                        project_entry.unproductive_ms.saturating_add(event_total);
+                }
+            }
         }
     }
 
@@ -542,7 +558,7 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
     let streaks = Some(query_streaks(&events, &app.config));
     let input_metrics = Some(input_metrics(&events, total_keys));
     let flow = Some(query_flow_sessions(&events, &app.config));
-    let fatigue = query_fatigue_indicators(&app.conn, &app.config, since_utc, until_utc).ok();
+    let fatigue = Some(fatigue_indicators(&events, &app.config));
 
     Ok(ReportData {
         since_str,
@@ -859,8 +875,12 @@ fn query_gaps(
                     if decoded.is_empty() && has_counted_input {
                         input_points.push(end_ms);
                     }
-                } else if has_counted_input {
-                    input_points.push(end_ms);
+                } else {
+                    legacy_intervals.push((start_ms, end_ms));
+                    legacy_events.push((start_ms, duration_ms));
+                    if has_counted_input {
+                        input_points.push(end_ms);
+                    }
                 }
             }
             _ => {
@@ -1300,67 +1320,52 @@ fn compute_consistency(rates: &[f64]) -> u8 {
     ((1.0 - cv.min(1.0)) * 100.0).clamp(0.0, 100.0) as u8
 }
 
-fn query_fatigue_indicators(
-    conn: &Connection,
-    config: &Config,
-    since_utc: &str,
-    until_utc: &str,
-) -> Result<FatigueIndicators, Error> {
-    struct Row {
-        timestamp: String,
-        keystrokes: i64,
-        backspace_count: i64,
-    }
-    let mut stmt = conn.prepare("SELECT timestamp, keystrokes, backspace_count FROM events WHERE timestamp >= ?1 AND timestamp < ?2 AND keystrokes > 0 ORDER BY timestamp")?;
-    let rows: Vec<Row> = stmt
-        .query_map(params![since_utc, until_utc], |row| {
-            Ok(Row {
-                timestamp: row.get(0)?,
-                keystrokes: row.get(1)?,
-                backspace_count: row.get(2)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+fn fatigue_indicators(events: &[EventInterval], config: &Config) -> FatigueIndicators {
     let mut hourly_keys: HashMap<u32, i64> = HashMap::new();
     let mut hourly_backspaces: HashMap<u32, i64> = HashMap::new();
-    for row in &rows {
-        if let Some(dt) = config.parse_timestamp_to_local(&row.timestamp) {
-            let h = dt.hour();
-            *hourly_keys.entry(h).or_insert(0) += row.keystrokes;
-            *hourly_backspaces.entry(h).or_insert(0) += row.backspace_count;
+    for event in events {
+        for slice in event.minute_slices() {
+            let Some(timestamp) = slice.local_start(config) else {
+                continue;
+            };
+            let hour = timestamp.hour();
+            let keys = hourly_keys.entry(hour).or_default();
+            *keys = keys.saturating_add(slice.keystrokes);
+            let backspaces = hourly_backspaces.entry(hour).or_default();
+            *backspaces = backspaces.saturating_add(slice.granular.backspace_count);
         }
     }
     let mut hourly_rates: Vec<HourlyErrorRate> = Vec::new();
     for hour in 0..24 {
         let keys = hourly_keys.get(&hour).copied().unwrap_or(0);
-        let bs = hourly_backspaces.get(&hour).copied().unwrap_or(0);
+        let backspaces = hourly_backspaces.get(&hour).copied().unwrap_or(0);
         if keys > 100 {
             hourly_rates.push(HourlyErrorRate {
                 hour,
-                backspace_rate: (bs as f64 / keys as f64) * 100.0,
+                backspace_rate: (backspaces as f64 / keys as f64) * 100.0,
                 keystrokes: keys,
             });
         }
     }
     if hourly_rates.len() < 2 {
-        return Ok(FatigueIndicators {
+        return FatigueIndicators {
             trend: FatigueTrend::Insufficient,
             early_error_rate: 0.0,
             late_error_rate: 0.0,
             hourly_rates,
             recommendation: None,
-        });
+        };
     }
-    hourly_rates.sort_by_key(|r| r.hour);
+    hourly_rates.sort_by_key(|rate| rate.hour);
     let mid = hourly_rates.len() / 2;
     let early_avg: f64 = hourly_rates[..mid]
         .iter()
-        .map(|r| r.backspace_rate)
+        .map(|rate| rate.backspace_rate)
         .sum::<f64>()
         / mid as f64;
     let late_avg: f64 = hourly_rates[mid..]
         .iter()
-        .map(|r| r.backspace_rate)
+        .map(|rate| rate.backspace_rate)
         .sum::<f64>()
         / (hourly_rates.len() - mid) as f64;
     let trend = if late_avg > early_avg * 1.3 {
@@ -1370,7 +1375,7 @@ fn query_fatigue_indicators(
     } else {
         FatigueTrend::Stable
     };
-    let rec = match trend {
+    let recommendation = match trend {
         FatigueTrend::Increasing => {
             Some("Error rate increasing later in day. Consider more frequent breaks.".to_string())
         }
@@ -1379,13 +1384,13 @@ fn query_fatigue_indicators(
         }
         _ => None,
     };
-    Ok(FatigueIndicators {
+    FatigueIndicators {
         trend,
         early_error_rate: early_avg,
         late_error_rate: late_avg,
         hourly_rates,
-        recommendation: rec,
-    })
+        recommendation,
+    }
 }
 
 #[cfg(test)]
@@ -1884,6 +1889,48 @@ mod tests {
         .expect("human gaps");
 
         assert!(away.summaries.is_empty());
+    }
+
+    #[test]
+    fn corrupt_aligned_offsets_block_sleep_even_with_counted_input() {
+        let app = create_utc_test_app();
+        for event in [
+            MeasuredEvent {
+                timestamp: "2026-05-25T22:00:00+00:00",
+                total_ms: MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[1_000],
+            },
+            MeasuredEvent {
+                timestamp: "2026-05-26T05:00:00+00:00",
+                total_ms: MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[9_000_000],
+            },
+            MeasuredEvent {
+                timestamp: "2026-05-26T06:00:00+00:00",
+                total_ms: MS_PER_MIN,
+                agent_ms: 0,
+                input_offsets: &[1_000],
+            },
+        ] {
+            insert_measured_event(&app.conn, event).expect("measured event");
+        }
+
+        let away = query_gaps(
+            &app.conn,
+            &app.config,
+            "2026-05-25T00:00:00+00:00",
+            "2026-05-27T00:00:00+00:00",
+            &app.config.sleep,
+        )
+        .expect("human gaps");
+
+        assert!(
+            away.summaries
+                .iter()
+                .all(|summary| summary.gap_type != GapType::Sleep)
+        );
     }
 
     #[test]
@@ -2940,5 +2987,114 @@ mod tests {
 
         let result = query_report_range(&app, TimeRange::Days(2)).expect("query should succeed");
         assert_eq!(result.daily.len(), 2);
+    }
+    #[test]
+    fn projects_preserve_pure_and_mixed_category_totals() {
+        let app = create_utc_test_app();
+        let today = app.config.local_date_today();
+        let timestamp = format!("{}T10:00:00+00:00", today);
+        for (app_id, category, duration) in [
+            ("pure-app", "neutral", 60_000),
+            ("mixed-productive", "productive", 120_000),
+            ("mixed-unproductive", "unproductive", 30_000),
+        ] {
+            insert_test_event(
+                &app.conn, &timestamp, app_id, category, duration, 0, 0, 0, 0,
+            )
+            .expect("project event");
+        }
+        app.conn
+            .execute(
+                "UPDATE events SET project = CASE WHEN app_id = 'pure-app' THEN 'pure-project' ELSE 'mixed-project' END",
+                [],
+            )
+            .expect("projects");
+
+        let report = query_report_range(&app, TimeRange::Days(0)).expect("report");
+        let pure = report
+            .projects
+            .iter()
+            .find(|project| project.project == "pure-project")
+            .expect("pure project");
+        assert_eq!(pure.total_ms, 60_000);
+        assert_eq!(pure.productive_ms, 0);
+        assert_eq!(pure.neutral_ms, 60_000);
+        assert_eq!(pure.unproductive_ms, 0);
+
+        let mixed = report
+            .projects
+            .iter()
+            .find(|project| project.project == "mixed-project")
+            .expect("mixed project");
+        assert_eq!(mixed.total_ms, 150_000);
+        assert_eq!(mixed.productive_ms, 120_000);
+        assert_eq!(mixed.neutral_ms, 0);
+        assert_eq!(mixed.unproductive_ms, 30_000);
+    }
+
+    #[test]
+    fn fatigue_uses_input_clipped_at_the_report_boundary() {
+        let app = create_utc_test_app();
+        let today = app.config.local_date_today();
+        let yesterday = today - chrono::Duration::days(1);
+        insert_test_event(
+            &app.conn,
+            &format!("{}T23:59:00+00:00", yesterday),
+            "code",
+            "productive",
+            120_000,
+            0,
+            0,
+            400,
+            0,
+        )
+        .expect("boundary event");
+        app.conn
+            .execute("UPDATE events SET backspace_count = 40", [])
+            .expect("granular input");
+
+        let report = query_report_range(&app, TimeRange::DateRange(today, today)).expect("report");
+        let fatigue = report.fatigue.expect("fatigue");
+
+        assert_eq!(fatigue.hourly_rates.len(), 1);
+        assert_eq!(fatigue.hourly_rates[0].hour, 0);
+        assert_eq!(fatigue.hourly_rates[0].keystrokes, 200);
+        assert!((fatigue.hourly_rates[0].backspace_rate - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fatigue_splits_input_across_hour_boundaries() {
+        let app = create_utc_test_app();
+        let today = app.config.local_date_today();
+        insert_test_event(
+            &app.conn,
+            &format!("{}T10:59:00+00:00", today),
+            "code",
+            "productive",
+            120_000,
+            0,
+            0,
+            400,
+            0,
+        )
+        .expect("cross-hour event");
+        app.conn
+            .execute("UPDATE events SET backspace_count = 40", [])
+            .expect("granular input");
+
+        let report = query_report_range(&app, TimeRange::Days(0)).expect("report");
+        let fatigue = report.fatigue.expect("fatigue");
+
+        assert_eq!(fatigue.hourly_rates.len(), 2);
+        assert_eq!(fatigue.hourly_rates[0].hour, 10);
+        assert_eq!(fatigue.hourly_rates[0].keystrokes, 200);
+        assert_eq!(fatigue.hourly_rates[1].hour, 11);
+        assert_eq!(fatigue.hourly_rates[1].keystrokes, 200);
+        assert!(
+            fatigue
+                .hourly_rates
+                .iter()
+                .all(|rate| (rate.backspace_rate - 10.0).abs() < f64::EPSILON)
+        );
     }
 }

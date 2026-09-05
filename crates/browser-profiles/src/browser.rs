@@ -46,6 +46,70 @@ impl Browser {
         Browser::Opera,
     ];
 
+    /// Linux desktop and Flatpak application IDs emitted for this browser.
+    ///
+    /// Keep this list exact and fail-closed: an unknown application must not
+    /// gain access to browser-history-derived identity merely because its name
+    /// resembles a browser.
+    fn app_ids(self) -> &'static [&'static str] {
+        match self {
+            Browser::Firefox => &[
+                "firefox",
+                "firefox-bin",
+                "firefox-esr",
+                "firefox-nightly",
+                "firefoxdeveloperedition",
+                "org.mozilla.firefox",
+                "org.mozilla.firefoxdeveloperedition",
+                "org.mozilla.firefoxnightly",
+            ],
+            Browser::Zen => &[
+                "zen",
+                "zen-browser",
+                "zen-alpha",
+                "zen-twilight",
+                "zen-unofficial",
+                "app.zen_browser.zen",
+                "app.zen_browser.zen-twilight",
+            ],
+            Browser::LibreWolf => &["librewolf", "io.gitlab.librewolf-community"],
+            Browser::Waterfox => &["waterfox", "net.waterfox.waterfox"],
+            Browser::TorBrowser => &["tor browser", "org.torproject.torbrowser-launcher"],
+            Browser::Camoufox => &["camoufox"],
+            Browser::Chrome => &[
+                "google-chrome",
+                "google-chrome-stable",
+                "google-chrome-beta",
+                "google-chrome-unstable",
+                "com.google.chrome",
+                "com.google.chromebeta",
+                "com.google.chromedev",
+            ],
+            Browser::Chromium => &["chromium", "chromium-browser", "org.chromium.chromium"],
+            Browser::Brave => &[
+                "brave-browser",
+                "brave-browser-beta",
+                "brave-browser-dev",
+                "brave-browser-nightly",
+                "com.brave.browser",
+                "com.brave.browser.beta",
+                "com.brave.browser.dev",
+                "com.brave.browser.nightly",
+            ],
+            Browser::Edge => &[
+                "microsoft-edge",
+                "microsoft-edge-stable",
+                "microsoft-edge-beta",
+                "microsoft-edge-dev",
+                "com.microsoft.edge",
+                "com.microsoft.edge.beta",
+                "com.microsoft.edge.dev",
+            ],
+            Browser::Vivaldi => &["vivaldi-stable", "vivaldi-snapshot", "com.vivaldi.vivaldi"],
+            Browser::Opera => &["opera", "opera-beta", "opera-developer", "com.opera.opera"],
+        }
+    }
+
     pub fn family(self) -> Family {
         match self {
             Browser::Firefox
@@ -86,6 +150,8 @@ impl Browser {
             Browser::Camoufox => &[".camoufox", ".config/camoufox"],
             Browser::Chrome => &[
                 ".config/google-chrome",
+                ".config/google-chrome-beta",
+                ".config/google-chrome-unstable",
                 ".var/app/com.google.Chrome/config/google-chrome",
             ],
             Browser::Chromium => &[
@@ -159,6 +225,21 @@ impl fmt::Display for Browser {
     }
 }
 
+/// Return whether `app_id` is an exact known Linux application ID for a
+/// supported browser.
+///
+/// Matching is ASCII-case-insensitive because compositors do not consistently
+/// preserve desktop-file casing. No substring or prefix matching is used, so
+/// unknown and non-browser applications fail closed.
+pub fn is_browser_app_id(app_id: &str) -> bool {
+    Browser::ALL.iter().any(|browser| {
+        browser
+            .app_ids()
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(app_id))
+    })
+}
+
 /// Remove the browser's branding from a window title.
 ///
 /// A window manager sees `"Rust Docs — Zen Browser"` where history stores
@@ -192,6 +273,61 @@ impl Family {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chrome_discovers_supported_linux_channel_roots() {
+        let roots = Browser::Chrome.profile_roots();
+        assert!(roots.contains(&".config/google-chrome"));
+        assert!(roots.contains(&".config/google-chrome-beta"));
+        assert!(roots.contains(&".config/google-chrome-unstable"));
+    }
+
+    #[test]
+    fn recognizes_app_ids_for_every_supported_browser() {
+        let representatives = [
+            (Browser::Firefox, "org.mozilla.firefox"),
+            (Browser::Zen, "app.zen_browser.zen-twilight"),
+            (Browser::LibreWolf, "io.gitlab.librewolf-community"),
+            (Browser::Waterfox, "net.waterfox.waterfox"),
+            (Browser::TorBrowser, "org.torproject.torbrowser-launcher"),
+            (Browser::Camoufox, "camoufox"),
+            (Browser::Chrome, "com.google.Chrome"),
+            (Browser::Chromium, "org.chromium.Chromium"),
+            (Browser::Brave, "com.brave.Browser"),
+            (Browser::Edge, "com.microsoft.Edge"),
+            (Browser::Vivaldi, "com.vivaldi.Vivaldi"),
+            (Browser::Opera, "com.opera.Opera"),
+        ];
+
+        assert_eq!(representatives.len(), Browser::ALL.len());
+        for (browser, app_id) in representatives {
+            assert!(
+                browser
+                    .app_ids()
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(app_id)),
+                "{browser} must own its representative app ID"
+            );
+            assert!(is_browser_app_id(app_id), "{app_id:?} must be recognized");
+        }
+    }
+
+    #[test]
+    fn browser_app_id_matching_fails_closed() {
+        for app_id in [
+            "foot",
+            "code",
+            "firefox-helper",
+            "my-google-chrome-wrapper",
+            "org.mozilla.not-firefox",
+            "",
+        ] {
+            assert!(
+                !is_browser_app_id(app_id),
+                "unexpected match for {app_id:?}"
+            );
+        }
+    }
 
     #[test]
     fn strips_release_channel_brands() {

@@ -59,45 +59,77 @@ struct TuiApp {
     mouse_dpi: f64,
     schedule_start: String,
     schedule_end: String,
+    last_error: Option<String>,
     quit: bool,
+}
+
+struct Snapshot {
+    today: TodayData,
+    metrics: MetricsData,
+    timeline: TimelineData,
+    report: ReportData,
+    mouse_dpi: f64,
+    schedule_start: String,
+    schedule_end: String,
+}
+
+impl Snapshot {
+    fn load(app: &App, range: TimeRange) -> Result<Self, Error> {
+        Ok(Self {
+            today: query_today(app)?,
+            metrics: query_metrics_range(app, range.clone())?,
+            timeline: query_timeline(app, 0, 15)?,
+            report: query_report_range(app, range)?,
+            mouse_dpi: app.config.mouse_dpi,
+            schedule_start: app.config.schedule.start.clone(),
+            schedule_end: app.config.schedule.end.clone(),
+        })
+    }
 }
 
 impl TuiApp {
     fn load(range: TimeRange) -> Result<Self, Error> {
         let app = App::open()?;
-        let today = query_today(&app).ok();
-        let metrics = query_metrics_range(&app, range.clone()).ok();
-        let timeline = query_timeline(&app, 0, 15).ok();
-        let report = query_report_range(&app, range.clone()).ok();
-        let mouse_dpi = app.config.mouse_dpi;
-        let schedule_start = app.config.schedule.start;
-        let schedule_end = app.config.schedule.end;
+        let snapshot = Snapshot::load(&app, range.clone())?;
 
         Ok(Self {
             tab: Tab::Dashboard,
             range,
-            today,
-            metrics,
-            timeline,
-            report,
-            mouse_dpi,
-            schedule_start,
-            schedule_end,
+            today: Some(snapshot.today),
+            metrics: Some(snapshot.metrics),
+            timeline: Some(snapshot.timeline),
+            report: Some(snapshot.report),
+            mouse_dpi: snapshot.mouse_dpi,
+            schedule_start: snapshot.schedule_start,
+            schedule_end: snapshot.schedule_end,
+            last_error: None,
             quit: false,
         })
     }
 
     fn reload(&mut self) {
-        match App::open() {
-            Ok(app) => {
-                self.today = query_today(&app).ok();
-                self.metrics = query_metrics_range(&app, self.range.clone()).ok();
-                self.timeline = query_timeline(&app, 0, 15).ok();
-                self.report = query_report_range(&app, self.range.clone()).ok();
-                self.mouse_dpi = app.config.mouse_dpi;
+        let range = self.range.clone();
+        self.reload_with(|| {
+            let app = App::open()?;
+            Snapshot::load(&app, range)
+        });
+    }
+
+    fn reload_with(&mut self, load: impl FnOnce() -> Result<Snapshot, Error>) {
+        match load() {
+            Ok(snapshot) => {
+                self.today = Some(snapshot.today);
+                self.metrics = Some(snapshot.metrics);
+                self.timeline = Some(snapshot.timeline);
+                self.report = Some(snapshot.report);
+                self.mouse_dpi = snapshot.mouse_dpi;
+                self.schedule_start = snapshot.schedule_start;
+                self.schedule_end = snapshot.schedule_end;
+                self.last_error = None;
             }
-            Err(e) => {
-                tracing::warn!("TUI reload failed: {}", e);
+            Err(error) => {
+                tracing::warn!(%error, "TUI reload failed; retaining previous data");
+                self.last_error = Some(error.to_string());
             }
         }
     }
@@ -160,14 +192,24 @@ fn handle_key(app: &mut TuiApp, key: KeyEvent) {
 
 fn render(app: &TuiApp, frame: &mut Frame) {
     let area = frame.area();
+    let error_height = u16::from(app.last_error.is_some());
     let layout = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(error_height),
         Constraint::Min(0),
         Constraint::Length(1),
     ]);
-    let [title_area, content_area, footer_area] = area.layout(&layout);
+    let [title_area, error_area, content_area, footer_area] = area.layout(&layout);
 
     render_title_bar(app, title_area, frame);
+    if let Some(error) = &app.last_error {
+        let status = Line::from(vec![
+            Span::styled(" Reload failed: ", THEME.warning),
+            Span::styled(error.as_str(), THEME.warning),
+            Span::styled(" (showing previous data)", THEME.value_dim),
+        ]);
+        frame.render_widget(Paragraph::new(status), error_area);
+    }
     render_tab_content(app, content_area, frame);
     render_footer(footer_area, frame);
 }
@@ -886,4 +928,87 @@ fn render_peaks(rpt: &ReportData, area: Rect, frame: &mut Frame) {
     .block(block);
 
     frame.render_widget(table, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::NaiveDate;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+
+    fn app_with_empty_data() -> TuiApp {
+        TuiApp {
+            tab: Tab::Dashboard,
+            range: TimeRange::Days(1),
+            today: Some(TodayData {
+                date: NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
+                rows: Vec::new(),
+            }),
+            metrics: Some(MetricsData {
+                days: 1,
+                total_ms: 0,
+                productive_ms: 0,
+                unproductive_ms: 0,
+                neutral_ms: 0,
+                productive_active_ms: 0,
+                productive_passive_ms: 0,
+                productive_idle_ms: 0,
+            }),
+            timeline: Some(TimelineData {
+                date: NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
+                bucket_min: 15,
+                buckets: Vec::new(),
+            }),
+            report: None,
+            mouse_dpi: 1_200.0,
+            schedule_start: "09:00".into(),
+            schedule_end: "17:00".into(),
+            last_error: None,
+            quit: false,
+        }
+    }
+
+    #[test]
+    fn failed_reload_retains_previous_snapshot_and_records_error() {
+        let mut app = app_with_empty_data();
+
+        app.reload_with(|| Err(Error::InvalidArgument("query failed".into())));
+
+        assert!(app.today.is_some());
+        assert!(app.metrics.is_some());
+        assert!(app.timeline.is_some());
+        assert_eq!(app.mouse_dpi, 1_200.0);
+        assert_eq!(app.schedule_start, "09:00");
+        assert_eq!(app.schedule_end, "17:00");
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some("invalid argument: query failed")
+        );
+    }
+
+    #[test]
+    fn reload_error_is_visible_while_empty_snapshot_remains_data() {
+        let mut app = app_with_empty_data();
+        app.reload_with(|| Err(Error::InvalidArgument("query failed".into())));
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut text, cell| {
+                    text.push_str(cell.symbol());
+                    text
+                });
+        assert!(rendered.contains("Reload failed: invalid argument: query failed"));
+        assert!(rendered.contains("showing previous data"));
+        assert!(rendered.contains("Today (2026-01-02)"));
+        assert!(!rendered.contains("No activity today"));
+    }
 }

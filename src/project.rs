@@ -173,8 +173,10 @@ fn parse_jetbrains_title(title: &str) -> Option<String> {
     // ..." The project name is always the first segment
     let separator = if title.contains(" \u{2013} ") {
         " \u{2013} "
-    } else {
+    } else if title.contains(" - ") {
         " - "
+    } else {
+        return None;
     };
     let first = title.split(separator).next()?.trim();
 
@@ -268,8 +270,13 @@ pub fn detect_git_branch(path: &Path) -> Option<String> {
                 // Worktree: .git is a file with "gitdir:
                 // /path/to/real/.git/worktrees/name"
                 let content = std::fs::read_to_string(&git_dir).ok()?;
-                let gitdir = content.strip_prefix("gitdir: ")?.trim();
-                PathBuf::from(gitdir).join("HEAD")
+                let gitdir = PathBuf::from(content.strip_prefix("gitdir: ")?.trim());
+                let gitdir = if gitdir.is_absolute() {
+                    gitdir
+                } else {
+                    git_dir.parent()?.join(gitdir)
+                };
+                gitdir.join("HEAD")
             } else {
                 git_dir.join("HEAD")
             };
@@ -301,6 +308,13 @@ pub fn detect_git_branch(path: &Path) -> Option<String> {
 /// .git, Cargo.toml, etc). Returns the validated project name (possibly the
 /// basename itself if found).
 pub fn resolve_project_in_search_dirs(basename: &str, search_dirs: &[PathBuf]) -> Option<String> {
+    let mut components = Path::new(basename).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return None;
+    }
+
     for dir in search_dirs {
         let candidate = dir.join(basename);
         if candidate.is_dir() {
@@ -433,6 +447,17 @@ mod tests {
             ),
             Some("my-project".to_string())
         );
+    }
+
+    #[test]
+    fn jetbrains_welcome_titles_are_not_projects() {
+        for app_id in ["jetbrains-idea", "jetbrains-rustrover", "jetbrains-pycharm"] {
+            assert_eq!(detect_project_from_app_title(app_id, "IntelliJ IDEA"), None);
+            assert_eq!(
+                detect_project_from_app_title(app_id, "Welcome to the IDE"),
+                None
+            );
+        }
     }
 
     #[test]
@@ -648,6 +673,31 @@ mod tests {
     }
 
     #[test]
+    fn detects_branch_from_relative_worktree_gitdir() {
+        let tmp = TempDir::new().unwrap();
+        let worktree_git_dir = tmp.path().join("main-repo/.git/worktrees/my-wt");
+        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::write(
+            worktree_git_dir.join("HEAD"),
+            "ref: refs/heads/relative-worktree-branch\n",
+        )
+        .unwrap();
+
+        let worktree_dir = tmp.path().join("worktree-dir");
+        fs::create_dir_all(&worktree_dir).unwrap();
+        fs::write(
+            worktree_dir.join(".git"),
+            "gitdir: ../main-repo/.git/worktrees/my-wt\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_git_branch(&worktree_dir),
+            Some("relative-worktree-branch".to_string())
+        );
+    }
+
+    #[test]
     fn returns_none_when_no_git() {
         let tmp = TempDir::new().unwrap();
         let project_dir = tmp.path().join("no-git");
@@ -655,6 +705,37 @@ mod tests {
 
         let result = detect_git_branch(&project_dir.join("src"));
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolves_single_component_project_in_search_dir() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("my-project")).unwrap();
+
+        assert_eq!(
+            resolve_project_in_search_dirs("my-project", &[tmp.path().to_path_buf()]),
+            Some("my-project".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_non_basename_project_search_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let search_dir = tmp.path().join("search");
+        let other_dir = tmp.path().join("other");
+        fs::create_dir_all(&search_dir).unwrap();
+        fs::create_dir_all(&other_dir).unwrap();
+        let search_dirs = [search_dir];
+
+        for input in [
+            ".",
+            "..",
+            "../other",
+            "nested/project",
+            other_dir.to_str().unwrap(),
+        ] {
+            assert_eq!(resolve_project_in_search_dirs(input, &search_dirs), None);
+        }
     }
 }
 
@@ -664,17 +745,23 @@ mod path_title_tests {
 
     #[test]
     fn shell_prompt_full_path_resolves_project() {
-        // This test only works if the path actually exists on the system
-        let title = "cole@gentoo-thinkpad /home/cole/RustProjects/active/niri-activity-rs";
-        let result = detect_project_from_title(title);
-        // Should resolve to "niri-activity-rs" via detect_project_from_path
-        assert_eq!(result, Some("niri-activity-rs".to_string()));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("my-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("Cargo.toml"), "[package]").unwrap();
+        let title = format!("user@host {}", project_dir.display());
+
+        assert_eq!(
+            detect_project_from_title(&title),
+            Some("my-project".to_string())
+        );
     }
 
     #[test]
     fn shell_prompt_full_path_home_dir() {
-        let title = "cole@gentoo-thinkpad /home/cole";
-        let result = detect_project_from_title(title);
-        assert_eq!(result, None);
+        let home = dirs::home_dir().unwrap();
+        let title = format!("user@host {}", home.display());
+
+        assert_eq!(detect_project_from_title(&title), None);
     }
 }

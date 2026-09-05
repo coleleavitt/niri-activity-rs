@@ -28,30 +28,46 @@ const MS_PER_MIN: i64 = 60_000;
 /// Shared time-range arguments flattened into subcommands that need them.
 #[derive(Debug, Clone, clap::Args)]
 struct TimeRangeArgs {
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month", "from", "to"])]
     aligned: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["aligned", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month", "from", "to"])]
     today: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["aligned", "today", "last_week", "this_week", "last_month", "this_month", "week", "month", "from", "to"])]
     yesterday: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["aligned", "today", "yesterday", "this_week", "last_month", "this_month", "week", "month", "from", "to"])]
     last_week: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "last_month", "this_month", "week", "month", "from", "to"])]
     this_week: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "this_week", "this_month", "week", "month", "from", "to"])]
     last_month: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "this_week", "last_month", "week", "month", "from", "to"])]
     this_month: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "this_week", "last_month", "this_month", "month", "from", "to"])]
     week: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "from", "to"])]
     month: bool,
     /// Start date (YYYY-MM-DD), use with --to
-    #[arg(long)]
+    #[arg(long, requires = "to", conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month"])]
     from: Option<String>,
     /// End date (YYYY-MM-DD), use with --from
-    #[arg(long)]
+    #[arg(long, requires = "from", conflicts_with_all = ["aligned", "today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month"])]
     to: Option<String>,
+}
+
+impl TimeRangeArgs {
+    fn is_selected(&self) -> bool {
+        self.aligned
+            || self.today
+            || self.yesterday
+            || self.last_week
+            || self.this_week
+            || self.last_month
+            || self.this_month
+            || self.week
+            || self.month
+            || self.from.is_some()
+            || self.to.is_some()
+    }
 }
 
 /// Which browser-derived view to show.
@@ -139,6 +155,17 @@ fn parse_time_range(days: u32, time: &TimeRangeArgs) -> Result<report::TimeRange
     } else {
         report::TimeRange::Days(days)
     })
+}
+
+fn email_time_range(
+    days: Option<u32>,
+    time: &TimeRangeArgs,
+) -> Result<Option<report::TimeRange>, Error> {
+    if days.is_some() || time.is_selected() {
+        parse_time_range(days.unwrap_or(7), time).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 #[derive(Parser)]
@@ -248,21 +275,56 @@ enum Commands {
     BackfillProjects,
     /// Send activity report via email
     Email {
-        #[arg(short, long, default_value = "7")]
-        days: u32,
+        #[arg(short, long, conflicts_with_all = ["today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month", "from", "to", "weekly", "monthly", "test", "secure"])]
+        days: Option<u32>,
         #[command(flatten)]
         time: TimeRangeArgs,
-        /// Send weekly report (last Mon-Sun)
-        #[arg(long)]
+        /// Send weekly report (last Saturday-Friday)
+        #[arg(long, conflicts_with_all = [
+                    "monthly",
+                    "days",
+                    "aligned",
+                    "today",
+                    "yesterday",
+                    "last_week",
+                    "this_week",
+                    "last_month",
+                    "this_month",
+                    "week",
+                    "month",
+                    "from",
+                    "to",
+                    "test",
+                    "secure",
+                ])]
         weekly: bool,
         /// Send monthly report (last full month)
-        #[arg(long)]
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "weekly",
+                "days",
+                "aligned",
+                "today",
+                "yesterday",
+                "last_week",
+                "this_week",
+                "last_month",
+                "this_month",
+                "week",
+                "month",
+                "from",
+                "to",
+                "test",
+                "secure",
+            ]
+        )]
         monthly: bool,
         /// Test email configuration
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["weekly", "monthly", "days", "aligned", "today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month", "from", "to", "secure"])]
         test: bool,
         /// Secure config file permissions (chmod 600)
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["weekly", "monthly", "days", "aligned", "today", "yesterday", "last_week", "this_week", "last_month", "this_month", "week", "month", "from", "to", "test"])]
         secure: bool,
     },
 }
@@ -356,7 +418,7 @@ fn main() {
             let since = chrono::Utc::now().timestamp() - i64::from(days) * 86_400;
             println!("Reconstructing agent activity from the last {days} days...");
             let filled = db::backfill_agent_ms(&mut conn, since)?;
-            println!("Backfilled agent time for {filled} events.");
+            println!("Settled agent-time measurement for {filled} events.");
             Ok(())
         })(),
         Some(Commands::FixFalseActive { dry_run }) => (|| -> Result<(), Error> {
@@ -460,9 +522,7 @@ fn main() {
             if test {
                 let cfg = config::load_config()?;
                 email::test_email_config(&cfg)?;
-            } else if time.from.is_some() || time.to.is_some() {
-                // Custom date range takes precedence
-                let range = parse_time_range(days, &time)?;
+            } else if let Some(range) = email_time_range(days, &time)? {
                 let period_name = if let (Some(from), Some(to)) = (&time.from, &time.to) {
                     format!("Custom ({} to {})", from, to)
                 } else {
@@ -476,7 +536,7 @@ fn main() {
                 report::App::open().and_then(|app| email::send_monthly_report(&app))?;
             } else if !secure {
                 return Err(Error::InvalidArgument(
-                    "Specify --weekly, --monthly, --from/--to, --test, or --secure".into(),
+                    "Specify a time range, --days, --weekly, --monthly, --test, or --secure".into(),
                 ));
             }
             Ok(())
@@ -488,5 +548,127 @@ fn main() {
         // doesn't initialize a tracing subscriber, making tracing a no-op
         eprintln!("Error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_email(args: &[&str]) -> (Option<u32>, TimeRangeArgs, bool, bool) {
+        let cli = Cli::try_parse_from(
+            std::iter::once("niri-activity-rs")
+                .chain(std::iter::once("email"))
+                .chain(args.iter().copied()),
+        )
+        .expect("email arguments should parse");
+
+        match cli.command.expect("email command should be present") {
+            Commands::Email {
+                days,
+                time,
+                weekly,
+                monthly,
+                ..
+            } => (days, time, weekly, monthly),
+            _ => panic!("expected email command"),
+        }
+    }
+
+    #[test]
+    fn every_email_time_selector_dispatches_a_range() {
+        let selectors: &[&[&str]] = &[
+            &["--aligned"],
+            &["--today"],
+            &["--yesterday"],
+            &["--last-week"],
+            &["--this-week"],
+            &["--last-month"],
+            &["--this-month"],
+            &["--week"],
+            &["--month"],
+            &["--from", "2026-01-01", "--to", "2026-01-02"],
+            &["--days", "7"],
+        ];
+
+        for args in selectors {
+            let (days, time, weekly, monthly) = parse_email(args);
+            assert!(
+                !weekly && !monthly,
+                "unexpected scheduled mode for {args:?}"
+            );
+            assert!(
+                email_time_range(days, &time)
+                    .unwrap_or_else(|error| panic!("range failed for {args:?}: {error}"))
+                    .is_some(),
+                "selector did not dispatch a range: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn email_without_a_range_does_not_use_the_default_days() {
+        let (days, time, _, _) = parse_email(&[]);
+        assert!(days.is_none());
+        assert!(email_time_range(days, &time).unwrap().is_none());
+    }
+
+    #[test]
+    fn time_range_selectors_conflict_instead_of_using_branch_priority() {
+        for args in [
+            vec!["niri-activity-rs", "email", "--today", "--yesterday"],
+            vec!["niri-activity-rs", "email", "--last-week", "--this-month"],
+            vec!["niri-activity-rs", "email", "--days", "7", "--today"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(
+            Cli::try_parse_from(["niri-activity-rs", "email", "--days", "7", "--aligned"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn email_test_and_secure_are_exclusive_actions() {
+        for action in ["--weekly", "--monthly", "--today", "--secure"] {
+            assert!(Cli::try_parse_from(["niri-activity-rs", "email", "--test", action]).is_err());
+        }
+        assert!(
+            Cli::try_parse_from(["niri-activity-rs", "email", "--test", "--days", "7"]).is_err()
+        );
+    }
+
+    #[test]
+    fn email_scheduled_modes_conflict_with_range_selectors() {
+        assert!(
+            Cli::try_parse_from(["niri-activity-rs", "email", "--weekly", "--monthly"]).is_err()
+        );
+
+        for scheduled in ["--weekly", "--monthly"] {
+            for range in [
+                "--days",
+                "--aligned",
+                "--today",
+                "--yesterday",
+                "--last-week",
+                "--this-week",
+                "--last-month",
+                "--this-month",
+                "--week",
+                "--month",
+                "--from",
+                "--to",
+            ] {
+                let mut args = vec!["niri-activity-rs", "email", scheduled, range];
+                match range {
+                    "--days" => args.push("7"),
+                    "--from" | "--to" => args.push("2026-01-01"),
+                    _ => {}
+                }
+                assert!(
+                    Cli::try_parse_from(args).is_err(),
+                    "{scheduled} should conflict with {range}"
+                );
+            }
+        }
     }
 }

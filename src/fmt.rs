@@ -133,39 +133,61 @@ pub fn cat_bar_fractional(category: Category, frac_blocks: f64, width: usize) ->
 
 /// Create a colored progress bar showing productivity, neutral, and
 /// unproductive fractions.
+fn apportion_bar(weights: [f64; 3], width: usize) -> [usize; 3] {
+    let weights = weights.map(|weight| {
+        if weight.is_finite() && weight > 0.0 {
+            weight
+        } else {
+            0.0
+        }
+    });
+    let max_weight = weights.iter().copied().fold(0.0_f64, f64::max);
+    if width == 0 || max_weight == 0.0 {
+        return [0; 3];
+    }
+
+    // Scaling first prevents a finite sum from overflowing for very large
+    // weights.
+    let scaled = weights.map(|weight| weight / max_weight);
+    let scaled_total: f64 = scaled.iter().sum();
+    let quotas = scaled.map(|weight| weight / scaled_total * width as f64);
+    let mut allocated = quotas.map(|quota| quota.floor() as usize);
+    let allocated_total = allocated.iter().sum::<usize>().min(width);
+    let mut remaining = width - allocated_total;
+
+    let mut order = [0, 1, 2];
+    order.sort_by(|&left, &right| {
+        let left_remainder = quotas[left] - allocated[left] as f64;
+        let right_remainder = quotas[right] - allocated[right] as f64;
+        right_remainder
+            .total_cmp(&left_remainder)
+            .then_with(|| left.cmp(&right))
+    });
+    for index in order {
+        if remaining == 0 {
+            break;
+        }
+        if weights[index] > 0.0 {
+            allocated[index] += 1;
+            remaining -= 1;
+        }
+    }
+
+    allocated
+}
+
+/// Create a colored progress bar showing productivity, neutral, and
+/// unproductive fractions.
 pub fn colored_bar(prod_frac: f64, neutral_frac: f64, unprod_frac: f64, width: usize) -> String {
-    let prod_chars = if prod_frac.is_finite() && prod_frac > 0.0 {
-        (prod_frac.min(1.0) * width as f64).round() as usize
-    } else {
-        0
-    };
-    let neutral_chars = if neutral_frac.is_finite() && neutral_frac > 0.0 {
-        (neutral_frac.min(1.0) * width as f64).round() as usize
-    } else {
-        0
-    };
-    let unprod_chars = if unprod_frac.is_finite() && unprod_frac > 0.0 {
-        (unprod_frac.min(1.0) * width as f64).round() as usize
-    } else {
-        0
-    };
-    let total_used = prod_chars
-        .saturating_add(neutral_chars)
-        .saturating_add(unprod_chars);
-    let (prod_chars, neutral_chars, unprod_chars) = if total_used > width && total_used > 0 {
-        let scale = width as f64 / total_used as f64;
-        let p = (prod_chars as f64 * scale).floor() as usize;
-        let n = (neutral_chars as f64 * scale).floor() as usize;
-        let u = width.saturating_sub(p).saturating_sub(n);
-        (p, n, u)
-    } else {
-        (prod_chars, neutral_chars, unprod_chars)
-    };
+    let [prod_chars, neutral_chars, unprod_chars] =
+        apportion_bar([prod_frac, neutral_frac, unprod_frac], width);
+    let used = prod_chars + neutral_chars + unprod_chars;
     format!(
-        "{}{}{}",
+        "{}{}{}{}",
         "█".repeat(prod_chars).green(),
         "█".repeat(neutral_chars).yellow(),
         "█".repeat(unprod_chars).red(),
+        " ".repeat(width - used),
     )
 }
 
@@ -200,4 +222,57 @@ pub fn cat_bar(category: Category, filled: usize) -> String {
 /// Format text as a section header with styling.
 pub fn section_header(text: &str) -> String {
     text.cyan().bold().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apportion_bar, colored_bar};
+
+    fn visible_width(rendered: &str) -> usize {
+        let mut in_escape = false;
+        let mut width = 0;
+        for character in rendered.chars() {
+            if in_escape {
+                if character == 'm' {
+                    in_escape = false;
+                }
+            } else if character == '\u{1b}' {
+                in_escape = true;
+            } else {
+                width += 1;
+            }
+        }
+        width
+    }
+
+    #[test]
+    fn apportions_equal_weights_by_largest_remainder_and_stable_order() {
+        assert_eq!(apportion_bar([1.0, 1.0, 1.0], 2), [1, 1, 0]);
+        assert_eq!(apportion_bar([1.0, 1.0, 1.0], 4), [2, 1, 1]);
+    }
+
+    #[test]
+    fn apportions_skewed_weights_without_inventing_zero_weight_categories() {
+        assert_eq!(apportion_bar([1000.0, 0.0, 1.0], 2), [2, 0, 0]);
+        assert_eq!(apportion_bar([1.0, 0.0, 0.0], 7), [7, 0, 0]);
+    }
+
+    #[test]
+    fn ignores_nonfinite_and_nonpositive_weights() {
+        assert_eq!(apportion_bar([f64::NAN, f64::INFINITY, -1.0], 5), [0, 0, 0]);
+        assert_eq!(apportion_bar([f64::MAX, 0.0, f64::MAX], 3), [2, 0, 1]);
+    }
+
+    #[test]
+    fn rendered_bar_always_has_requested_visible_width() {
+        for (weights, width) in [
+            ([1.0, 1.0, 1.0], 8),
+            ([1000.0, 0.0, 1.0], 2),
+            ([f64::NAN, f64::INFINITY, -1.0], 6),
+            ([1.0, 2.0, 3.0], 0),
+        ] {
+            let rendered = colored_bar(weights[0], weights[1], weights[2], width);
+            assert_eq!(visible_width(&rendered), width);
+        }
+    }
 }

@@ -1,144 +1,65 @@
-//! Cross-check window-focus tracking against the browser's own measurements.
+//! Browser-derived reports and browser focus accounting.
 //!
-//! This tracker times a window while it holds focus. Firefox independently
-//! times each *page* while it is focused and visible, and counts keystrokes
-//! against it. The two disagree in informative ways: a video playing in an
-//! unfocused window is view time to Firefox but not focus time here, and a
-//! browser window left open on a docs page is focus time here but idle there.
+//! This tracker has bounded window-focus intervals. Firefox independently
+//! stores lifetime aggregate page-engagement counters. Those two measurements
+//! cannot be compared for a requested reporting interval without persisted
+//! engagement snapshots and deltas.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use owo_colors::OwoColorize;
-use rusqlite::params;
 
-use super::{App, MS_PER_HOUR, TimeRange, UNTIL_SENTINEL};
+use super::interval::load_human_intervals;
+use super::{App, TimeRange, UNTIL_SENTINEL};
 use crate::error::Error;
 use crate::fmt::truncate;
 
 /// Focus time this tracker recorded, per domain, for a range.
+///
+/// This uses the canonical interval loader so events overlapping either range
+/// boundary are clipped and focused idle time remains part of window focus.
+#[expect(
+    dead_code,
+    reason = "reserved for a future interval-safe browser report"
+)]
 fn tracked_by_domain(app: &App, range: TimeRange) -> Result<HashMap<String, i64>, Error> {
     let bounds = range.resolve(&app.config)?;
     let until = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
-    let mut stmt = app.conn.prepare(
-        "SELECT title, SUM(active_ms + COALESCE(passive_ms, 0)) AS ms
-         FROM events
-         WHERE timestamp >= ?1 AND timestamp < ?2
-           AND title IS NOT NULL AND title != ''
-         GROUP BY title",
-    )?;
+    tracked_by_domain_between(app, &bounds.since_utc, until)
+}
 
+fn tracked_by_domain_between(
+    app: &App,
+    since: &str,
+    until: &str,
+) -> Result<HashMap<String, i64>, Error> {
+    let events = load_human_intervals(&app.conn, &app.config, since, until)?;
     let mut totals: HashMap<String, i64> = HashMap::new();
-    let rows = stmt.query_map(params![&bounds.since_utc, until], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    for row in rows {
-        let (title, ms) = row?;
-        // A title that resolves to a domain came from a browser, so there is
-        // no need to guess at which app ids are browsers.
-        let key = browser_profiles::strip_window_suffix(&title);
+    for event in events {
+        let title = &event.title;
+        let key = browser_profiles::strip_window_suffix(title);
         if let Some(domain) = app
             .config
             .title_domains
             .get(key)
-            .or_else(|| app.config.title_domains.get(&title))
+            .or_else(|| app.config.title_domains.get(title))
         {
-            *totals.entry(domain.clone()).or_default() += ms;
+            *totals.entry(domain.clone()).or_default() += event.total_ms();
         }
     }
     Ok(totals)
 }
 
-fn hours(ms: i64) -> f64 {
-    ms as f64 / MS_PER_HOUR as f64
-}
-
-fn fmt_hm(ms: i64) -> String {
-    format!("{}h {:02}m", ms / MS_PER_HOUR, (ms % MS_PER_HOUR) / 60_000)
-}
-
-/// Compare tracked focus time against browser-measured view time by domain.
-pub fn show_engagement(app: &App, range: TimeRange, limit: usize) -> Result<(), Error> {
-    let bounds = range.resolve(&app.config)?;
-    let since = app.config.parse_timestamp_to_local(&bounds.since_utc);
-    let until = bounds
-        .until_utc
-        .as_deref()
-        .and_then(|u| app.config.parse_timestamp_to_local(u));
-    let measured = browser_profiles::engagement_by_domain_between(
-        since.map(|d| d.with_timezone(&chrono::Utc)),
-        until.map(|d| d.with_timezone(&chrono::Utc)),
-    )
-    .unwrap_or_default();
-    if measured.is_empty() {
-        println!(
-            "{}",
-            "No browser engagement data. Firefox-family browsers record this; \
-             Chromium does not."
-                .yellow()
-        );
-        return Ok(());
-    }
-    let tracked = tracked_by_domain(app, range)?;
-
-    println!(
-        "{}\n",
-        "Focus time (this tracker) vs view time (browser's own)"
-            .cyan()
-            .bold()
-    );
-    println!(
-        "{:<34} {:>10} {:>10} {:>9} {:>10}",
-        "Domain".bold(),
-        "Tracked".bold(),
-        "Browser".bold(),
-        "Ratio".bold(),
-        "Keys".bold()
-    );
-    println!("{}", "─".repeat(77).dimmed());
-
-    let mut rows: Vec<(&String, i64, Duration, i64)> = measured
-        .iter()
-        .map(|(domain, (view, keys))| {
-            let t = tracked.get(domain).copied().unwrap_or(0);
-            (domain, t, *view, *keys)
-        })
-        .collect();
-    rows.sort_by_key(|row| std::cmp::Reverse(row.2));
-
-    for (domain, tracked_ms, view, keys) in rows.into_iter().take(limit) {
-        let view_ms = i64::try_from(view.as_millis()).unwrap_or(i64::MAX);
-        let r = hours(tracked_ms) / hours(view_ms.max(1));
-        let ratio = if view_ms > 0 {
-            format!("{r:.2}x")
-        } else {
-            "—".to_string()
-        };
-        let ratio = if r < 0.5 {
-            format!("{}", ratio.red())
-        } else if r > 1.5 {
-            format!("{}", ratio.yellow())
-        } else {
-            format!("{}", ratio.green())
-        };
-        println!(
-            "{:<34} {:>10} {:>10} {:>9} {:>10}",
-            truncate(domain, 32),
-            fmt_hm(tracked_ms),
-            fmt_hm(view_ms).dimmed(),
-            ratio,
-            keys
-        );
-    }
-
-    println!(
-        "\n{}",
-        "Ratio < 1 means the browser saw more time than this tracker did, which is what\n\
-         media playing in an unfocused window looks like. Ratio > 1 means a window held\n\
-         focus while the page itself was idle."
-            .dimmed()
-    );
-    Ok(())
+/// Browser engagement cannot be compared to a bounded tracker range.
+///
+/// Firefox exposes lifetime cumulative counters. Its created/updated
+/// timestamps do not say when the accumulated engagement occurred, so using
+/// them as interval bounds would silently overcount arbitrary history.
+pub fn show_engagement(_app: &App, _range: TimeRange, _limit: usize) -> Result<(), Error> {
+    Err(Error::InvalidArgument(
+        "bounded browser engagement is unsupported: Firefox exposes lifetime aggregate counters, not interval engagement"
+            .to_string(),
+    ))
 }
 
 /// Show which sites lead to which, revealing how a destination is reached.
@@ -227,5 +148,55 @@ pub fn show_activity(limit: usize) {
             .last_searched
             .map_or_else(|| "—".to_string(), |t| t.format("%Y-%m-%d").to_string());
         println!("  {} {}", when.dimmed(), truncate(&s.term, 60));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::db::{init_db, run_migrations};
+
+    #[test]
+    fn tracked_focus_includes_idle_and_clips_overlapping_events() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("database");
+        init_db(&conn).expect("schema");
+        run_migrations(&mut conn, &Config::default()).expect("migrations");
+        conn.execute(
+            "INSERT INTO events (
+                 timestamp, app_id, title, category, active_ms, passive_ms, idle_ms
+             ) VALUES (
+                 '2026-01-01T23:59:00+00:00', 'zen', 'Example — Zen Browser',
+                 'neutral', 0, 0, 120000
+             )",
+            [],
+        )
+        .expect("event");
+        let mut config = Config::default();
+        config
+            .title_domains
+            .insert("Example".to_string(), "example.com".to_string());
+        let app = App { config, conn };
+
+        let totals = tracked_by_domain_between(
+            &app,
+            "2026-01-02T00:00:00+00:00",
+            "2026-01-03T00:00:00+00:00",
+        )
+        .expect("tracked totals");
+
+        assert_eq!(totals.get("example.com"), Some(&60_000));
+    }
+
+    #[test]
+    fn bounded_engagement_fails_closed() {
+        let conn = rusqlite::Connection::open_in_memory().expect("database");
+        let app = App {
+            config: Config::default(),
+            conn,
+        };
+        let error = show_engagement(&app, TimeRange::Days(7), 25).expect_err("unsupported");
+
+        assert!(error.to_string().contains("lifetime aggregate counters"));
     }
 }

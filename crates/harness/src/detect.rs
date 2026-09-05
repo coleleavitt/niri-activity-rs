@@ -89,27 +89,67 @@ fn database_written_within(path: &Path, window: Duration) -> bool {
     false
 }
 
-/// Whether any file directly inside a directory was written recently.
+/// Hard bounds for recursive log discovery. Agent stores are user-controlled
+/// and may grow forever, while this scan runs on the watcher's polling path.
+const MAX_LOG_TREE_ENTRIES: usize = 10_000;
+const MAX_LOG_TREE_DEPTH: usize = 16;
+
+/// Visit regular files under `root` without following symlinks.
 ///
-/// Appending to an existing file does not update its directory's mtime — only
-/// creating or removing an entry does — so a single stat on the directory
-/// would miss an agent streaming into a session log it opened minutes ago.
-/// Scanning stops at the first recent file, which is the common case when an
-/// agent is genuinely working.
-fn dir_written_within(dir: &Path, window: Duration) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let recent = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| is_recent(t, window));
-        if recent {
-            return true;
+/// Returning `true` stops the walk. Entry and depth budgets guarantee a stale
+/// or adversarial history tree cannot stall the watcher indefinitely.
+fn walk_log_files(root: &Path, mut visit: impl FnMut(&Path) -> bool) -> bool {
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut remaining = MAX_LOG_TREE_ENTRIES;
+    while let Some((current, depth)) = stack.pop() {
+        let Ok(entries) = fs::read_dir(current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if remaining == 0 {
+                return false;
+            }
+            remaining -= 1;
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_file() {
+                if visit(&entry.path()) {
+                    return true;
+                }
+            } else if file_type.is_dir() && depth < MAX_LOG_TREE_DEPTH {
+                stack.push((entry.path(), depth + 1));
+            }
         }
     }
     false
+}
+
+/// Whether any regular file beneath a directory was written recently.
+fn dir_written_within(dir: &Path, window: Duration) -> bool {
+    walk_log_files(dir, |path| written_within(path, window))
+}
+
+fn consider_file(path: &Path, consider: &mut impl FnMut(SystemTime)) {
+    if let Ok(stamp) = fs::metadata(path).and_then(|metadata| metadata.modified()) {
+        consider(stamp);
+    }
+}
+
+fn consider_database(path: &Path, consider: &mut impl FnMut(SystemTime)) {
+    consider_file(path, consider);
+    for suffix in ["-wal", "-journal"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        consider_file(Path::new(&sidecar), consider);
+    }
+}
+
+fn consider_dir_files(dir: &Path, consider: &mut impl FnMut(SystemTime)) {
+    walk_log_files(dir, |path| {
+        consider_file(path, consider);
+        false
+    });
 }
 
 /// Whether a signal shows activity within `window`.
@@ -132,20 +172,9 @@ pub fn signal_last_write(signal: Signal) -> Option<SystemTime> {
 
     for path in resolve(signal.path()) {
         match signal {
-            Signal::LogDir(_) => {
-                if let Ok(entries) = fs::read_dir(&path) {
-                    for entry in entries.flatten() {
-                        if let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
-                            consider(t);
-                        }
-                    }
-                }
-            }
-            _ => {
-                if let Ok(t) = fs::metadata(&path).and_then(|m| m.modified()) {
-                    consider(t);
-                }
-            }
+            Signal::Database(_) => consider_database(&path, &mut consider),
+            Signal::LogFile(_) => consider_file(&path, &mut consider),
+            Signal::LogDir(_) => consider_dir_files(&path, &mut consider),
         }
     }
     newest
@@ -205,6 +234,16 @@ mod tests {
     }
 
     #[test]
+    fn detects_nested_file_but_not_stale_nested_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("2026/01/01/rollout.jsonl");
+        touch(&log);
+        assert!(dir_written_within(dir.path(), Duration::from_millis(500)));
+        sleep(Duration::from_millis(1100));
+        assert!(!dir_written_within(dir.path(), Duration::from_millis(500)));
+    }
+
+    #[test]
     fn database_activity_is_seen_through_the_wal() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("agent.db");
@@ -215,6 +254,48 @@ mod tests {
         touch(&dir.path().join("agent.db-wal"));
 
         assert!(database_written_within(&db, Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn database_last_write_includes_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("agent.db");
+        touch(&db);
+        sleep(Duration::from_millis(1100));
+        let wal = dir.path().join("agent.db-wal");
+        touch(&wal);
+        let signal = Signal::Database(Box::leak(
+            db.to_string_lossy().into_owned().into_boxed_str(),
+        ));
+        let latest = signal_last_write(signal).expect("last write");
+        let wal_time = fs::metadata(wal)
+            .and_then(|m| m.modified())
+            .expect("wal time");
+        assert!(latest >= wal_time);
+    }
+
+    #[test]
+    fn recursive_scan_respects_the_depth_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut nested = dir.path().to_path_buf();
+        for depth in 0..=MAX_LOG_TREE_DEPTH {
+            nested.push(format!("level-{depth}"));
+        }
+        touch(&nested.join("too-deep.jsonl"));
+
+        assert!(!dir_written_within(dir.path(), Duration::MAX));
+    }
+
+    #[test]
+    fn recursive_scan_finds_files_at_the_supported_depth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut nested = dir.path().to_path_buf();
+        for depth in 0..MAX_LOG_TREE_DEPTH {
+            nested.push(format!("level-{depth}"));
+        }
+        touch(&nested.join("rollout.jsonl"));
+
+        assert!(dir_written_within(dir.path(), Duration::MAX));
     }
 
     #[test]

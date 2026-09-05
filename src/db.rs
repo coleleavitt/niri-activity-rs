@@ -334,56 +334,103 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         tracing::info!("Migration 011: indexed events pending agent measurement");
     }
 
+    if !applied.contains(&"012_add_scheduled_report_jobs".to_string()) {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE scheduled_report_jobs (
+                period_type TEXT NOT NULL,
+                period_key TEXT NOT NULL,
+                range_start TEXT NOT NULL,
+                range_end TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'sent')),
+                owner TEXT,
+                claimed_at TEXT,
+                lease_expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT,
+                sent_at TEXT,
+                last_error TEXT,
+                PRIMARY KEY(period_type, period_key)
+            );
+            INSERT INTO scheduled_report_jobs (
+                period_type, period_key, range_start, range_end, state, sent_at
+            )
+            SELECT period_type, period_key, period_key, period_key, 'sent', sent_at
+            FROM sent_reports;",
+        )?;
+        tx.execute(
+            "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
+            params!["012_add_scheduled_report_jobs", Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        tracing::info!("Migration 012: added durable scheduled report jobs");
+    }
+
     Ok(())
 }
+
+/// Maximum rows read and updated in one reclassification transaction.
+const RECLASSIFY_BATCH_SIZE: usize = 10_000;
 
 /// Reclassify all events in the database according to the current
 /// configuration.
 pub fn reclassify_all(conn: &mut Connection, config: &Config) -> Result<(), Error> {
+    reclassify_all_in_batches(conn, config, RECLASSIFY_BATCH_SIZE)
+}
+
+fn reclassify_all_in_batches(
+    conn: &mut Connection,
+    config: &Config,
+    batch_size: usize,
+) -> Result<(), Error> {
     if !config.can_reclassify_all() {
         tracing::warn!("Skipping category reclassification because browser history is unavailable");
         return Ok(());
     }
 
-    // Safety: check row count before loading all rows into memory.
-    // For databases with >5M events, this could use significant RAM.
-    const MAX_RECLASSIFY_ROWS: i64 = 5_000_000;
-    let row_count: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
-    if row_count > MAX_RECLASSIFY_ROWS {
-        tracing::warn!(
-            "{} events exceeds reclassify limit ({}), skipping bulk reclassify",
-            row_count,
-            MAX_RECLASSIFY_ROWS
-        );
-        return Ok(());
-    }
-
-    let tx = conn.transaction()?;
-    let rows: Vec<(i64, String, String, String)> = {
-        let mut stmt = tx.prepare("SELECT id, app_id, title, category FROM events")?;
-        stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-    };
-
+    let batch_size = i64::try_from(batch_size.max(1)).unwrap_or(i64::MAX);
+    let mut last_id: Option<i64> = None;
     let mut updated = 0i64;
-    for (id, app_id, title, old_category) in &rows {
-        let correct = config.classify(app_id, title).to_string();
-        if correct != *old_category {
-            tx.execute(
-                "UPDATE events SET category = ?1 WHERE id = ?2",
-                params![correct, id],
+
+    loop {
+        let tx = conn.transaction()?;
+        let rows: Vec<(i64, String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, app_id, title, category
+                   FROM events
+                  WHERE ?1 IS NULL OR id > ?1
+                  ORDER BY id
+                  LIMIT ?2",
             )?;
-            updated = updated.saturating_add(1);
+            stmt.query_map(params![last_id, batch_size], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        let Some((page_last_id, _, _, _)) = rows.last() else {
+            tx.commit()?;
+            break;
+        };
+        last_id = Some(*page_last_id);
+
+        for (id, app_id, title, old_category) in &rows {
+            let correct = config.classify(app_id, title).to_string();
+            if correct != *old_category {
+                tx.execute(
+                    "UPDATE events SET category = ?1 WHERE id = ?2",
+                    params![correct, id],
+                )?;
+                updated = updated.saturating_add(1);
+            }
         }
+        tx.commit()?;
     }
-    tx.commit()?;
+
     if updated > 0 {
         tracing::info!("Reclassified {} events to match current config", updated);
     }
@@ -410,10 +457,11 @@ const AGENT_HEAL_GRACE_SECS: i64 = 900; // 15 minutes
 /// Bounded to `MAX_AGENT_BACKFILL_ROWS` and ordered oldest-first so repeated
 /// passes make forward progress. `before_secs` excludes rows too recent to
 /// have settled (the live watcher may still measure them).
-fn events_needing_agent_ms(
+fn events_needing_agent_ms_after(
     conn: &Connection,
     since_secs: i64,
     before_secs: i64,
+    after: Option<(&str, i64)>,
 ) -> Result<Vec<(i64, String, i64)>, Error> {
     let since_rfc3339 = chrono::DateTime::from_timestamp(since_secs, 0)
         .unwrap_or_else(Utc::now)
@@ -421,24 +469,38 @@ fn events_needing_agent_ms(
     let before_rfc3339 = chrono::DateTime::from_timestamp(before_secs, 0)
         .unwrap_or_else(Utc::now)
         .to_rfc3339();
+    let (after_timestamp, after_id) =
+        after.map_or((None, 0), |(timestamp, id)| (Some(timestamp), id));
     let mut stmt = conn.prepare(
         "SELECT id, timestamp, active_ms + COALESCE(passive_ms,0) + idle_ms
            FROM events
           WHERE agent_ms IS NULL AND timestamp >= ?1 AND timestamp < ?2
-          ORDER BY timestamp
-          LIMIT ?3",
+            AND (?3 IS NULL OR timestamp > ?3 OR (timestamp = ?3 AND id > ?4))
+          ORDER BY timestamp, id
+          LIMIT ?5",
     )?;
     let rows = stmt
         .query_map(
             params![
                 &since_rfc3339,
                 &before_rfc3339,
+                after_timestamp,
+                after_id,
                 i64::try_from(MAX_AGENT_BACKFILL_ROWS).unwrap_or(i64::MAX)
             ],
             |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)?)),
         )?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+#[cfg(test)]
+fn events_needing_agent_ms(
+    conn: &Connection,
+    since_secs: i64,
+    before_secs: i64,
+) -> Result<Vec<(i64, String, i64)>, Error> {
+    events_needing_agent_ms_after(conn, since_secs, before_secs, None)
 }
 
 /// Measure any events the live watcher never recorded agent time for.
@@ -453,10 +515,12 @@ fn events_needing_agent_ms(
 /// and are not rescanned on the next startup. Only rows inside the grace window
 /// stay NULL, and those are few.
 pub fn heal_missing_agent_ms(conn: &mut Connection) -> Result<i64, Error> {
-    // MIN over an empty set yields one row holding NULL, so the Option is the
-    // "nothing pending" signal rather than a missing row.
-    let oldest: Option<String> = conn.query_row(
-        "SELECT MIN(timestamp) FROM events WHERE agent_ms IS NULL",
+    // Malformed timestamps remain unknown rather than being stamped measured
+    // zero. Exclude them from the boundary so they cannot wedge valid rows.
+    let oldest: Option<i64> = conn.query_row(
+        "SELECT MIN(unixepoch(timestamp))
+           FROM events
+          WHERE agent_ms IS NULL AND unixepoch(timestamp) IS NOT NULL",
         [],
         |row| row.get(0),
     )?;
@@ -464,10 +528,7 @@ pub fn heal_missing_agent_ms(conn: &mut Connection) -> Result<i64, Error> {
     let Some(oldest) = oldest else {
         return Ok(0);
     };
-    let Ok(start) = chrono::DateTime::parse_from_rfc3339(&oldest) else {
-        return Ok(0);
-    };
-    backfill_agent_ms(conn, start.timestamp())
+    backfill_agent_ms(conn, oldest)
 }
 
 pub fn backfill_agent_ms(conn: &mut Connection, since_secs: i64) -> Result<i64, Error> {
@@ -479,39 +540,51 @@ pub fn backfill_agent_ms(conn: &mut Connection, since_secs: i64) -> Result<i64, 
         return Ok(0);
     }
 
+    // Log discovery is substantially more expensive than the indexed event
+    // query. Compute it once for the requested interval, then reuse it while
+    // draining bounded database batches.
     let busy = harness::busy_minutes(since_secs, before_secs);
+    let mut settled = 0i64;
+    let mut cursor: Option<(String, i64)> = None;
 
-    // A row too old for the live watcher and outside any agent-busy interval
-    // gets a measured 0. Distinguishing "measured 0" from "never scanned" is
-    // exactly what makes heal converge; without it, no-agent nights stayed
-    // NULL forever and the healer rescanned all of history on every startup.
-    let rows = events_needing_agent_ms(conn, since_secs, before_secs)?;
-    if rows.is_empty() {
-        return Ok(0);
-    }
+    loop {
+        let rows = events_needing_agent_ms_after(
+            conn,
+            since_secs,
+            before_secs,
+            cursor
+                .as_ref()
+                .map(|(timestamp, id)| (timestamp.as_str(), *id)),
+        )?;
+        if rows.is_empty() {
+            break;
+        }
+        cursor = rows
+            .last()
+            .map(|(id, timestamp, _)| (timestamp.clone(), *id));
 
-    let tx = conn.transaction()?;
-    let mut filled = 0i64;
-    {
-        let mut stmt = tx.prepare("UPDATE events SET agent_ms = ?1 WHERE id = ?2")?;
-        for (id, timestamp, span_ms) in &rows {
-            let agent_ms = match chrono::DateTime::parse_from_rfc3339(timestamp) {
-                Ok(start) => {
-                    let start_ms = start.timestamp_millis();
-                    busy.overlap_ms(start_ms, start_ms.saturating_add(*span_ms))
-                }
-                // Unparseable timestamp: still settle it with a measured 0 so
-                // it does not wedge the healer at this row forever.
-                Err(_) => 0,
-            };
-            stmt.execute(params![agent_ms, id])?;
-            if agent_ms > 0 {
-                filled = filled.saturating_add(1);
+        // Each transaction is independently bounded so large repairs do not
+        // hold the write lock indefinitely.
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE events SET agent_ms = ?1 WHERE id = ?2")?;
+            for (id, timestamp, span_ms) in &rows {
+                let Ok(start) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+                    // Keep malformed rows unknown. The cursor advances past
+                    // them so valid rows behind them can still be repaired.
+                    continue;
+                };
+                let start_ms = start.timestamp_millis();
+                let agent_ms = busy.overlap_ms(start_ms, start_ms.saturating_add(*span_ms));
+                settled = settled.saturating_add(
+                    i64::try_from(stmt.execute(params![agent_ms, id])?).unwrap_or(i64::MAX),
+                );
             }
         }
+        tx.commit()?;
     }
-    tx.commit()?;
-    Ok(filled)
+
+    Ok(settled)
 }
 
 /// Reclassify events with zero input as passive instead of active, returning
@@ -696,7 +769,9 @@ pub fn reclassify_with_thresholds(
     #[allow(clippy::type_complexity)] // One-shot DB row tuple, not worth a named struct
     let rows: Vec<(i64, Option<Vec<u8>>, i64, i64, i64)> = {
         let mut stmt = conn.prepare(
-            "SELECT id, input_offsets, active_ms, passive_ms, idle_ms FROM events WHERE input_offsets IS NOT NULL"
+            "SELECT id, input_offsets, active_ms, passive_ms, idle_ms
+               FROM events
+              WHERE input_offsets IS NOT NULL AND length(input_offsets) > 0",
         )?;
         stmt.query_map([], |row| {
             Ok((
@@ -716,6 +791,9 @@ pub fn reclassify_with_thresholds(
     let tx = conn.transaction()?;
     for (id, blob_opt, old_active, old_passive, old_idle) in rows {
         if let Some(blob) = blob_opt {
+            if blob.len() % 4 != 0 {
+                continue;
+            }
             let total_duration = old_active
                 .saturating_add(old_passive)
                 .saturating_add(old_idle);
@@ -759,71 +837,82 @@ const TERMINAL_APP_IDS: &[&str] = &[
 /// Processes rows in batches for performance, applying
 /// `detect_project_from_title` and optional project aliases. Returns
 /// (total_candidates, detected_count).
+const PROJECT_BACKFILL_BATCH_SIZE: usize = 1_000;
+
 pub fn backfill_projects(
     conn: &mut Connection,
     aliases: &std::collections::HashMap<String, String>,
 ) -> Result<(i64, i64), Error> {
+    backfill_projects_in_batches(conn, aliases, PROJECT_BACKFILL_BATCH_SIZE)
+}
+
+fn backfill_projects_in_batches(
+    conn: &mut Connection,
+    aliases: &std::collections::HashMap<String, String>,
+    batch_size: usize,
+) -> Result<(i64, i64), Error> {
     use crate::project::detect_project_from_title;
 
-    // Build the IN clause for terminal apps
     let placeholders: String = TERMINAL_APP_IDS
         .iter()
         .enumerate()
         .map(|(i, _)| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(", ");
-
-    let count_sql = format!(
-        "SELECT COUNT(*) FROM events WHERE project IS NULL AND app_id IN ({})",
-        placeholders
-    );
-
-    let total: i64 = {
-        let mut stmt = conn.prepare(&count_sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> = TERMINAL_APP_IDS
-            .iter()
-            .map(|s| s as &dyn rusqlite::types::ToSql)
-            .collect();
-        stmt.query_row(params.as_slice(), |row| row.get(0))?
-    };
+    let terminal_params: Vec<&dyn rusqlite::types::ToSql> = TERMINAL_APP_IDS
+        .iter()
+        .map(|s| s as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count_sql =
+        format!("SELECT COUNT(*) FROM events WHERE project IS NULL AND app_id IN ({placeholders})");
+    let total: i64 = conn
+        .prepare(&count_sql)?
+        .query_row(terminal_params.as_slice(), |row| row.get(0))?;
 
     if total == 0 {
         println!("No terminal events with NULL project found. Nothing to backfill.");
         return Ok((0, 0));
     }
+    println!("Found {total} terminal events with NULL project");
 
-    println!("Found {} terminal events with NULL project", total);
-
+    let cursor_param = TERMINAL_APP_IDS.len() + 1;
+    let limit_param = cursor_param + 1;
     let select_sql = format!(
-        "SELECT id, title FROM events WHERE project IS NULL AND app_id IN ({}) ORDER BY id",
-        placeholders
+        "SELECT id, title
+           FROM events
+          WHERE project IS NULL
+            AND app_id IN ({placeholders})
+            AND (?{cursor_param} IS NULL OR id > ?{cursor_param})
+          ORDER BY id
+          LIMIT ?{limit_param}"
     );
+    let batch_limit = i64::try_from(batch_size.max(1)).unwrap_or(i64::MAX);
+    let mut last_id: Option<i64> = None;
+    let mut detected = 0i64;
+    let mut processed = 0i64;
 
-    // Read all candidate rows (id, title)
-    let rows: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(&select_sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> = TERMINAL_APP_IDS
-            .iter()
-            .map(|s| s as &dyn rusqlite::types::ToSql)
-            .collect();
-        stmt.query_map(params.as_slice(), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-    };
+    loop {
+        let rows: Vec<(i64, String)> = {
+            let mut query_params = terminal_params.clone();
+            query_params.push(&last_id);
+            query_params.push(&batch_limit);
+            let mut stmt = conn.prepare(&select_sql)?;
+            stmt.query_map(query_params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        let Some((page_last_id, _)) = rows.last() else {
+            break;
+        };
+        last_id = Some(*page_last_id);
 
-    let mut detected: i64 = 0;
-    let mut processed: i64 = 0;
-    let batch_size = 1000;
-
-    for chunk in rows.chunks(batch_size) {
         let tx = conn.transaction()?;
-        for (id, title) in chunk {
+        for (id, title) in &rows {
             if let Some(mut project) = detect_project_from_title(title) {
-                // Apply aliases
                 if let Some(alias) = aliases.get(&project) {
                     project = alias.clone();
                 }
@@ -831,17 +920,12 @@ pub fn backfill_projects(
                     "UPDATE events SET project = ?1 WHERE id = ?2",
                     params![project, id],
                 )?;
-                detected += 1;
+                detected = detected.saturating_add(1);
             }
-            processed += 1;
+            processed = processed.saturating_add(1);
         }
         tx.commit()?;
-
-        // Print progress every batch
-        println!(
-            "Backfilled {} of {} events ({} with project detected)",
-            processed, total, detected
-        );
+        println!("Backfilled {processed} of {total} events ({detected} with project detected)");
     }
 
     Ok((total, detected))
@@ -916,6 +1000,129 @@ mod tests {
             .expect_err("deep-idle must follow idle");
 
         assert!(matches!(error, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn category_reclassification_drains_multiple_bounded_batches() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        init_db(&conn).expect("schema");
+        for id in 1..=5 {
+            conn.execute(
+                "INSERT INTO events (id, timestamp, app_id, title, category, active_ms, idle_ms)
+                 VALUES (?1, '2026-08-16T12:00:00+00:00', 'foot', 'terminal', 'unproductive', 1, 0)",
+                [id],
+            )
+            .expect("fixture");
+        }
+        let config = Config {
+            categories: std::collections::HashMap::from([(
+                "foot".to_string(),
+                Category::Productive,
+            )]),
+            ..Config::default()
+        };
+
+        reclassify_all_in_batches(&mut conn, &config, 2).expect("reclassify");
+
+        let productive: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE category = 'productive'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(productive, 5);
+    }
+
+    #[test]
+    fn threshold_reclassification_skips_empty_input_offsets() {
+        let mut conn = db_with_events(&[]);
+        conn.execute(
+            "INSERT INTO events (
+                 timestamp, app_id, title, category, active_ms, passive_ms, idle_ms, input_offsets
+             ) VALUES ('2026-08-16T12:00:00+00:00', 'foot', 'terminal', 'productive', 60000, 30000, 0, x'')",
+            [],
+        )
+        .expect("fixture");
+
+        let result = reclassify_with_thresholds(&mut conn, 120, 300).expect("reclassify");
+        let times: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT active_ms, passive_ms, idle_ms FROM events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("times");
+
+        assert_eq!(result, (0, 0), "empty offsets are not safe to replay");
+        assert_eq!(times, (60_000, 30_000, 0));
+    }
+
+    #[test]
+    fn threshold_reclassification_preserves_malformed_input_offsets() {
+        for trailing_bytes in 1..=3 {
+            let mut conn = db_with_events(&[]);
+            let mut blob = 30_000u32.to_le_bytes().to_vec();
+            blob.extend(std::iter::repeat_n(0xA5, trailing_bytes));
+            conn.execute(
+                "INSERT INTO events (
+                     timestamp, app_id, title, category, active_ms, passive_ms, idle_ms,
+                     input_offsets
+                 ) VALUES (
+                     '2026-08-16T12:00:00+00:00', 'foot', 'terminal', 'productive',
+                     60000, 30000, 10000, ?1
+                 )",
+                params![blob],
+            )
+            .expect("fixture");
+
+            let before: (i64, i64, i64, Vec<u8>) = conn
+                .query_row(
+                    "SELECT active_ms, passive_ms, idle_ms, input_offsets FROM events",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("before");
+            let result = reclassify_with_thresholds(&mut conn, 20, 40).expect("reclassify");
+            let after: (i64, i64, i64, Vec<u8>) = conn
+                .query_row(
+                    "SELECT active_ms, passive_ms, idle_ms, input_offsets FROM events",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("after");
+
+            assert_eq!(result, (0, 1));
+            assert_eq!(after, before, "trailing byte count: {trailing_bytes}");
+        }
+    }
+
+    #[test]
+    fn project_backfill_drains_multiple_bounded_batches() {
+        let mut conn = db_with_events(&[]);
+        for id in 1..=5 {
+            let title = if id == 3 { "not a project" } else { "OpenCode" };
+            conn.execute(
+                "INSERT INTO events (
+                     id, timestamp, app_id, title, category, active_ms, idle_ms, project
+                 ) VALUES (?1, '2026-08-16T12:00:00+00:00', 'foot', ?2, 'productive', 1, 0, NULL)",
+                params![id, title],
+            )
+            .expect("fixture");
+        }
+
+        let result = backfill_projects_in_batches(&mut conn, &std::collections::HashMap::new(), 2)
+            .expect("backfill");
+        let detected: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE project = 'OpenCode'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+
+        assert_eq!(result, (5, 4));
+        assert_eq!(detected, 4);
     }
 
     #[test]
@@ -1044,7 +1251,8 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
             .expect("fixed")
             .timestamp();
-        backfill_agent_ms(&mut conn, since).expect("backfill");
+        let settled = backfill_agent_ms(&mut conn, since).expect("backfill");
+        assert_eq!(settled, 2, "progress includes measured-zero rows");
 
         let still_null: i64 = conn
             .query_row(
@@ -1058,6 +1266,64 @@ mod tests {
         // A second heal pass finds nothing pending and is a no-op.
         let second = heal_missing_agent_ms(&mut conn).expect("heal");
         assert_eq!(second, 0, "heal converges: nothing left to scan");
+    }
+
+    #[test]
+    fn backfill_drains_more_than_one_bounded_batch() {
+        let mut conn = db_with_events(&[]);
+        let total = i64::try_from(MAX_AGENT_BACKFILL_ROWS).expect("batch size") + 1;
+        conn.execute(
+            "WITH RECURSIVE sequence(n) AS (
+                 SELECT 1
+                 UNION ALL SELECT n + 1 FROM sequence WHERE n < ?1
+             )
+             INSERT INTO events (timestamp, app_id, title, category, active_ms, idle_ms)
+             SELECT printf('2026-01-01T00:%02d:%02d+00:00', (n / 60) % 60, n % 60),
+                    'foot', 't', 'productive', 1000, 0
+               FROM sequence",
+            [total],
+        )
+        .expect("bulk fixture");
+
+        let since = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
+            .expect("fixed")
+            .timestamp();
+        let settled = backfill_agent_ms(&mut conn, since).expect("backfill");
+        let still_null: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_ms IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+
+        assert_eq!(settled, total, "progress counts every settled row");
+        assert_eq!(still_null, 0, "all batches must drain in one call");
+    }
+
+    #[test]
+    fn malformed_oldest_timestamp_does_not_wedge_healing() {
+        let mut conn = db_with_events(&["not-a-timestamp", "2026-01-01T00:00:00+00:00"]);
+
+        let settled = heal_missing_agent_ms(&mut conn).expect("heal");
+        let malformed: Option<i64> = conn
+            .query_row(
+                "SELECT agent_ms FROM events WHERE timestamp = 'not-a-timestamp'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("malformed row");
+        let valid: Option<i64> = conn
+            .query_row(
+                "SELECT agent_ms FROM events WHERE timestamp != 'not-a-timestamp'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("valid row");
+
+        assert_eq!(settled, 1);
+        assert_eq!(malformed, None, "malformed input must remain unknown");
+        assert!(valid.is_some(), "valid rows still heal");
     }
 
     #[test]

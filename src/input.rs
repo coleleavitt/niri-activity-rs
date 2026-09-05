@@ -63,6 +63,9 @@ pub struct InputSnapshot {
     pub mouse_clicks: u64,
     pub scroll_events: u64,
     pub mouse_distance: u64,
+    /// Mouse motion windows whose net displacement crossed the activity
+    /// threshold.
+    pub qualifying_mouse_movements: u64,
     pub backspace_count: u64,
     pub modifier_count: u64,
     pub left_clicks: u64,
@@ -80,6 +83,7 @@ pub struct InputCounters {
     pub mouse_clicks: AtomicU64,
     pub scroll_events: AtomicU64,
     pub mouse_distance: AtomicU64,
+    pub qualifying_mouse_movements: AtomicU64,
     pub backspace_count: AtomicU64,
     pub modifier_count: AtomicU64,
     pub left_clicks: AtomicU64,
@@ -102,6 +106,7 @@ impl InputCounters {
             mouse_clicks: AtomicU64::new(0),
             scroll_events: AtomicU64::new(0),
             mouse_distance: AtomicU64::new(0),
+            qualifying_mouse_movements: AtomicU64::new(0),
             backspace_count: AtomicU64::new(0),
             modifier_count: AtomicU64::new(0),
             left_clicks: AtomicU64::new(0),
@@ -140,6 +145,10 @@ impl InputStats {
             mouse_clicks: self.counters.mouse_clicks.swap(0, Ordering::AcqRel),
             scroll_events: self.counters.scroll_events.swap(0, Ordering::AcqRel),
             mouse_distance: self.counters.mouse_distance.swap(0, Ordering::AcqRel),
+            qualifying_mouse_movements: self
+                .counters
+                .qualifying_mouse_movements
+                .swap(0, Ordering::AcqRel),
             backspace_count: self.counters.backspace_count.swap(0, Ordering::AcqRel),
             modifier_count: self.counters.modifier_count.swap(0, Ordering::AcqRel),
             left_clicks: self.counters.left_clicks.swap(0, Ordering::AcqRel),
@@ -202,16 +211,20 @@ impl IntervalTracker {
 
     fn record(&mut self, now_ms: u64) {
         self.timestamps_ms.push_back(now_ms);
-        let cutoff = now_ms.saturating_sub(self.window_ms);
-        while let Some(&front) = self.timestamps_ms.front() {
-            if front < cutoff {
-                self.timestamps_ms.pop_front();
-            } else {
-                break;
-            }
-        }
+        self.prune(now_ms);
         // Hard cap: drop oldest entries if deque exceeds max_capacity
         while self.timestamps_ms.len() > self.max_capacity {
+            self.timestamps_ms.pop_front();
+        }
+    }
+
+    fn prune(&mut self, now_ms: u64) {
+        let cutoff = now_ms.saturating_sub(self.window_ms);
+        while self
+            .timestamps_ms
+            .front()
+            .is_some_and(|timestamp| *timestamp < cutoff)
+        {
             self.timestamps_ms.pop_front();
         }
     }
@@ -263,6 +276,23 @@ impl IntervalTracker {
 
         max_interval.saturating_sub(min_interval) < self.variance_threshold_ms
     }
+}
+
+fn update_jiggler_pattern(
+    keyboard: &mut IntervalTracker,
+    mouse: &mut IntervalTracker,
+    counters: &InputCounters,
+    now_ms: u64,
+) {
+    keyboard.prune(now_ms);
+    mouse.prune(now_ms);
+
+    let keyboard_age_ms = now_ms.saturating_sub(counters.last_keyboard_ms.load(Ordering::Acquire));
+    let mouse_artificial = mouse.is_artificial() && keyboard_age_ms >= mouse.window_ms;
+    let artificial = keyboard.is_artificial() || mouse_artificial;
+    counters
+        .jiggler_pattern
+        .store(artificial, Ordering::Release);
 }
 
 /// Detect if any jiggler/artificial input software is currently running.
@@ -517,6 +547,9 @@ fn unified_input_loop(
 
                                 if window_expired || above_threshold {
                                     if above_threshold {
+                                        counters
+                                            .qualifying_mouse_movements
+                                            .fetch_add(1, Ordering::Release);
                                         counters.last_activity_ms.store(now, Ordering::Release);
                                     }
                                     motion_dx = 0.0;
@@ -620,15 +653,7 @@ fn unified_input_loop(
             && Instant::now().duration_since(last_jiggler_check) >= JIGGLER_CHECK_INTERVAL
         {
             let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let kb_ms = counters.last_keyboard_ms.load(Ordering::Acquire);
-            let kb_age_ms = now_ms.saturating_sub(kb_ms);
-            let window_ms = jiggler_config.window_secs.saturating_mul(1000);
-
-            let mouse_artificial = mouse_tracker.is_artificial() && kb_age_ms >= window_ms;
-            let artificial = kb_tracker.is_artificial() || mouse_artificial;
-            counters
-                .jiggler_pattern
-                .store(artificial, Ordering::Release);
+            update_jiggler_pattern(&mut kb_tracker, &mut mouse_tracker, counters, now_ms);
             last_jiggler_check = Instant::now();
         }
     }
@@ -767,4 +792,49 @@ pub fn start_idle_monitor(
     }
 
     stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tracker(window_secs: u64, min_events: usize) -> IntervalTracker {
+        IntervalTracker::new(&JigglerConfig {
+            enabled: true,
+            window_secs,
+            min_events,
+            variance_threshold_ms: 100,
+            process_blacklist: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn interval_tracker_prunes_at_evaluation_time() {
+        let mut tracker = tracker(120, 3);
+        for timestamp in [0, 30_000, 60_000] {
+            tracker.record(timestamp);
+        }
+        assert!(tracker.is_artificial());
+
+        tracker.prune(180_001);
+
+        assert!(!tracker.is_artificial());
+        assert!(tracker.timestamps_ms.is_empty());
+    }
+
+    #[test]
+    fn periodic_evaluation_clears_stale_artificial_flag_without_new_input() {
+        let mut keyboard = tracker(120, 3);
+        let mut mouse = tracker(120, 3);
+        let counters = InputCounters::new();
+        for timestamp in [0, 30_000, 60_000] {
+            keyboard.record(timestamp);
+        }
+
+        update_jiggler_pattern(&mut keyboard, &mut mouse, &counters, 60_000);
+        assert!(counters.jiggler_pattern.load(Ordering::Acquire));
+
+        update_jiggler_pattern(&mut keyboard, &mut mouse, &counters, 180_001);
+        assert!(!counters.jiggler_pattern.load(Ordering::Acquire));
+    }
 }

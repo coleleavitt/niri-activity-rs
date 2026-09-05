@@ -1,6 +1,13 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use crate::harness::Harness;
+
+#[cfg(unix)]
+fn is_current_user(entry_uid: u32, current_uid: u32) -> bool {
+    entry_uid == current_uid
+}
 
 /// Harnesses with a matching process currently running.
 ///
@@ -8,6 +15,13 @@ use crate::harness::Harness;
 /// prompt still shows up — so callers should pair this with a file-activity
 /// check or a recent-input requirement.
 pub fn running() -> Vec<Harness> {
+    #[cfg(not(unix))]
+    return Vec::new();
+
+    #[cfg(unix)]
+    let Ok(current_uid) = fs::metadata("/proc/self").map(|metadata| metadata.uid()) else {
+        return Vec::new();
+    };
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -17,6 +31,14 @@ pub fn running() -> Vec<Harness> {
         let name = entry.file_name();
         let Some(pid) = name.to_str() else { continue };
         if !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        #[cfg(unix)]
+        if !entry
+            .metadata()
+            .map(|metadata| is_current_user(metadata.uid(), current_uid))
+            .unwrap_or(false)
+        {
             continue;
         }
         let Ok(comm) = fs::read_to_string(entry.path().join("comm")) else {
@@ -42,6 +64,13 @@ pub fn is_running(harness: Harness) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_filter_is_fail_closed() {
+        assert!(is_current_user(1000, 1000));
+        assert!(!is_current_user(1001, 1000));
+    }
 
     #[test]
     fn scanning_proc_never_panics() {

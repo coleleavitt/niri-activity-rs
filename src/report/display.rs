@@ -446,9 +446,42 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
         );
         let max_proj_ms = data.projects.first().map_or(1, |p| p.total_ms).max(1);
         for proj in &data.projects {
-            let frac_blocks =
-                (proj.total_ms as f64 / max_proj_ms as f64 * BAR_WIDTH as f64).max(0.125);
-            let bar = cat_bar_fractional(Category::Productive, frac_blocks, BAR_WIDTH);
+            let filled = (proj.total_ms as f64 / max_proj_ms as f64 * BAR_WIDTH as f64)
+                .round()
+                .clamp(1.0, BAR_WIDTH as f64) as usize;
+            let category_count = [proj.productive_ms, proj.neutral_ms, proj.unproductive_ms]
+                .into_iter()
+                .filter(|total| *total > 0)
+                .count();
+            let (name, bar, label) = if category_count == 1 {
+                let category = if proj.productive_ms > 0 {
+                    Category::Productive
+                } else if proj.unproductive_ms > 0 {
+                    Category::Unproductive
+                } else {
+                    Category::Neutral
+                };
+                (
+                    cat_colored(category, &format!("{:<22}", truncate(&proj.project, 22))),
+                    cat_bar_fractional(category, filled as f64, BAR_WIDTH),
+                    cat_label(category),
+                )
+            } else {
+                let total = proj.total_ms.max(1) as f64;
+                let segmented = colored_bar(
+                    proj.productive_ms as f64 / total,
+                    proj.neutral_ms as f64 / total,
+                    proj.unproductive_ms as f64 / total,
+                    filled,
+                );
+                (
+                    format!("{:<22}", truncate(&proj.project, 22))
+                        .bold()
+                        .to_string(),
+                    format!("{}{}", segmented, " ".repeat(BAR_WIDTH - filled)),
+                    "mixed".dimmed().to_string(),
+                )
+            };
             let active_min = proj.active_ms as f64 / MS_PER_MIN as f64;
             let keys_per_min = if active_min > 0.5 {
                 format!("{:.0}/m", proj.keys as f64 / active_min)
@@ -457,16 +490,13 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             };
             println!(
                 "  {} {} {:>8}  {:>5} keys ({:>5}) {:>3} clicks  ({})",
-                cat_colored(
-                    Category::Productive,
-                    &format!("{:<22}", truncate(&proj.project, 22))
-                ),
+                name,
                 bar,
                 fmt_duration(proj.total_ms).bold(),
                 proj.keys,
                 keys_per_min.dimmed(),
                 proj.clicks,
-                cat_label(Category::Productive)
+                label
             );
         }
     }

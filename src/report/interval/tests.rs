@@ -6,6 +6,7 @@ fn event(start_ms: i64, active_ms: i64, passive_ms: i64, idle_ms: i64) -> EventI
         source_start_ms: start_ms,
         start_ms,
         app_id: "code".to_string(),
+        title: String::new(),
         category: Category::Productive,
         project: None,
         active_ms,
@@ -84,4 +85,28 @@ fn loader_includes_the_single_overlapping_predecessor() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].start_ms, 1_767_312_000_000);
     assert_eq!(events[0].total_ms(), 60_000);
+}
+
+#[test]
+fn minute_slices_telescope_each_presence_dimension_with_tiny_counts() {
+    let event = event(59_999, 1, 1, 1);
+
+    let slices = event.minute_slices();
+
+    assert_eq!(slices.len(), 2);
+    assert_eq!(slices.iter().map(|slice| slice.active_ms).sum::<i64>(), 1);
+    assert_eq!(slices.iter().map(|slice| slice.passive_ms).sum::<i64>(), 1);
+    assert_eq!(slices.iter().map(|slice| slice.idle_ms).sum::<i64>(), 1);
+}
+
+#[test]
+fn complementary_clips_telescope_each_presence_dimension() {
+    let event = event(0, 1, 1, 1);
+
+    let left = event.clone().clip(0, 1).expect("left clip");
+    let right = event.clone().clip(1, 3).expect("right clip");
+
+    assert_eq!(left.active_ms + right.active_ms, event.active_ms);
+    assert_eq!(left.passive_ms + right.passive_ms, event.passive_ms);
+    assert_eq!(left.idle_ms + right.idle_ms, event.idle_ms);
 }

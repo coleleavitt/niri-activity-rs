@@ -17,6 +17,7 @@ pub(super) struct EventInterval {
     pub(super) source_start_ms: i64,
     pub(super) start_ms: i64,
     pub(super) app_id: String,
+    pub(super) title: String,
     pub(super) category: Category,
     pub(super) project: Option<String>,
     pub(super) active_ms: i64,
@@ -77,33 +78,19 @@ impl EventInterval {
         let total_ms = self.total_ms();
         let start_offset = slice_start_ms.saturating_sub(self.start_ms);
         let end_offset = slice_end_ms.saturating_sub(self.start_ms);
-        let slice_total = end_offset.saturating_sub(start_offset);
-        let non_idle = self.active_ms.saturating_add(self.passive_ms);
-        let slice_non_idle = proportional_between(non_idle, start_offset, end_offset, total_ms)
-            .clamp(0, slice_total);
-        let slice_active = if non_idle > 0 {
-            i64::try_from(
-                (i128::from(self.active_ms.max(0)) * i128::from(slice_non_idle))
-                    / i128::from(non_idle),
-            )
-            .unwrap_or(i64::MAX)
-        } else {
-            0
-        };
-
         Self {
             source_start_ms: self.source_start_ms,
             start_ms: slice_start_ms,
             app_id: self.app_id.clone(),
+            title: self.title.clone(),
             category: self.category,
             project: self.project.clone(),
-            active_ms: slice_active,
-            passive_ms: slice_non_idle.saturating_sub(slice_active),
-            idle_ms: slice_total.saturating_sub(slice_non_idle),
-            agent_ms: self.agent_ms.map(|agent_ms| {
-                proportional_between(agent_ms, start_offset, end_offset, total_ms)
-                    .clamp(0, slice_total)
-            }),
+            active_ms: proportional_between(self.active_ms, start_offset, end_offset, total_ms),
+            passive_ms: proportional_between(self.passive_ms, start_offset, end_offset, total_ms),
+            idle_ms: proportional_between(self.idle_ms, start_offset, end_offset, total_ms),
+            agent_ms: self
+                .agent_ms
+                .map(|agent_ms| proportional_between(agent_ms, start_offset, end_offset, total_ms)),
             keystrokes: proportional_between(self.keystrokes, start_offset, end_offset, total_ms),
             mouse_clicks: proportional_between(
                 self.mouse_clicks,
@@ -141,14 +128,14 @@ pub(super) fn load_overlapping(
     }
 
     let mut stmt = conn.prepare(
-        "SELECT id, timestamp, app_id, category, active_ms, COALESCE(passive_ms,0), idle_ms,
+        "SELECT id, timestamp, app_id, COALESCE(title,''), category, active_ms, COALESCE(passive_ms,0), idle_ms,
                 agent_ms, keystrokes, mouse_clicks, scroll_events, mouse_distance,
                 jiggler_detected, project, backspace_count, modifier_count, left_clicks,
                 right_clicks, middle_clicks, scroll_up, scroll_down, scroll_horizontal
            FROM events
           WHERE timestamp >= ?1 AND timestamp < ?2
          UNION ALL
-         SELECT id, timestamp, app_id, category, active_ms, COALESCE(passive_ms,0), idle_ms,
+         SELECT id, timestamp, app_id, COALESCE(title,''), category, active_ms, COALESCE(passive_ms,0), idle_ms,
                 agent_ms, keystrokes, mouse_clicks, scroll_events, mouse_distance,
                 jiggler_detected, project, backspace_count, modifier_count, left_clicks,
                 right_clicks, middle_clicks, scroll_up, scroll_down, scroll_horizontal
@@ -167,17 +154,17 @@ pub(super) fn load_overlapping(
             row.get::<_, String>(1)?,
             row.get::<_, Option<String>>(2)?.unwrap_or_default(),
             row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
+            row.get::<_, String>(4)?,
             row.get::<_, i64>(5)?,
             row.get::<_, i64>(6)?,
-            row.get::<_, Option<i64>>(7)?,
-            row.get::<_, i64>(8)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, Option<i64>>(8)?,
             row.get::<_, i64>(9)?,
             row.get::<_, i64>(10)?,
             row.get::<_, i64>(11)?,
-            row.get::<_, i64>(12)? != 0,
-            row.get::<_, Option<String>>(13)?,
-            row.get::<_, i64>(14)?,
+            row.get::<_, i64>(12)?,
+            row.get::<_, i64>(13)? != 0,
+            row.get::<_, Option<String>>(14)?,
             row.get::<_, i64>(15)?,
             row.get::<_, i64>(16)?,
             row.get::<_, i64>(17)?,
@@ -185,6 +172,7 @@ pub(super) fn load_overlapping(
             row.get::<_, i64>(19)?,
             row.get::<_, i64>(20)?,
             row.get::<_, i64>(21)?,
+            row.get::<_, i64>(22)?,
         ))
     })?;
 
@@ -193,6 +181,7 @@ pub(super) fn load_overlapping(
         let (
             timestamp,
             app_id,
+            title,
             category,
             active_ms,
             passive_ms,
@@ -218,6 +207,7 @@ pub(super) fn load_overlapping(
             source_start_ms,
             start_ms: source_start_ms,
             app_id,
+            title,
             category: Category::from_str(&category).unwrap_or(Category::Neutral),
             project,
             active_ms: active_ms.max(0),

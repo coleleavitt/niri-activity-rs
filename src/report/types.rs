@@ -260,6 +260,9 @@ pub struct ProjectBreakdown {
     pub active_ms: i64,
     pub keys: i64,
     pub clicks: i64,
+    pub productive_ms: i64,
+    pub neutral_ms: i64,
+    pub unproductive_ms: i64,
 }
 
 #[derive(Serialize)]

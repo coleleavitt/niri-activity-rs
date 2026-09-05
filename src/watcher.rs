@@ -23,7 +23,7 @@ use crate::fmt::{cat_colored, cat_label, fmt_duration_compact, truncate};
 use crate::input::{InputSnapshot, start_idle_monitor};
 use crate::logind::start_logind_monitor;
 use crate::project;
-use crate::scheduler::check_scheduled_reports;
+use crate::scheduler::{Scheduler, check_scheduled_reports};
 
 // Duration constants
 const FLUSH_INTERVAL_SECS: u64 = 300; // 5 minutes
@@ -54,11 +54,13 @@ fn reclassify_false_active(
     if *active_ms > 0
         && input.keystrokes == 0
         && input.mouse_clicks == 0
+        && input.scroll_events == 0
+        && input.qualifying_mouse_movements == 0
         && u64::try_from(*active_ms).is_ok_and(|ms| ms >= input_active_ms)
     {
         if !quiet {
             tracing::debug!(
-                "{} Reclassifying {}ms active → passive (0 keystrokes, 0 clicks)",
+                "{} Reclassifying {}ms active → passive (no qualifying input)",
                 "[INPUT]".yellow().bold(),
                 *active_ms,
             );
@@ -213,7 +215,10 @@ impl WatchState {
             input_baseline_ms,
             session_start_mono_ms,
             logind_warned: false,
-            input_offsets: Vec::new(),
+            // The watcher deliberately starts a fresh session as Active.
+            // Persist that decision so report reconstruction has a defensible
+            // presence point even when the first real input arrives later.
+            input_offsets: vec![0],
             last_seen_input_ms: input_baseline_ms,
             last_heartbeat_value: 0,
             last_heartbeat_check: now_instant,
@@ -253,6 +258,7 @@ impl WatchState {
         self.session_start_mono_ms = session_mono;
         self.last_seen_input_ms = input_baseline;
         self.input_offsets.clear();
+        self.input_offsets.push(0);
     }
 
     /// Begin a new persisted event segment without changing human-presence
@@ -294,12 +300,17 @@ fn handle_shutdown(
     state: &mut WatchState,
     flush_ctx: &FlushContext<'_>,
     input_stats: &crate::input::InputStats,
+    agent_monitor: &mut AgentMonitor,
+    monitor_start: Instant,
+    now_instant: Instant,
 ) -> Result<bool, Error> {
     if !shutdown.load(Ordering::SeqCst) {
         return Ok(false);
     }
 
     tracing::info!("Shutdown signal received, flushing current session...");
+    let agent_active = detect_agent_activity(state, input_stats, agent_monitor, monitor_start);
+    charge_boundary_elapsed(state, now_instant, agent_active);
     let info = state
         .focused_id
         .and_then(|id| state.windows.get(&id))
@@ -340,6 +351,7 @@ fn handle_suspend_resume(
     logind: &crate::logind::LogindMonitor,
     flush_ctx: &FlushContext<'_>,
     input_stats: &crate::input::InputStats,
+    agent_monitor: &mut AgentMonitor,
     monitor_start: Instant,
     now_instant: Instant,
     quiet: bool,
@@ -381,6 +393,9 @@ fn handle_suspend_resume(
         tracing::info!("{} {}", "[SUSPEND]".blue().bold(), label);
     }
 
+    let agent_active = detect_agent_activity(state, input_stats, agent_monitor, monitor_start);
+    charge_boundary_elapsed(state, now_instant, agent_active);
+
     let has_data = state.accumulated_active_ms > 0
         || state.accumulated_passive_ms > 0
         || state.accumulated_idle_ms > 0;
@@ -421,19 +436,26 @@ fn handle_lock_unlock(
     logind: &crate::logind::LogindMonitor,
     flush_ctx: &FlushContext<'_>,
     input_stats: &crate::input::InputStats,
+    agent_monitor: &mut AgentMonitor,
     monitor_start: Instant,
     now_instant: Instant,
     quiet: bool,
 ) -> Result<bool, Error> {
     let locked_now = logind.is_locked();
 
-    if !state.logind_warned && logind.has_thread_error() {
-        tracing::warn!("logind listener thread died, lock/suspend detection may be degraded");
+    let logind_degraded = logind.is_degraded();
+    if logind_degraded && !state.logind_warned {
+        tracing::warn!("logind lock monitoring degraded; fail-closed locked state is active");
         state.logind_warned = true;
+    } else if !logind_degraded && state.logind_warned {
+        tracing::info!("logind lock monitoring recovered");
+        state.logind_warned = false;
     }
 
     // Transition: unlocked → locked
     if locked_now && !state.is_locked {
+        let agent_active = detect_agent_activity(state, input_stats, agent_monitor, monitor_start);
+        charge_boundary_elapsed(state, now_instant, agent_active);
         let info = state
             .focused_id
             .and_then(|id| state.windows.get(&id))
@@ -450,9 +472,11 @@ fn handle_lock_unlock(
                 jiggler,
                 FlushReset::NoReset,
             )?;
-            // Zero accumulators after flush to prevent double-counting
-            state.reset_accumulators();
         }
+        // End the pre-lock segment even when there is no focused window.
+        // The boundary interval has already been charged, and carrying it
+        // through unlock would either replay or misattribute it.
+        state.reset_accumulators();
         state.is_locked = true;
         state.current_state = ActivityState::Locked;
         if !quiet {
@@ -567,6 +591,7 @@ fn handle_idle_transitions(
             input_stats,
             now_instant,
             idle_duration_ms,
+            agent_active,
             quiet,
         )?;
     }
@@ -621,8 +646,10 @@ fn handle_enter_away(
     input_stats: &crate::input::InputStats,
     now_instant: Instant,
     idle_duration_ms: u64,
+    agent_active: bool,
     quiet: bool,
 ) -> Result<(), Error> {
+    charge_boundary_elapsed(state, now_instant, agent_active);
     let info = state
         .focused_id
         .and_then(|id| state.windows.get(&id))
@@ -668,6 +695,29 @@ fn handle_exit_away(
         );
     }
     state.resume_after_away(now_instant, input_stats.last_activity_ms(), now_ms);
+}
+
+fn detect_agent_activity(
+    state: &WatchState,
+    input_stats: &crate::input::InputStats,
+    agent_monitor: &mut AgentMonitor,
+    monitor_start: Instant,
+) -> bool {
+    let now_ms = millis_u64(monitor_start.elapsed());
+    let idle_duration_ms = now_ms.saturating_sub(input_stats.last_activity_ms());
+    let focused_title = state
+        .focused_id
+        .and_then(|id| state.windows.get(&id))
+        .map(|info| info.title.as_str());
+    agent_monitor.is_active(idle_duration_ms, focused_title)
+}
+
+/// Close the monotonic accounting interval immediately before a boundary
+/// flush/reset. Updating `last_idle_check` makes subsequent maintenance in the
+/// same loop iteration a zero-length interval, so the boundary is conserved
+/// exactly once.
+fn charge_boundary_elapsed(state: &mut WatchState, now_instant: Instant, agent_active: bool) {
+    accumulate_state_time(state, now_instant, agent_active);
 }
 
 fn accumulate_state_time(state: &mut WatchState, now_instant: Instant, agent_active: bool) {
@@ -804,6 +854,7 @@ fn handle_windows_changed(
             state.session_start_mono_ms = millis_u64(ctx.monitor_start.elapsed());
             state.last_seen_input_ms = state.input_baseline_ms;
             state.input_offsets.clear();
+            state.input_offsets.push(0);
         }
     }
 
@@ -870,21 +921,38 @@ fn classify_metadata_change(state: &WatchState, id: u64, next: &WindowInfo) -> M
     }
 }
 
-/// Decide whether a metadata change should trigger a session flush now.
-/// App changes always flush. Title-only changes are debounced so animated
-/// titles cannot flush every tick.
-fn should_flush_metadata_change(
+/// Action to take after receiving updated metadata for a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataChangeDecision {
+    CacheOnly,
+    RolloverApp,
+    RolloverTitle,
+}
+
+/// Decide whether updated metadata ends the current session.
+///
+/// Title changes while locked or away only update the window cache because no
+/// live session exists to roll over. Active title changes remain debounced.
+fn decide_metadata_change(
+    state: &WatchState,
     change: MetadataChange,
     now_instant: Instant,
-    last_title_flush: Instant,
-) -> bool {
+) -> MetadataChangeDecision {
     match change {
-        MetadataChange::None => false,
-        MetadataChange::AppChanged => true,
-        MetadataChange::TitleChanged => {
-            now_instant.duration_since(last_title_flush)
-                >= Duration::from_secs(TITLE_FLUSH_DEBOUNCE_SECS)
+        MetadataChange::None => MetadataChangeDecision::CacheOnly,
+        MetadataChange::AppChanged => MetadataChangeDecision::RolloverApp,
+        MetadataChange::TitleChanged
+            if state.is_locked || state.current_state == ActivityState::Away =>
+        {
+            MetadataChangeDecision::CacheOnly
         }
+        MetadataChange::TitleChanged
+            if now_instant.duration_since(state.last_title_flush)
+                < Duration::from_secs(TITLE_FLUSH_DEBOUNCE_SECS) =>
+        {
+            MetadataChangeDecision::CacheOnly
+        }
+        MetadataChange::TitleChanged => MetadataChangeDecision::RolloverTitle,
     }
 }
 
@@ -973,6 +1041,7 @@ fn handle_focus_changed(
     state.session_start_mono_ms = millis_u64(ctx.monitor_start.elapsed());
     state.last_seen_input_ms = state.input_baseline_ms;
     state.input_offsets.clear();
+    state.input_offsets.push(0);
 
     Ok(())
 }
@@ -1082,8 +1151,28 @@ fn flush_on_disconnect(
 /// stale.
 const PWD_FILE_FRESHNESS_SECS: u64 = 30;
 
+/// App IDs whose focused window can safely consume the global shell-hook state.
+const TERMINAL_APP_IDS: &[&str] = &[
+    "Alacritty",
+    "kitty",
+    "foot",
+    "org.wezfurlong.wezterm",
+    "wezterm",
+    "alacritty",
+    "org.codeberg.dnkl.foot",
+];
+
+fn is_terminal_app(app_id: &str) -> bool {
+    TERMINAL_APP_IDS.contains(&app_id)
+}
+
+fn terminal_fallback<T>(app_id: &str, fallback: impl FnOnce() -> Option<T>) -> Option<T> {
+    is_terminal_app(app_id).then(fallback).flatten()
+}
+
 /// Detect the current project by checking /proc/PID/cwd first, then the shell
-/// pwd file, then window title parsing. Applies project aliases from config.
+/// pwd file for terminals, then window title parsing. Applies project aliases
+/// from config.
 fn detect_project(config: &Config, app_id: &str, title: &str, pid: Option<i32>) -> Option<String> {
     // 1. Try /proc/PID/cwd (most reliable — no shell hook needed, always
     //    current)
@@ -1091,28 +1180,33 @@ fn detect_project(config: &Config, app_id: &str, title: &str, pid: Option<i32>) 
         return Some(apply_alias(config, project));
     }
 
-    // 2. Try reading the pwd file written by shell hooks
-    if let Some(project) = pwd_file_project() {
+    // 2. Only terminals may consume process-global shell-hook state. It has no
+    // association with browser or IDE windows and could otherwise leak the
+    // most recent terminal project into an unrelated event.
+    if let Some(project) = terminal_fallback(app_id, pwd_file_project) {
         return Some(apply_alias(config, project));
     }
 
     // 3. Title-based detection (terminal patterns)
-    if let Some(name) = project::detect_project_from_title(title) {
-        // OC sessions and compound names always pass through
-        if name.contains(':') || name.contains(' ') {
+    if is_terminal_app(app_id) {
+        if let Some(name) = project::detect_project_from_title(title) {
+            // OC sessions and compound names always pass through
+            if name.contains(':') || name.contains(' ') {
+                return Some(apply_alias(config, name));
+            }
+            // Simple basenames: try to validate via search_dirs if configured
+            if !config.project_search_dirs.is_empty() {
+                if let Some(resolved) =
+                    project::resolve_project_in_search_dirs(&name, &config.project_search_dirs)
+                {
+                    return Some(apply_alias(config, resolved));
+                }
+            }
+            // Accept the name — it came from detect_project_from_path (full
+            // path titles) or is a legitimate basename from a shell
+            // prompt
             return Some(apply_alias(config, name));
         }
-        // Simple basenames: try to validate via search_dirs if configured
-        if !config.project_search_dirs.is_empty() {
-            if let Some(resolved) =
-                project::resolve_project_in_search_dirs(&name, &config.project_search_dirs)
-            {
-                return Some(apply_alias(config, resolved));
-            }
-        }
-        // Accept the name — it came from detect_project_from_path (full path
-        // titles) or is a legitimate basename from a shell prompt
-        return Some(apply_alias(config, name));
     }
 
     // 4. Try app-specific title parsing (IDEs, editors)
@@ -1191,7 +1285,7 @@ fn pwd_file_project() -> Option<String> {
 
 /// Detect the git branch from the shell hook's pwd file path.
 /// Uses the same pwd file as project detection for consistency.
-fn detect_branch_from_pwd(pid: Option<i32>) -> Option<String> {
+fn detect_branch_from_pwd(app_id: &str, pid: Option<i32>) -> Option<String> {
     // 1. Try /proc/PID/cwd first
     if let Some(pid) = pid {
         let leaf = find_leaf_child(pid);
@@ -1202,7 +1296,8 @@ fn detect_branch_from_pwd(pid: Option<i32>) -> Option<String> {
         }
     }
 
-    // 2. Fall back to pwd file
+    // 2. Fall back to global shell state only for a terminal window.
+    terminal_fallback(app_id, || Some(()))?;
     let data_dir = get_data_dir().ok()?;
     let pwd_path = data_dir.join("current_pwd");
 
@@ -1248,7 +1343,7 @@ fn flush_session(
         );
 
         let detected_project = detect_project(ctx.config, &info.app_id, &info.title, info.pid);
-        let git_branch = detect_branch_from_pwd(info.pid);
+        let git_branch = detect_branch_from_pwd(&info.app_id, info.pid);
 
         insert_event(
             ctx.conn,
@@ -1299,6 +1394,7 @@ fn flush_session(
             *accum.session_start_mono_ms = new_session_mono_ms;
             *accum.last_seen_input_ms = new_baseline_ms;
             accum.input_offsets.clear();
+            accum.input_offsets.push(0);
         }
     }
 
@@ -1356,12 +1452,16 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         reclassify_all(&mut conn, &config)?;
         match crate::db::heal_missing_agent_ms(&mut conn) {
             Ok(0) => {}
-            Ok(n) => println!("Agent time reconstructed for {n} unmeasured events"),
+            Ok(n) => println!("Agent-time measurement settled for {n} unmeasured events"),
             // Healing is a repair, not a prerequisite: a corrupt agent log
             // must not stop the watcher from recording activity.
             Err(e) => tracing::warn!("Could not reconstruct agent time: {e}"),
         }
     }
+
+    // Report generation and SMTP live on a dedicated bounded worker. The
+    // watcher only performs non-blocking queue pokes.
+    let mut scheduler = Scheduler::start(quiet)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
@@ -1446,11 +1546,19 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     loop {
         let _linkscope_watch_loop = linkscope::phase("watch.loop");
         linkscope::record_items("watch.loop", 1);
-        if handle_shutdown(&shutdown, &mut state, &flush_ctx, &input_stats)? {
+        let now_instant = Instant::now();
+        if handle_shutdown(
+            &shutdown,
+            &mut state,
+            &flush_ctx,
+            &input_stats,
+            &mut agent_monitor,
+            monitor_start,
+            now_instant,
+        )? {
+            scheduler.shutdown();
             return Ok(());
         }
-
-        let now_instant = Instant::now();
 
         {
             let _linkscope_watch_maintenance = linkscope::phase("watch.maintenance");
@@ -1459,6 +1567,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 &logind,
                 &flush_ctx,
                 &input_stats,
+                &mut agent_monitor,
                 monitor_start,
                 now_instant,
                 quiet,
@@ -1471,6 +1580,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 &logind,
                 &flush_ctx,
                 &input_stats,
+                &mut agent_monitor,
                 monitor_start,
                 now_instant,
                 quiet,
@@ -1493,7 +1603,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 >= Duration::from_secs(FLUSH_INTERVAL_SECS)
             {
                 state.last_schedule_check = now_instant;
-                check_scheduled_reports(&conn, &config, quiet);
+                check_scheduled_reports(&scheduler, &config);
             }
         }
 
@@ -1549,16 +1659,14 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
                 let _linkscope_event = linkscope::phase("watch.event.window_changed");
                 let info = WindowInfo::from(&window);
                 let change = classify_metadata_change(&state, window.id, &info);
-                if should_flush_metadata_change(change, now_instant, state.last_title_flush) {
-                    match change {
-                        MetadataChange::AppChanged => {
-                            handle_focus_changed(&mut state, &mut niri_ctx, Some(window.id))?;
-                        }
-                        MetadataChange::TitleChanged => {
-                            handle_title_changed(&mut state, &mut niri_ctx)?;
-                            state.last_title_flush = now_instant;
-                        }
-                        MetadataChange::None => {}
+                match decide_metadata_change(&state, change, now_instant) {
+                    MetadataChangeDecision::CacheOnly => {}
+                    MetadataChangeDecision::RolloverApp => {
+                        handle_focus_changed(&mut state, &mut niri_ctx, Some(window.id))?;
+                    }
+                    MetadataChangeDecision::RolloverTitle => {
+                        handle_title_changed(&mut state, &mut niri_ctx)?;
+                        state.last_title_flush = now_instant;
                     }
                 }
                 state.windows.insert(window.id, info);
@@ -1579,6 +1687,64 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn false_active_snapshot() -> InputSnapshot {
+        InputSnapshot::default()
+    }
+
+    fn reclassified_with(input: InputSnapshot) -> (i64, i64) {
+        let mut active_ms = 1_000;
+        let mut passive_ms = 0;
+        reclassify_false_active(&mut active_ms, &mut passive_ms, &input, 1_000, true);
+        (active_ms, passive_ms)
+    }
+
+    #[test]
+    fn scroll_only_input_is_not_reclassified_as_passive() {
+        let mut input = false_active_snapshot();
+        input.scroll_events = 1;
+        assert_eq!(reclassified_with(input), (1_000, 0));
+    }
+
+    #[test]
+    fn qualifying_mouse_motion_is_not_reclassified_as_passive() {
+        let mut input = false_active_snapshot();
+        input.qualifying_mouse_movements = 1;
+        input.mouse_distance = 50;
+        assert_eq!(reclassified_with(input), (1_000, 0));
+    }
+
+    #[test]
+    fn sub_threshold_mouse_noise_is_reclassified_as_passive() {
+        let mut input = false_active_snapshot();
+        input.mouse_distance = 1;
+        assert_eq!(reclassified_with(input), (0, 1_000));
+    }
+
+    #[test]
+    fn global_shell_fallback_is_terminal_only() {
+        let project = Some("niri-activity-rs".to_string());
+        assert_eq!(terminal_fallback("foot", || project.clone()), project);
+        assert_eq!(terminal_fallback("kitty", || project.clone()), project);
+        assert_eq!(terminal_fallback("zen", || project.clone()), None);
+        assert_eq!(terminal_fallback("code", || project.clone()), None);
+        assert_eq!(terminal_fallback("jetbrains-rustrover", || project), None);
+    }
+
+    #[test]
+    fn ide_title_detection_remains_independent_of_shell_fallback() {
+        assert_eq!(
+            terminal_fallback("code", || Some("wrong-shell-project".to_string())),
+            None
+        );
+        assert_eq!(
+            project::detect_project_from_app_title(
+                "code",
+                "watcher.rs - niri-activity-rs - Visual Studio Code",
+            ),
+            Some("niri-activity-rs".to_string())
+        );
+    }
 
     fn thresholds() -> IdleThresholds {
         IdleThresholds {
@@ -1615,6 +1781,20 @@ mod tests {
             compute_activity_state(3_600_000, true, &thresholds()),
             ActivityState::Away
         );
+    }
+
+    #[test]
+    fn startup_and_true_session_reset_persist_presence_anchor() {
+        let mut state = WatchState::new(100, 0);
+        assert_eq!(state.input_offsets, vec![0]);
+
+        state.input_offsets.push(60_000);
+        state.reset_session(Instant::now(), 60_100, 60_000);
+
+        assert_eq!(state.input_baseline_ms, 60_100);
+        assert_eq!(state.session_start_mono_ms, 60_000);
+        assert_eq!(state.last_seen_input_ms, 60_100);
+        assert_eq!(state.input_offsets, vec![0]);
     }
 
     #[test]
@@ -1692,6 +1872,77 @@ mod tests {
             .expect("instant predates process start");
         accumulate_state_time(&mut state, Instant::now(), agent_active);
         state
+    }
+
+    fn boundary_state(current: ActivityState) -> (WatchState, Instant) {
+        let boundary = Instant::now();
+        let mut state = WatchState::new(0, 0);
+        state.current_state = current;
+        state.last_idle_check = boundary
+            .checked_sub(Duration::from_millis(1_250))
+            .expect("instant predates process start");
+        (state, boundary)
+    }
+
+    fn assert_boundary_charge(current: ActivityState, expected: (i64, i64, i64), agent: bool) {
+        let (mut state, boundary) = boundary_state(current);
+        charge_boundary_elapsed(&mut state, boundary, agent);
+        assert_eq!(
+            (
+                state.accumulated_active_ms,
+                state.accumulated_passive_ms,
+                state.accumulated_idle_ms
+            ),
+            expected,
+        );
+        assert_eq!(state.accumulated_agent_ms, i64::from(agent) * 1_250);
+        assert_eq!(state.last_idle_check, boundary);
+
+        accumulate_state_time(&mut state, boundary, agent);
+        assert_eq!(
+            state.accumulated_active_ms + state.accumulated_passive_ms + state.accumulated_idle_ms,
+            1_250,
+        );
+        assert_eq!(state.accumulated_agent_ms, i64::from(agent) * 1_250);
+    }
+
+    #[test]
+    fn lock_boundary_charges_pre_lock_state_once() {
+        assert_boundary_charge(ActivityState::Active, (1_250, 0, 0), true);
+    }
+
+    #[test]
+    fn suspend_boundary_charges_pre_suspend_state_once() {
+        assert_boundary_charge(ActivityState::Passive, (0, 1_250, 0), false);
+    }
+
+    #[test]
+    fn enter_away_boundary_charges_pre_away_state_once() {
+        assert_boundary_charge(ActivityState::Idle, (0, 0, 1_250), true);
+    }
+
+    #[test]
+    fn shutdown_boundary_charges_pre_shutdown_state_once() {
+        assert_boundary_charge(ActivityState::Active, (1_250, 0, 0), false);
+    }
+
+    #[test]
+    fn boundary_reset_conserves_elapsed_time_without_resume_replay() {
+        let (mut state, boundary) = boundary_state(ActivityState::Passive);
+        state.accumulated_active_ms = 500;
+        charge_boundary_elapsed(&mut state, boundary, true);
+        let persisted_human_ms =
+            state.accumulated_active_ms + state.accumulated_passive_ms + state.accumulated_idle_ms;
+        let persisted_agent_ms = state.accumulated_agent_ms;
+        assert_eq!((persisted_human_ms, persisted_agent_ms), (1_750, 1_250));
+
+        state.reset_session(boundary, 10_000, 10_000);
+        accumulate_state_time(&mut state, boundary, true);
+        assert_eq!(
+            state.accumulated_active_ms + state.accumulated_passive_ms + state.accumulated_idle_ms,
+            0,
+        );
+        assert_eq!(state.accumulated_agent_ms, 0);
     }
 
     #[test]
@@ -1775,36 +2026,115 @@ mod tests {
         );
     }
 
+    fn title_change_state(current_state: ActivityState) -> WatchState {
+        let mut state = WatchState::new(0, 0);
+        state.focused_id = Some(7);
+        state.current_state = current_state;
+        state.windows.insert(
+            7,
+            WindowInfo {
+                app_id: "zen".to_string(),
+                title: "Before".to_string(),
+                pid: Some(10),
+            },
+        );
+        state
+    }
+
+    fn changed_title() -> WindowInfo {
+        WindowInfo {
+            app_id: "zen".to_string(),
+            title: "After".to_string(),
+            pid: Some(10),
+        }
+    }
+
     #[test]
-    fn app_change_always_flushes_but_title_change_is_debounced() {
-        let now = Instant::now();
-        // App switches always flush, regardless of timing.
-        assert!(should_flush_metadata_change(
-            MetadataChange::AppChanged,
-            now,
-            now
-        ));
-        // A title change right after the previous title flush is suppressed
-        // (this is what stops the spinner-title flush storm).
-        assert!(!should_flush_metadata_change(
-            MetadataChange::TitleChanged,
-            now,
-            now
-        ));
-        // A title change after the debounce window is honored.
-        let later = now
-            .checked_add(Duration::from_secs(TITLE_FLUSH_DEBOUNCE_SECS + 1))
-            .expect("instant math");
-        assert!(should_flush_metadata_change(
-            MetadataChange::TitleChanged,
-            later,
-            now
-        ));
-        // No metadata change never flushes.
-        assert!(!should_flush_metadata_change(
-            MetadataChange::None,
-            later,
-            now
-        ));
+    fn title_change_while_away_updates_cache_without_rollover() {
+        let mut state = title_change_state(ActivityState::Away);
+        let previous_flush = state.last_title_flush;
+        let now = previous_flush + Duration::from_secs(TITLE_FLUSH_DEBOUNCE_SECS + 1);
+        let next = changed_title();
+        let change = classify_metadata_change(&state, 7, &next);
+
+        assert_eq!(
+            decide_metadata_change(&state, change, now),
+            MetadataChangeDecision::CacheOnly
+        );
+        state.windows.insert(7, next);
+        assert_eq!(state.windows[&7].title, "After");
+        assert_eq!(state.last_title_flush, previous_flush);
+    }
+
+    #[test]
+    fn title_change_while_locked_updates_cache_without_rollover() {
+        let mut state = title_change_state(ActivityState::Active);
+        state.is_locked = true;
+        let previous_flush = state.last_title_flush;
+        let now = previous_flush + Duration::from_secs(TITLE_FLUSH_DEBOUNCE_SECS + 1);
+        let next = changed_title();
+        let change = classify_metadata_change(&state, 7, &next);
+
+        assert_eq!(
+            decide_metadata_change(&state, change, now),
+            MetadataChangeDecision::CacheOnly
+        );
+        state.windows.insert(7, next);
+        assert_eq!(state.windows[&7].title, "After");
+        assert_eq!(state.last_title_flush, previous_flush);
+    }
+
+    #[test]
+    fn title_change_debounce_does_not_advance_last_flush() {
+        let state = title_change_state(ActivityState::Active);
+        let previous_flush = state.last_title_flush;
+        let change = classify_metadata_change(&state, 7, &changed_title());
+
+        assert_eq!(
+            decide_metadata_change(&state, change, previous_flush),
+            MetadataChangeDecision::CacheOnly
+        );
+        assert_eq!(state.last_title_flush, previous_flush);
+    }
+
+    #[test]
+    fn cached_away_title_does_not_roll_over_on_resume_but_next_title_does() {
+        let mut state = title_change_state(ActivityState::Away);
+        let previous_flush = state.last_title_flush;
+        let now = previous_flush + Duration::from_secs(TITLE_FLUSH_DEBOUNCE_SECS + 1);
+        let away_title = changed_title();
+        let change = classify_metadata_change(&state, 7, &away_title);
+        assert_eq!(
+            decide_metadata_change(&state, change, now),
+            MetadataChangeDecision::CacheOnly
+        );
+        state.windows.insert(7, away_title.clone());
+
+        state.current_state = ActivityState::Active;
+        let unchanged = classify_metadata_change(&state, 7, &away_title);
+        assert_eq!(
+            decide_metadata_change(&state, unchanged, now),
+            MetadataChangeDecision::CacheOnly
+        );
+
+        let after_resume = WindowInfo {
+            title: "After resume".to_string(),
+            ..away_title
+        };
+        let changed = classify_metadata_change(&state, 7, &after_resume);
+        assert_eq!(
+            decide_metadata_change(&state, changed, now),
+            MetadataChangeDecision::RolloverTitle
+        );
+        assert_eq!(state.last_title_flush, previous_flush);
+    }
+
+    #[test]
+    fn app_change_always_rolls_over() {
+        let state = title_change_state(ActivityState::Active);
+        assert_eq!(
+            decide_metadata_change(&state, MetadataChange::AppChanged, state.last_title_flush),
+            MetadataChangeDecision::RolloverApp
+        );
     }
 }

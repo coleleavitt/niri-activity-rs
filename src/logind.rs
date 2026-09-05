@@ -1,6 +1,7 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use logind_zbus::manager::ManagerProxyBlocking;
 use logind_zbus::session::SessionProxyBlocking;
@@ -18,16 +19,15 @@ use crate::error::Error;
 /// Pattern matches `start_idle_monitor()` in `input.rs` — background threads
 /// with atomics, no locks.
 pub struct LogindMonitor {
-    is_locked: Arc<AtomicBool>,
+    lock_state: Arc<AtomicU8>,
     suspend_resumed: Arc<AtomicBool>,
-    /// Tracks if any listener thread has died unexpectedly
-    thread_error: Arc<AtomicBool>,
+    sleep_degraded: Arc<AtomicBool>,
 }
 
 impl LogindMonitor {
     /// Read the current lock state. Non-blocking (atomic load).
     pub fn is_locked(&self) -> bool {
-        self.is_locked.load(Ordering::Acquire)
+        self.lock_state.load(Ordering::Acquire) != LOCK_STATE_HEALTHY_UNLOCKED
     }
 
     /// Check and clear the suspend-resumed flag. Returns `true` exactly once
@@ -36,10 +36,11 @@ impl LogindMonitor {
         self.suspend_resumed.swap(false, Ordering::AcqRel)
     }
 
-    /// Check if any listener thread has died. If true, logind monitoring may be
-    /// degraded.
-    pub fn has_thread_error(&self) -> bool {
-        self.thread_error.load(Ordering::Acquire)
+    /// Whether lock monitoring is currently fail-closed due to an unavailable
+    /// or unreadable logind stream.
+    pub fn is_degraded(&self) -> bool {
+        self.lock_state.load(Ordering::Acquire) == LOCK_STATE_DEGRADED
+            || self.sleep_degraded.load(Ordering::Acquire)
     }
 }
 
@@ -85,215 +86,244 @@ fn find_user_session_path(
     Ok(sessions[0].path().clone())
 }
 
-/// Start the logind D-Bus monitor. Spawns background threads for:
-/// 1. Lock signal → sets `is_locked = true`
-/// 2. Unlock signal → sets `is_locked = false`
-/// 3. PrepareForSleep signal → sets `suspend_resumed = true` on resume
-///
-/// Also reads the initial `LockedHint` property so we start in the correct
-/// state.
-/// Start D-Bus monitor for screen lock/unlock and suspend/resume events.
-pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
-    let connection = Connection::system().map_err(|_| Error::LogindConnectionFailed)?;
+/// Maximum delay between attempts to restore a failed logind listener.
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+const LOCK_STATE_DEGRADED: u8 = 0;
+const LOCK_STATE_HEALTHY_LOCKED: u8 = 1;
+const LOCK_STATE_HEALTHY_UNLOCKED: u8 = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockMonitorEvent {
+    Observed(bool),
+    Failed,
+}
+
+/// Apply one ordered lock-monitor event.
+///
+/// Only the lock listener calls this in production. A failure is itself an
+/// authoritative fail-closed update: consumers must never keep using the last
+/// observed unlocked value while monitoring is degraded.
+fn apply_lock_event(event: LockMonitorEvent, lock_state: &AtomicU8) {
+    let state = match event {
+        LockMonitorEvent::Observed(true) => LOCK_STATE_HEALTHY_LOCKED,
+        LockMonitorEvent::Observed(false) => LOCK_STATE_HEALTHY_UNLOCKED,
+        LockMonitorEvent::Failed => LOCK_STATE_DEGRADED,
+    };
+    lock_state.store(state, Ordering::Release);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReconnectBackoff {
+    next: Duration,
+}
+
+impl ReconnectBackoff {
+    const fn new() -> Self {
+        Self {
+            next: Duration::from_secs(1),
+        }
+    }
+
+    fn take(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.saturating_mul(2).min(RECONNECT_MAX_DELAY);
+        delay
+    }
+
+    const fn reset(&mut self) {
+        self.next = Duration::from_secs(1);
+    }
+}
+
+/// Run one lock-listener connection until its stream ends or an update fails.
+///
+/// Subscribing before the initial read closes the startup/reconnect window: a
+/// transition is either reflected by the read or queued in the ordered stream.
+fn listen_for_locked_hint(lock_state: &AtomicU8) -> Result<(), Error> {
+    let connection = Connection::system()
+        .map_err(|e| Error::Logind(format!("failed to connect lock-state listener: {e}")))?;
     let manager = ManagerProxyBlocking::new(&connection)
         .map_err(|e| Error::Logind(format!("failed to create manager proxy: {e}")))?;
-
     let session_path = find_user_session_path(&manager)?;
-
-    // Build session proxy to read initial state
     let session = SessionProxyBlocking::builder(&connection)
-        .path(session_path.clone())
+        .path(session_path)
         .map_err(|e| Error::Logind(format!("invalid session path: {e}")))?
         .build()
         .map_err(|e| Error::Logind(format!("failed to build session proxy: {e}")))?;
 
-    // Read initial LockedHint so we don't miss a lock that happened before we
-    // started
-    let initial_locked = session.locked_hint().unwrap_or_else(|e| {
-        tracing::warn!("failed to read initial LockedHint: {e}, assuming unlocked");
-        false
-    });
+    let mut changes = session.receive_locked_hint_changed();
+    let locked = session
+        .locked_hint()
+        .map_err(|e| Error::Logind(format!("failed to read LockedHint: {e}")))?;
+    apply_lock_event(LockMonitorEvent::Observed(locked), lock_state);
 
-    let is_locked = Arc::new(AtomicBool::new(initial_locked));
-    let suspend_resumed = Arc::new(AtomicBool::new(false));
-    let thread_error = Arc::new(AtomicBool::new(false));
-
-    if initial_locked {
-        tracing::info!("Session already locked at startup");
+    for change in &mut changes {
+        let locked = change
+            .get()
+            .map_err(|e| Error::Logind(format!("failed to read changed LockedHint: {e}")))?;
+        apply_lock_event(LockMonitorEvent::Observed(locked), lock_state);
+        tracing::debug!(locked, "LockedHint changed");
     }
 
-    tracing::info!(
-        "Monitoring session {} (locked={})",
-        session_path.as_str(),
-        initial_locked,
-    );
+    Err(Error::Logind(
+        "LockedHint signal stream ended unexpectedly".to_owned(),
+    ))
+}
 
-    // Thread 1: Lock signal → is_locked = true
+fn run_lock_listener(lock_state: &AtomicU8) -> ! {
+    let mut backoff = ReconnectBackoff::new();
+    loop {
+        match listen_for_locked_hint(lock_state) {
+            Ok(()) => unreachable!("lock listener always reports an ended stream as an error"),
+            Err(error) => {
+                let was_healthy = lock_state.load(Ordering::Acquire) != LOCK_STATE_DEGRADED;
+                apply_lock_event(LockMonitorEvent::Failed, lock_state);
+                if was_healthy {
+                    backoff.reset();
+                }
+                let delay = backoff.take();
+                tracing::warn!(
+                    %error,
+                    retry_delay_secs = delay.as_secs(),
+                    "logind lock monitoring degraded; publishing locked and reconnecting"
+                );
+                thread::sleep(delay);
+            }
+        }
+    }
+}
+
+fn listen_for_sleep(
+    suspend_resumed: &AtomicBool,
+    sleep_degraded: &AtomicBool,
+) -> Result<(), Error> {
+    let connection = Connection::system()
+        .map_err(|e| Error::Logind(format!("failed to connect sleep listener: {e}")))?;
+    let manager = ManagerProxyBlocking::new(&connection)
+        .map_err(|e| Error::Logind(format!("failed to create sleep manager proxy: {e}")))?;
+    let signals = manager
+        .receive_prepare_for_sleep()
+        .map_err(|e| Error::Logind(format!("failed to subscribe to PrepareForSleep: {e}")))?;
+    sleep_degraded.store(false, Ordering::Release);
+
+    for signal in signals {
+        let args = signal
+            .args()
+            .map_err(|e| Error::Logind(format!("failed to parse PrepareForSleep args: {e}")))?;
+        if args.start {
+            tracing::debug!("PrepareForSleep: suspending");
+        } else {
+            suspend_resumed.store(true, Ordering::Release);
+            tracing::debug!("PrepareForSleep: resumed");
+        }
+    }
+
+    Err(Error::Logind(
+        "PrepareForSleep signal stream ended unexpectedly".to_owned(),
+    ))
+}
+
+fn run_sleep_listener(suspend_resumed: &AtomicBool, sleep_degraded: &AtomicBool) -> ! {
+    let mut backoff = ReconnectBackoff::new();
+    loop {
+        if let Err(error) = listen_for_sleep(suspend_resumed, sleep_degraded) {
+            let was_healthy = !sleep_degraded.swap(true, Ordering::AcqRel);
+            if was_healthy {
+                backoff.reset();
+            }
+            let delay = backoff.take();
+            tracing::warn!(
+                %error,
+                retry_delay_secs = delay.as_secs(),
+                "logind sleep monitoring degraded; reconnecting"
+            );
+            thread::sleep(delay);
+        }
+    }
+}
+
+/// Start the logind D-Bus monitor.
+///
+/// Lock state starts fail-closed. The background listener is the sole ordered
+/// writer and only publishes unlocked after it has subscribed and completed a
+/// fresh `LockedHint` read. Connection, proxy, read, and stream failures all
+/// publish locked and retry forever with bounded exponential backoff.
+pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
+    let lock_state = Arc::new(AtomicU8::new(LOCK_STATE_DEGRADED));
+    let suspend_resumed = Arc::new(AtomicBool::new(false));
+    let sleep_degraded = Arc::new(AtomicBool::new(true));
+
     {
-        let is_locked = Arc::clone(&is_locked);
-        let thread_error = Arc::clone(&thread_error);
-        let connection = Connection::system().map_err(|e| {
-            Error::Logind(format!(
-                "failed to connect to system bus (lock thread): {e}"
-            ))
-        })?;
-        let session_path = session_path.clone();
-
+        let lock_state = Arc::clone(&lock_state);
         thread::Builder::new()
             .name("logind-lock".into())
-            .spawn(move || {
-                let session = match SessionProxyBlocking::builder(&connection)
-                    .path(session_path)
-                    .and_then(zbus::blocking::proxy::Builder::build)
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!("Lock listener failed to build proxy: {e}");
-                        thread_error.store(true, Ordering::Release);
-                        return;
-                    }
-                };
-
-                match session.receive_lock() {
-                    Ok(mut signals) => {
-                        if session.locked_hint().unwrap_or(false) {
-                            is_locked.store(true, Ordering::Release);
-                        }
-                        let mut iterations: u64 = 0;
-                        while signals.next().is_some() {
-                            iterations = iterations.saturating_add(1);
-                            if iterations == u64::MAX {
-                                tracing::warn!("Lock signal loop reached iteration limit");
-                                break;
-                            }
-                            is_locked.store(true, Ordering::Release);
-                            tracing::debug!("Lock signal received");
-                        }
-                        tracing::warn!("Lock signal iterator ended unexpectedly");
-                        thread_error.store(true, Ordering::Release);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to subscribe to Lock signal: {e}");
-                        thread_error.store(true, Ordering::Release);
-                    }
-                }
-            })
-            .map_err(|e| Error::Logind(format!("failed to spawn lock thread: {e}")))?;
+            .spawn(move || run_lock_listener(&lock_state))
+            .map_err(|e| Error::Logind(format!("failed to spawn lock-state thread: {e}")))?;
     }
 
-    // Thread 2: Unlock signal → is_locked = false
-    {
-        let is_locked = Arc::clone(&is_locked);
-        let thread_error = Arc::clone(&thread_error);
-        let connection = Connection::system().map_err(|e| {
-            Error::Logind(format!(
-                "failed to connect to system bus (unlock thread): {e}"
-            ))
-        })?;
-        thread::Builder::new()
-            .name("logind-unlock".into())
-            .spawn(move || {
-                let session = match SessionProxyBlocking::builder(&connection)
-                    .path(session_path)
-                    .and_then(zbus::blocking::proxy::Builder::build)
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!("Unlock listener failed to build proxy: {e}");
-                        thread_error.store(true, Ordering::Release);
-                        return;
-                    }
-                };
-
-                match session.receive_unlock() {
-                    Ok(mut signals) => {
-                        if !session.locked_hint().unwrap_or(true) {
-                            is_locked.store(false, Ordering::Release);
-                        }
-                        let mut iterations: u64 = 0;
-                        while signals.next().is_some() {
-                            iterations = iterations.saturating_add(1);
-                            if iterations == u64::MAX {
-                                tracing::warn!("Unlock signal loop reached iteration limit");
-                                break;
-                            }
-                            is_locked.store(false, Ordering::Release);
-                            tracing::debug!("Unlock signal received");
-                        }
-                        tracing::warn!("Unlock signal iterator ended unexpectedly");
-                        thread_error.store(true, Ordering::Release);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to subscribe to Unlock signal: {e}");
-                        thread_error.store(true, Ordering::Release);
-                    }
-                }
-            })
-            .map_err(|e| Error::Logind(format!("failed to spawn unlock thread: {e}")))?;
-    }
-
-    // Thread 3: PrepareForSleep signal → set suspend_resumed on resume
-    // (start=false)
     {
         let suspend_resumed = Arc::clone(&suspend_resumed);
-        let thread_error = Arc::clone(&thread_error);
-        let connection = Connection::system().map_err(|e| {
-            Error::Logind(format!(
-                "failed to connect to system bus (sleep thread): {e}"
-            ))
-        })?;
-
+        let sleep_degraded = Arc::clone(&sleep_degraded);
         thread::Builder::new()
             .name("logind-sleep".into())
-            .spawn(move || {
-                let manager = match ManagerProxyBlocking::new(&connection) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::warn!("Sleep listener failed to build proxy: {e}");
-                        thread_error.store(true, Ordering::Release);
-                        return;
-                    }
-                };
-
-                match manager.receive_prepare_for_sleep() {
-                    Ok(signals) => {
-                        let mut iterations: u64 = 0;
-                        for signal in signals {
-                            iterations = iterations.saturating_add(1);
-                            if iterations == u64::MAX {
-                                tracing::warn!("Sleep signal loop reached iteration limit");
-                                break;
-                            }
-                            match signal.args() {
-                                Ok(args) => {
-                                    if args.start {
-                                        tracing::debug!("PrepareForSleep: suspending");
-                                    } else {
-                                        suspend_resumed.store(true, Ordering::Release);
-                                        tracing::debug!("PrepareForSleep: resumed");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to parse PrepareForSleep args: {e}");
-                                }
-                            }
-                        }
-                        tracing::warn!("Sleep signal iterator ended unexpectedly");
-                        thread_error.store(true, Ordering::Release);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to subscribe to PrepareForSleep signal: {e}");
-                        thread_error.store(true, Ordering::Release);
-                    }
-                }
-            })
+            .spawn(move || run_sleep_listener(&suspend_resumed, &sleep_degraded))
             .map_err(|e| Error::Logind(format!("failed to spawn sleep thread: {e}")))?;
     }
 
     Ok(LogindMonitor {
-        is_locked,
+        lock_state,
         suspend_resumed,
-        thread_error,
+        sleep_degraded,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_state_is_fail_closed_and_degraded() {
+        let monitor = LogindMonitor {
+            lock_state: Arc::new(AtomicU8::new(LOCK_STATE_DEGRADED)),
+            suspend_resumed: Arc::new(AtomicBool::new(false)),
+            sleep_degraded: Arc::new(AtomicBool::new(true)),
+        };
+
+        assert!(monitor.is_locked());
+        assert!(monitor.is_degraded());
+    }
+
+    #[test]
+    fn successful_read_publishes_observation_and_health() {
+        let state = AtomicU8::new(LOCK_STATE_DEGRADED);
+        apply_lock_event(LockMonitorEvent::Observed(false), &state);
+
+        assert_eq!(state.load(Ordering::Acquire), LOCK_STATE_HEALTHY_UNLOCKED);
+    }
+
+    #[test]
+    fn failure_atomically_overrides_stale_unlocked_state() {
+        let state = AtomicU8::new(LOCK_STATE_HEALTHY_UNLOCKED);
+        apply_lock_event(LockMonitorEvent::Failed, &state);
+
+        assert_eq!(state.load(Ordering::Acquire), LOCK_STATE_DEGRADED);
+    }
+
+    #[test]
+    fn reconnect_observation_recovers_from_degraded_state() {
+        let state = AtomicU8::new(LOCK_STATE_DEGRADED);
+        apply_lock_event(LockMonitorEvent::Observed(false), &state);
+
+        assert_eq!(state.load(Ordering::Acquire), LOCK_STATE_HEALTHY_UNLOCKED);
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded_and_resettable() {
+        let mut backoff = ReconnectBackoff::new();
+        let delays: Vec<_> = (0..7).map(|_| backoff.take()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs));
+
+        backoff.reset();
+        assert_eq!(backoff.take(), Duration::from_secs(1));
+    }
 }

@@ -66,18 +66,68 @@ fn bucket(unix_secs: i64) -> i64 {
 }
 
 /// Parse an RFC 3339 timestamp to a Unix second.
-///
-/// Hand-rolled rather than pulled from a date library: the only shape these
-/// logs emit is `YYYY-MM-DDTHH:MM:SS`, and the fractional part and zone suffix
-/// are both discardable at minute resolution.
-fn parse_rfc3339(s: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339(s: &str) -> Option<i64> {
     let bytes = s.as_bytes();
-    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
         return None;
     }
     let num = |from: usize, to: usize| s.get(from..to)?.parse::<i64>().ok();
     let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (hour, min, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&month) || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+    let leap = year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if day < 1 || day > month_days[usize::try_from(month - 1).ok()?] {
+        return None;
+    }
+
+    let mut zone = 19;
+    if bytes.get(zone) == Some(&b'.') {
+        zone += 1;
+        let fraction_start = zone;
+        while bytes.get(zone).is_some_and(u8::is_ascii_digit) {
+            zone += 1;
+        }
+        if zone == fraction_start {
+            return None;
+        }
+    }
+    let offset = match bytes.get(zone) {
+        Some(b'Z') if zone + 1 == bytes.len() => 0,
+        Some(sign @ (b'+' | b'-'))
+            if zone + 6 == bytes.len() && bytes.get(zone + 3) == Some(&b':') =>
+        {
+            let hours = s.get(zone + 1..zone + 3)?.parse::<i64>().ok()?;
+            let minutes = s.get(zone + 4..zone + 6)?.parse::<i64>().ok()?;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let seconds = hours * 3_600 + minutes * 60;
+            if *sign == b'+' { seconds } else { -seconds }
+        }
+        _ => return None,
+    };
 
     // Days from the civil epoch, per Howard Hinnant's algorithm.
     let y = if month <= 2 { year - 1 } else { year };
@@ -88,7 +138,7 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
 
-    Some(days * 86_400 + hour * 3_600 + min * 60 + sec)
+    Some(days * 86_400 + hour * 3_600 + min * 60 + sec - offset)
 }
 
 /// Extract the first RFC 3339 timestamp from a `"timestamp":"..."` field.
@@ -154,28 +204,41 @@ const OPENCODE_STEP_TIMES: &str = "\
       AND json_extract(data,'$.type') = 'step-finish'";
 
 fn scan_opencode(since: i64, until: i64, busy: &mut BusyMinutes) {
-    let Some(path) = detect::resolve("~/.local/share/opencode/opencode*.db")
-        .into_iter()
-        .find(|p| p.exists())
-    else {
-        return;
-    };
-    let Ok(conn) = rusqlite::Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
-        return;
-    };
-    let _ = conn.busy_timeout(std::time::Duration::ZERO);
+    scan_opencode_paths(
+        detect::resolve("~/.local/share/opencode/opencode*.db"),
+        since,
+        until,
+        busy,
+    );
+}
 
-    let Ok(mut stmt) = conn.prepare(OPENCODE_STEP_TIMES) else {
-        return;
-    };
-    let Ok(rows) = stmt.query_map([since * 1000, until * 1000], |row| row.get::<_, i64>(0)) else {
-        return;
-    };
-    for secs in rows.flatten() {
-        busy.insert(secs);
+fn scan_opencode_paths(
+    paths: impl IntoIterator<Item = PathBuf>,
+    since: i64,
+    until: i64,
+    busy: &mut BusyMinutes,
+) {
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            continue;
+        };
+        let _ = conn.busy_timeout(std::time::Duration::ZERO);
+        let Ok(mut stmt) = conn.prepare(OPENCODE_STEP_TIMES) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map([since * 1000, until * 1000], |row| row.get::<_, i64>(0))
+        else {
+            continue;
+        };
+        for secs in rows.flatten() {
+            busy.insert(secs);
+        }
     }
 }
 
@@ -226,6 +289,17 @@ mod tests {
             parse_rfc3339("2026-01-01T00:00:01+00:00"),
             Some(1_767_225_601)
         );
+        assert_eq!(
+            parse_rfc3339("2026-01-01T01:00:00+01:00"),
+            Some(1_767_225_600)
+        );
+        assert_eq!(
+            parse_rfc3339("2025-12-31T23:30:00-01:00"),
+            Some(1_767_227_400)
+        );
+        assert_eq!(parse_rfc3339("2026-01-01T00:00:00"), None);
+        assert_eq!(parse_rfc3339("2026-01-01T00:00:00+24:00"), None);
+        assert_eq!(parse_rfc3339("2026-02-30T00:00:00Z"), None);
         assert_eq!(parse_rfc3339("not a date"), None);
         assert_eq!(parse_rfc3339("2026-01-01"), None);
     }
@@ -282,6 +356,31 @@ mod tests {
         let start = 1_767_225_600 * 1000;
         // Spans three minutes, of which the first and third are busy.
         assert_eq!(busy.overlap_ms(start, start + 180_000), 120_000);
+    }
+
+    fn create_opencode(path: &Path, seconds: i64) {
+        let conn = rusqlite::Connection::open(path).expect("open");
+        conn.execute("CREATE TABLE part (time_updated INTEGER, data TEXT)", [])
+            .expect("schema");
+        conn.execute(
+            r#"INSERT INTO part VALUES (?1, '{"type":"step-finish"}')"#,
+            [seconds * 1000],
+        )
+        .expect("insert");
+    }
+
+    #[test]
+    fn opencode_history_aggregates_every_matching_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("one.db");
+        let second = dir.path().join("two.db");
+        create_opencode(&first, 1_767_225_600);
+        create_opencode(&second, 1_767_225_720);
+        let mut busy = BusyMinutes::default();
+        scan_opencode_paths([first, second], 1_767_225_500, 1_767_225_800, &mut busy);
+        assert_eq!(busy.len(), 2);
+        assert!(busy.contains(1_767_225_600));
+        assert!(busy.contains(1_767_225_720));
     }
 
     #[test]
