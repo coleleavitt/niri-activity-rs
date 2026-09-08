@@ -1,6 +1,22 @@
+use std::io::{self, Write};
+
 use owo_colors::OwoColorize;
 
 use crate::config::Category;
+
+/// Write a human-facing status line without letting a detached or stale output
+/// stream abort background work.
+///
+/// Rust's `println!` panics when stdout returns an error. The watcher can
+/// outlive the terminal that launched it, so report scheduling must treat
+/// status output as best-effort rather than part of delivery success.
+pub fn status_line(arguments: std::fmt::Arguments<'_>) {
+    write_status_line(io::stdout().lock(), arguments);
+}
+
+fn write_status_line(mut writer: impl Write, arguments: std::fmt::Arguments<'_>) {
+    let _ = writeln!(writer, "{arguments}");
+}
 
 // Time constants (milliseconds)
 const MS_PER_HOUR: i64 = 3_600_000;
@@ -226,7 +242,26 @@ pub fn section_header(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apportion_bar, colored_bar};
+    use std::io;
+
+    use super::{apportion_bar, colored_bar, write_status_line};
+
+    struct BrokenWriter;
+
+    impl io::Write for BrokenWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        }
+    }
+
+    #[test]
+    fn status_output_failure_does_not_panic() {
+        write_status_line(BrokenWriter, format_args!("report sent"));
+    }
 
     fn visible_width(rendered: &str) -> usize {
         let mut in_escape = false;

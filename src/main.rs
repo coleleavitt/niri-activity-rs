@@ -16,7 +16,7 @@ mod theme;
 mod tui;
 mod watcher;
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -162,6 +162,29 @@ fn email_time_range(
         parse_time_range(days.unwrap_or(7), time).map(Some)
     } else {
         Ok(None)
+    }
+}
+
+fn email_period_name(range: &report::TimeRange) -> &'static str {
+    match range {
+        report::TimeRange::Yesterday | report::TimeRange::Days(0) => "Daily",
+        report::TimeRange::LastWeek | report::TimeRange::ThisWeek => "Weekly",
+        report::TimeRange::LastMonth | report::TimeRange::ThisMonth => "Monthly",
+        report::TimeRange::DateRange(start, end)
+            if start.weekday() == chrono::Weekday::Sat
+                && *end == *start + chrono::Duration::days(6) =>
+        {
+            "Weekly"
+        }
+        report::TimeRange::DateRange(start, end)
+            if start.day() == 1
+                && end
+                    .succ_opt()
+                    .is_some_and(|next| next.day() == 1 && next.month() != start.month()) =>
+        {
+            "Monthly"
+        }
+        _ => "Activity",
     }
 }
 
@@ -517,13 +540,8 @@ fn main() {
                 let cfg = config::load_config()?;
                 email::test_email_config(&cfg)?;
             } else if let Some(range) = email_time_range(days, &time)? {
-                let period_name = if let (Some(from), Some(to)) = (&time.from, &time.to) {
-                    format!("Custom ({} to {})", from, to)
-                } else {
-                    "Custom".to_string()
-                };
-                report::App::open()
-                    .and_then(|app| email::send_report(&app, range, &period_name))?;
+                let period_name = email_period_name(&range);
+                report::App::open().and_then(|app| email::send_report(&app, range, period_name))?;
             } else if weekly {
                 report::App::open().and_then(|app| email::send_weekly_report(&app))?;
             } else if monthly {
@@ -598,6 +616,33 @@ mod tests {
                 "selector did not dispatch a range: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_saturday_through_friday_email_range_is_weekly() {
+        let (days, time, _, _) = parse_email(&["--from", "2026-08-29", "--to", "2026-09-04"]);
+        let range = email_time_range(days, &time)
+            .expect("valid range")
+            .expect("selected range");
+        assert_eq!(email_period_name(&range), "Weekly");
+    }
+
+    #[test]
+    fn explicit_full_calendar_month_email_range_is_monthly() {
+        let (days, time, _, _) = parse_email(&["--from", "2026-08-01", "--to", "2026-08-31"]);
+        let range = email_time_range(days, &time)
+            .expect("valid range")
+            .expect("selected range");
+        assert_eq!(email_period_name(&range), "Monthly");
+    }
+
+    #[test]
+    fn arbitrary_email_range_uses_neutral_activity_label() {
+        let (days, time, _, _) = parse_email(&["--from", "2026-08-30", "--to", "2026-09-04"]);
+        let range = email_time_range(days, &time)
+            .expect("valid range")
+            .expect("selected range");
+        assert_eq!(email_period_name(&range), "Activity");
     }
 
     #[test]

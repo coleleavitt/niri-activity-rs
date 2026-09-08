@@ -309,7 +309,7 @@ fn run_worker_once(db_path: &PathBuf, quiet: bool, stop: &AtomicBool) -> Result<
         if !quiet {
             tracing::info!("[SCHEDULER] Sending {label}");
         }
-        match send_report(job.start, job.end, &label) {
+        match send_report(job.start, job.end, capitalize(job.period_type).as_str()) {
             Ok(()) => finalize_sent(&mut conn, &job, &owner, Utc::now())?,
             Err(error) => {
                 record_failure(&conn, &job, &owner, &error)?;

@@ -59,23 +59,7 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
         .map_err(|e| Error::NiriError(format!("Failed to read generated XLSX: {}", e)))?;
     drop(temp_file); // Explicitly remove the temp file
 
-    // Sanitize subject line: strip newlines to prevent header injection
-    let raw_subject = if email_config.report_name.is_empty() {
-        format!(
-            "{} {}: {} to {}",
-            email_config.subject_prefix, period_name, bounds.start_date, bounds.end_date
-        )
-    } else {
-        format!(
-            "{} {}: {} ({} to {})",
-            email_config.subject_prefix,
-            email_config.report_name,
-            period_name,
-            bounds.start_date,
-            bounds.end_date
-        )
-    };
-    let subject = raw_subject.replace(['\n', '\r'], " ");
+    let subject = report_subject(email_config, &bounds, period_name);
 
     let html_body = build_html_summary(&bounds, period_name);
     let text_body = build_text_summary(&bounds, period_name);
@@ -137,7 +121,7 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
     let cc_count = email_config.cc_addresses.len();
     let total_recipients = to_count + cc_count;
 
-    println!(
+    crate::fmt::status_line(format_args!(
         "Successfully sent {} report ({} to {}) to {} recipient(s){}{}",
         period_name,
         bounds.start_date,
@@ -163,9 +147,28 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
         } else {
             String::new()
         },
-    );
+    ));
 
     Ok(())
+}
+
+fn report_subject(email: &Email, bounds: &report::TimeBounds, period_name: &str) -> String {
+    let raw_subject = if email.report_name.is_empty() {
+        format!(
+            "{} {}: {} to {}",
+            email.subject_prefix, period_name, bounds.start_date, bounds.end_date
+        )
+    } else {
+        format!(
+            "{} {}: {} ({} to {})",
+            email.subject_prefix,
+            email.report_name,
+            period_name,
+            bounds.start_date,
+            bounds.end_date
+        )
+    };
+    raw_subject.replace(['\n', '\r'], " ")
 }
 
 fn build_mailer(config: &Email) -> Result<SmtpTransport, Error> {
@@ -299,13 +302,13 @@ pub fn test_email_config(config: &Config) -> Result<(), Error> {
         .send(&test_email)
         .map_err(|e| Error::NiriError(format!("Failed to send test email: {}", e)))?;
 
-    println!(
+    crate::fmt::status_line(format_args!(
         "Test email sent successfully to {}",
         email_config
             .to_addresses
             .first()
             .map_or_else(|| "<none>".to_string(), |e| mask_email_for_log(e))
-    );
+    ));
 
     Ok(())
 }
@@ -324,4 +327,60 @@ pub fn secure_config_permissions(config_path: &Path) -> Result<(), Error> {
         println!("Set {} permissions to 600", config_path.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::NaiveDate;
+
+    use super::report_subject;
+    use crate::config::Email;
+    use crate::report::TimeBounds;
+
+    #[test]
+    fn weekly_subject_matches_the_scheduled_email_default() {
+        let email: Email = toml::from_str(
+            r#"
+            subject_prefix = "[Activity Report]"
+            report_name = "Cole Leavitt"
+            "#,
+        )
+        .expect("email config");
+        let start = NaiveDate::from_ymd_opt(2026, 8, 29).expect("date");
+        let end = NaiveDate::from_ymd_opt(2026, 9, 4).expect("date");
+        let bounds = TimeBounds {
+            since_utc: String::new(),
+            until_utc: None,
+            since_str: String::new(),
+            now_str: String::new(),
+            start_date: start,
+            end_date: end,
+        };
+
+        assert_eq!(
+            report_subject(&email, &bounds, "Weekly"),
+            "[Activity Report] Cole Leavitt: Weekly (2026-08-29 to 2026-09-04)"
+        );
+    }
+
+    #[test]
+    fn subject_header_characters_are_sanitized() {
+        let email: Email = toml::from_str(
+            r#"subject_prefix = "[Activity\nReport]"
+report_name = "Cole\rLeavitt""#,
+        )
+        .expect("email config");
+        let date = NaiveDate::from_ymd_opt(2026, 9, 4).expect("date");
+        let bounds = TimeBounds {
+            since_utc: String::new(),
+            until_utc: None,
+            since_str: String::new(),
+            now_str: String::new(),
+            start_date: date,
+            end_date: date,
+        };
+
+        let subject = report_subject(&email, &bounds, "Daily\nInjected");
+        assert!(!subject.contains(['\n', '\r']));
+    }
 }

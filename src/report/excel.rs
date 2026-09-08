@@ -730,7 +730,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     // ── Save ────────────────────────────────────────────────────────────
     workbook.save(path).map_err(xlsx_err)?;
 
-    println!("Exported to {path}");
+    crate::fmt::status_line(format_args!("Exported to {path}"));
     Ok(())
 }
 
