@@ -841,8 +841,12 @@ fn query_gaps(
 
     let mut stmt = conn.prepare(
         "SELECT timestamp,
-                active_ms + COALESCE(passive_ms, 0) + idle_ms AS total_ms,
-                input_offsets, keystrokes, mouse_clicks, scroll_events
+                CAST(ROUND(active_ms + COALESCE(passive_ms, 0) + idle_ms) AS INTEGER)
+                    AS total_ms,
+                input_offsets,
+                CAST(ROUND(keystrokes) AS INTEGER),
+                CAST(ROUND(mouse_clicks) AS INTEGER),
+                CAST(ROUND(scroll_events) AS INTEGER)
            FROM events
           WHERE timestamp >= ?1 AND timestamp < ?2
           ORDER BY timestamp, id",
@@ -1664,6 +1668,32 @@ mod tests {
         let mut app = create_test_app();
         app.config.timezone = Some(chrono_tz::UTC);
         app
+    }
+
+    #[test]
+    fn gap_query_accepts_fractional_reconstructed_rows() {
+        let app = create_utc_test_app();
+        app.conn
+            .execute(
+                "INSERT INTO events (
+                     timestamp, app_id, title, category, active_ms, passive_ms, idle_ms,
+                     keystrokes, mouse_clicks, scroll_events
+                 ) VALUES (
+                     '2026-09-05T10:00:00+00:00', 'prime-agent-reconstructed', '',
+                     'productive', 0.4, 0.4, 0.4, 18.4, 0.4, 0.4
+                 )",
+                [],
+            )
+            .expect("fractional event");
+
+        query_gaps(
+            &app.conn,
+            &app.config,
+            "2026-09-05T00:00:00+00:00",
+            "2026-09-06T00:00:00+00:00",
+            &app.config.sleep,
+        )
+        .expect("fractional counters and duration must be normalized");
     }
 
     // ==================== classify_gap tests ====================

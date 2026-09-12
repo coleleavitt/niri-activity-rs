@@ -64,6 +64,49 @@ fn minute_slices_conserve_duration_and_counters() {
 }
 
 #[test]
+fn loader_rounds_fractional_durations_without_changing_total_span() {
+    let mut conn = Connection::open_in_memory().expect("database");
+    init_db(&conn).expect("schema");
+    run_migrations(&mut conn, &Config::default()).expect("migrations");
+    conn.execute_batch(
+        "INSERT INTO events (
+             timestamp, app_id, title, category, active_ms, passive_ms, idle_ms, agent_ms,
+             keystrokes
+         ) VALUES
+             ('2026-09-04T23:59:59.999+00:00', 'prime-agent-reconstructed', '',
+              'productive', 0.6, 0.6, 0.6, 0.6, 18.6),
+             ('2026-09-05T00:00:00.001+00:00', 'prime-agent-reconstructed', '',
+              'productive', 0.4, 0.4, 0.4, 0.6, 18.4);",
+    )
+    .expect("fractional reconstructed events");
+
+    let events = load_overlapping(
+        &conn,
+        "2026-09-05T00:00:00+00:00",
+        "2026-09-06T00:00:00+00:00",
+    )
+    .expect("load fractional durations");
+
+    assert_eq!(events.len(), 2, "the fractional predecessor still overlaps");
+    assert_eq!(
+        events[0].total_ms(),
+        1,
+        "the predecessor is clipped at midnight"
+    );
+    assert_eq!(events[0].active_ms, 1);
+    assert_eq!(events[0].passive_ms, 0);
+    assert_eq!(events[0].idle_ms, 0);
+    assert_eq!(events[0].agent_ms, Some(1));
+    assert_eq!(events[0].keystrokes, 10);
+    assert_eq!(events[1].total_ms(), 1);
+    assert_eq!(events[1].active_ms, 0);
+    assert_eq!(events[1].passive_ms, 1);
+    assert_eq!(events[1].idle_ms, 0);
+    assert_eq!(events[1].agent_ms, Some(1));
+    assert_eq!(events[1].keystrokes, 18);
+}
+
+#[test]
 fn loader_includes_the_single_overlapping_predecessor() {
     let mut conn = Connection::open_in_memory().expect("database");
     init_db(&conn).expect("schema");

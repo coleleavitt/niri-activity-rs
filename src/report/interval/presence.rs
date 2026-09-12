@@ -31,14 +31,22 @@ pub(super) fn apply(
     let mut stmt = conn.prepare(
         "WITH selected AS (
              SELECT id, timestamp,
-                    active_ms + COALESCE(passive_ms, 0) + idle_ms AS total_ms,
-                    input_offsets, keystrokes, mouse_clicks, scroll_events
+                    CAST(ROUND(active_ms + COALESCE(passive_ms, 0) + idle_ms) AS INTEGER)
+                        AS total_ms,
+                    input_offsets,
+                    CAST(ROUND(keystrokes) AS INTEGER) AS keystrokes,
+                    CAST(ROUND(mouse_clicks) AS INTEGER) AS mouse_clicks,
+                    CAST(ROUND(scroll_events) AS INTEGER) AS scroll_events
                FROM events
               WHERE timestamp >= ?1 AND timestamp < ?2
              UNION ALL
              SELECT id, timestamp,
-                    active_ms + COALESCE(passive_ms, 0) + idle_ms AS total_ms,
-                    input_offsets, keystrokes, mouse_clicks, scroll_events
+                    CAST(ROUND(active_ms + COALESCE(passive_ms, 0) + idle_ms) AS INTEGER)
+                        AS total_ms,
+                    input_offsets,
+                    CAST(ROUND(keystrokes) AS INTEGER) AS keystrokes,
+                    CAST(ROUND(mouse_clicks) AS INTEGER) AS mouse_clicks,
+                    CAST(ROUND(scroll_events) AS INTEGER) AS scroll_events
                FROM events
               WHERE id = (
                     SELECT id FROM events
@@ -47,7 +55,8 @@ pub(super) fn apply(
                      LIMIT 1
               )
          )
-         SELECT timestamp, total_ms, input_offsets, keystrokes, mouse_clicks, scroll_events
+         SELECT timestamp, total_ms, input_offsets,
+                keystrokes, mouse_clicks, scroll_events
            FROM selected
           ORDER BY timestamp, id",
     )?;

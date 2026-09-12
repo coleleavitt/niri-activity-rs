@@ -153,17 +153,49 @@ pub(super) fn load_overlapping(
     }
 
     let mut stmt = conn.prepare(
-        "SELECT id, timestamp, app_id, COALESCE(title,''), category, active_ms, COALESCE(passive_ms,0), idle_ms,
-                agent_ms, keystrokes, mouse_clicks, scroll_events, mouse_distance,
-                jiggler_detected, project, backspace_count, modifier_count, left_clicks,
-                right_clicks, middle_clicks, scroll_up, scroll_down, scroll_horizontal
+        "SELECT id, timestamp, app_id, COALESCE(title,''), category,
+                CAST(ROUND(active_ms) AS INTEGER),
+                CAST(ROUND(active_ms + COALESCE(passive_ms,0)) AS INTEGER)
+                    - CAST(ROUND(active_ms) AS INTEGER),
+                CAST(ROUND(active_ms + COALESCE(passive_ms,0) + idle_ms) AS INTEGER)
+                    - CAST(ROUND(active_ms + COALESCE(passive_ms,0)) AS INTEGER),
+                CAST(ROUND(agent_ms) AS INTEGER),
+                CAST(ROUND(keystrokes) AS INTEGER),
+                CAST(ROUND(mouse_clicks) AS INTEGER),
+                CAST(ROUND(scroll_events) AS INTEGER),
+                CAST(ROUND(mouse_distance) AS INTEGER),
+                CAST(ROUND(jiggler_detected) AS INTEGER), project,
+                CAST(ROUND(backspace_count) AS INTEGER),
+                CAST(ROUND(modifier_count) AS INTEGER),
+                CAST(ROUND(left_clicks) AS INTEGER),
+                CAST(ROUND(right_clicks) AS INTEGER),
+                CAST(ROUND(middle_clicks) AS INTEGER),
+                CAST(ROUND(scroll_up) AS INTEGER),
+                CAST(ROUND(scroll_down) AS INTEGER),
+                CAST(ROUND(scroll_horizontal) AS INTEGER)
            FROM events
           WHERE timestamp >= ?1 AND timestamp < ?2
          UNION ALL
-         SELECT id, timestamp, app_id, COALESCE(title,''), category, active_ms, COALESCE(passive_ms,0), idle_ms,
-                agent_ms, keystrokes, mouse_clicks, scroll_events, mouse_distance,
-                jiggler_detected, project, backspace_count, modifier_count, left_clicks,
-                right_clicks, middle_clicks, scroll_up, scroll_down, scroll_horizontal
+         SELECT id, timestamp, app_id, COALESCE(title,''), category,
+                CAST(ROUND(active_ms) AS INTEGER),
+                CAST(ROUND(active_ms + COALESCE(passive_ms,0)) AS INTEGER)
+                    - CAST(ROUND(active_ms) AS INTEGER),
+                CAST(ROUND(active_ms + COALESCE(passive_ms,0) + idle_ms) AS INTEGER)
+                    - CAST(ROUND(active_ms + COALESCE(passive_ms,0)) AS INTEGER),
+                CAST(ROUND(agent_ms) AS INTEGER),
+                CAST(ROUND(keystrokes) AS INTEGER),
+                CAST(ROUND(mouse_clicks) AS INTEGER),
+                CAST(ROUND(scroll_events) AS INTEGER),
+                CAST(ROUND(mouse_distance) AS INTEGER),
+                CAST(ROUND(jiggler_detected) AS INTEGER), project,
+                CAST(ROUND(backspace_count) AS INTEGER),
+                CAST(ROUND(modifier_count) AS INTEGER),
+                CAST(ROUND(left_clicks) AS INTEGER),
+                CAST(ROUND(right_clicks) AS INTEGER),
+                CAST(ROUND(middle_clicks) AS INTEGER),
+                CAST(ROUND(scroll_up) AS INTEGER),
+                CAST(ROUND(scroll_down) AS INTEGER),
+                CAST(ROUND(scroll_horizontal) AS INTEGER)
            FROM events
           WHERE id = (
                 SELECT id FROM events
