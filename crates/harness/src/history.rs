@@ -237,10 +237,23 @@ fn prime_message_timestamp(line: &str) -> Option<i64> {
 }
 
 fn scan_prime_log(path: &Path, since: i64, until: i64, busy: &mut BusyMinutes) {
-    let Ok(file) = fs::File::open(path) else {
-        return;
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => {
+            busy.mark_incomplete();
+            return;
+        }
     };
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for line in BufReader::new(file).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => {
+                busy.mark_incomplete();
+                return;
+            }
+        };
         if let Some(secs) = prime_message_timestamp(&line) {
             if secs >= since && secs < until {
                 busy.insert(secs);
@@ -253,6 +266,22 @@ const MAX_PRIME_HISTORY_ENTRIES: usize = 50_000;
 const MAX_PRIME_HISTORY_FILES: usize = 10_000;
 const MAX_PRIME_HISTORY_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_PRIME_HISTORY_DEPTH: usize = 32;
+
+fn metadata_modified_is_fresh(
+    modified: std::io::Result<std::time::SystemTime>,
+    since: i64,
+) -> Option<bool> {
+    let modified = match modified {
+        Ok(modified) => modified,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    Some(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .is_ok_and(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX) >= since),
+    )
+}
 
 fn bounded_recent_prime_files(
     roots: impl IntoIterator<Item = PathBuf>,
@@ -279,21 +308,31 @@ fn bounded_recent_prime_files_with_limits(
     let mut entries_seen = 0usize;
     let mut stack: Vec<_> = roots.into_iter().map(|root| (root, 0usize)).collect();
     while let Some((current, depth)) = stack.pop() {
-        let Ok(entries) = fs::read_dir(current) else {
-            continue;
+        let entries = match fs::read_dir(current) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
             entries_seen = entries_seen.saturating_add(1);
             if entries_seen > max_entries {
                 return None;
             }
-            let Ok(metadata) = entry.metadata() else {
-                continue;
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
             };
             if metadata.is_dir() {
-                if depth < MAX_PRIME_HISTORY_DEPTH {
-                    stack.push((entry.path(), depth + 1));
+                if depth >= MAX_PRIME_HISTORY_DEPTH {
+                    return None;
                 }
+                stack.push((entry.path(), depth + 1));
                 continue;
             }
             let path = entry.path();
@@ -303,13 +342,7 @@ fn bounded_recent_prime_files_with_limits(
             {
                 continue;
             }
-            let fresh = metadata.modified().is_ok_and(|modified| {
-                modified
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .is_ok_and(|duration| {
-                        i64::try_from(duration.as_secs()).unwrap_or(i64::MAX) >= since
-                    })
-            });
+            let fresh = metadata_modified_is_fresh(metadata.modified(), since)?;
             if !fresh {
                 continue;
             }
@@ -599,6 +632,76 @@ mod tests {
             .is_none(),
             "overflow must not look like a complete empty scan"
         );
+    }
+
+    #[test]
+    fn prime_history_modified_time_errors_fail_closed_except_not_found() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(metadata_modified_is_fresh(Err(missing), 0), Some(false));
+
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(metadata_modified_is_fresh(Err(denied), 0), None);
+    }
+
+    #[test]
+    fn prime_history_missing_optional_roots_remain_complete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut busy = BusyMinutes::default();
+
+        scan_prime_roots(
+            [dir.path().join("missing-sessions")],
+            1_767_225_500,
+            1_767_225_800,
+            &mut busy,
+        );
+
+        assert!(busy.is_complete());
+        assert!(busy.is_empty());
+    }
+
+    #[test]
+    fn prime_history_non_not_found_io_errors_are_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_directory = dir.path().join("sessions");
+        fs::write(&not_a_directory, "not a directory").expect("fixture");
+        let mut busy = BusyMinutes::default();
+
+        scan_prime_roots([not_a_directory], 1_767_225_500, 1_767_225_800, &mut busy);
+
+        assert!(!busy.is_complete());
+    }
+
+    #[test]
+    fn prime_history_transcript_read_errors_are_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("sessions/broken.jsonl");
+        fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
+        fs::write(&transcript, [0xff, b'\n']).expect("fixture");
+        let mut busy = BusyMinutes::default();
+
+        scan_prime_roots([dir.path().join("sessions")], 0, i64::MAX, &mut busy);
+
+        assert!(!busy.is_complete());
+    }
+
+    #[test]
+    fn prime_history_directory_beyond_depth_limit_is_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut deepest = dir.path().join("sessions");
+        for level in 0..=MAX_PRIME_HISTORY_DEPTH {
+            deepest = deepest.join(format!("child-{level}"));
+        }
+        fs::create_dir_all(&deepest).expect("deep tree");
+        let mut busy = BusyMinutes::default();
+
+        scan_prime_roots(
+            [dir.path().join("sessions")],
+            1_767_225_500,
+            1_767_225_800,
+            &mut busy,
+        );
+
+        assert!(!busy.is_complete());
     }
 
     #[test]

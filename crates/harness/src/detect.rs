@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::harness::Signal;
 
@@ -180,18 +180,26 @@ fn consider_dir_files(dir: &Path, consider: &mut impl FnMut(SystemTime)) {
 const PRIME_TRACE_TAIL_BYTES: u64 = 32 * 1024 * 1024;
 
 fn bounded_tail_lines(path: &Path) -> Vec<String> {
+    bounded_tail_lines_with_limit(path, PRIME_TRACE_TAIL_BYTES)
+}
+
+fn bounded_tail_lines_with_limit(path: &Path, max_bytes: u64) -> Vec<String> {
     let Ok(mut file) = fs::File::open(path) else {
         return Vec::new();
     };
     let Ok(len) = file.metadata().map(|metadata| metadata.len()) else {
         return Vec::new();
     };
-    let start = len.saturating_sub(PRIME_TRACE_TAIL_BYTES);
+    let start = len.saturating_sub(max_bytes);
     if file.seek(SeekFrom::Start(start)).is_err() {
         return Vec::new();
     }
+    // Read no farther than the size observed above. The daemon may keep
+    // appending after `metadata()`, so `read_to_end` on the bare file can chase
+    // a moving EOF and defeat the tail bound.
+    let read_len = len - start;
     let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
+    if file.take(read_len).read_to_end(&mut bytes).is_err() {
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&bytes);
@@ -203,11 +211,50 @@ fn bounded_tail_lines(path: &Path) -> Vec<String> {
     lines.map(str::to_owned).collect()
 }
 
+fn prime_timestamp(value: &serde_json::Value) -> Option<(i64, u32)> {
+    let timestamp = value.get("ts")?.as_str()?;
+    let seconds = crate::history::parse_rfc3339(timestamp)?;
+    let Some(fraction) = timestamp
+        .get(19..)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+    else {
+        return Some((seconds, 0));
+    };
+    let digits = fraction.bytes().take_while(u8::is_ascii_digit);
+    let mut nanos = 0_u32;
+    let mut count = 0_u32;
+    for digit in digits.take(9) {
+        nanos = nanos
+            .checked_mul(10)?
+            .checked_add(u32::from(digit - b'0'))?;
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    Some((seconds, nanos.checked_mul(10_u32.pow(9 - count))?))
+}
+
+fn prime_prompt_record(line: &str) -> Option<(serde_json::Value, i64, u32)> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if value.get("component")?.as_str()? != "trace"
+        || value.get("name")?.as_str()? != "agent.prompt"
+        || !matches!(value.get("msg")?.as_str()?, "span_start" | "span_end")
+        || value.get("pid")?.as_u64().is_none()
+        || value.get("traceId")?.as_str()?.is_empty()
+        || value.get("spanId")?.as_str()?.is_empty()
+    {
+        return None;
+    }
+    let (seconds, nanos) = prime_timestamp(&value)?;
+    Some((value, seconds, nanos))
+}
+
 /// Whether the current/previous trace generations contain an open
 /// `agent.prompt` span owned by the same live process that emitted it.
 fn prime_trace_has_open_prompt_with(
     current: &Path,
-    pid_is_live_since: impl Fn(u64, i64) -> bool,
+    pid_is_live_since: impl Fn(u64, i64, u32) -> bool,
 ) -> bool {
     let mut previous = current.as_os_str().to_owned();
     previous.push(".old");
@@ -216,14 +263,9 @@ fn prime_trace_has_open_prompt_with(
 
     let mut decided = HashSet::new();
     for line in lines.into_iter().rev() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+        let Some((value, start_secs, start_nanos)) = prime_prompt_record(&line) else {
             continue;
         };
-        if value.get("component").and_then(|value| value.as_str()) != Some("trace")
-            || value.get("name").and_then(|value| value.as_str()) != Some("agent.prompt")
-        {
-            continue;
-        }
         let Some(pid) = value.get("pid").and_then(|value| value.as_u64()) else {
             continue;
         };
@@ -240,14 +282,7 @@ fn prime_trace_has_open_prompt_with(
         if value.get("msg").and_then(|value| value.as_str()) != Some("span_start") {
             continue;
         }
-        let Some(start_secs) = value
-            .get("ts")
-            .and_then(|value| value.as_str())
-            .and_then(crate::history::parse_rfc3339)
-        else {
-            continue;
-        };
-        if pid_is_live_since(pid, start_secs) {
+        if pid_is_live_since(pid, start_secs, start_nanos) {
             return true;
         }
     }
@@ -255,8 +290,13 @@ fn prime_trace_has_open_prompt_with(
 }
 
 fn prime_trace_has_open_prompt(path: &Path) -> bool {
-    prime_trace_has_open_prompt_with(path, |pid, start_secs| {
-        crate::process::pid_matches_harness_since(pid, crate::Harness::PrimeAgent, start_secs)
+    prime_trace_has_open_prompt_with(path, |pid, start_secs, start_nanos| {
+        crate::process::pid_matches_harness_since(
+            pid,
+            crate::Harness::PrimeAgent,
+            start_secs,
+            start_nanos,
+        )
     })
 }
 
@@ -270,7 +310,21 @@ pub fn signal_active(signal: Signal, window: Duration) -> bool {
     })
 }
 
-/// Most recent write across a signal's paths.
+fn prime_trace_last_activity(current: &Path) -> Option<SystemTime> {
+    let mut previous = current.as_os_str().to_owned();
+    previous.push(".old");
+    bounded_tail_lines(Path::new(&previous))
+        .into_iter()
+        .chain(bounded_tail_lines(current))
+        .filter_map(|line| {
+            let (_, seconds, nanos) = prime_prompt_record(&line)?;
+            let seconds = u64::try_from(seconds).ok()?;
+            UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))
+        })
+        .max()
+}
+
+/// Most recent semantic activity across a signal's paths.
 pub fn signal_last_write(signal: Signal) -> Option<SystemTime> {
     let mut newest: Option<SystemTime> = None;
     let mut consider = |t: SystemTime| {
@@ -282,7 +336,12 @@ pub fn signal_last_write(signal: Signal) -> Option<SystemTime> {
     for path in resolve(signal.path()) {
         match signal {
             Signal::Database(_) => consider_database(&path, &mut consider),
-            Signal::LogFile(_) | Signal::PrimeTrace(_) => consider_file(&path, &mut consider),
+            Signal::LogFile(_) => consider_file(&path, &mut consider),
+            Signal::PrimeTrace(_) => {
+                if let Some(stamp) = prime_trace_last_activity(&path) {
+                    consider(stamp);
+                }
+            }
             Signal::LogDir(_) => consider_dir_files(&path, &mut consider),
         }
     }
@@ -402,7 +461,7 @@ mod tests {
             ),
         )
         .expect("closed trace");
-        assert!(!prime_trace_has_open_prompt_with(&log, |_, _| true));
+        assert!(!prime_trace_has_open_prompt_with(&log, |_, _, _| true));
 
         fs::OpenOptions::new()
             .append(true)
@@ -414,7 +473,7 @@ mod tests {
                 )
             })
             .expect("open trace");
-        assert!(prime_trace_has_open_prompt_with(&log, |_, _| true));
+        assert!(prime_trace_has_open_prompt_with(&log, |_, _, _| true));
     }
 
     #[test]
@@ -428,7 +487,7 @@ mod tests {
         .expect("previous generation");
         fs::write(&log, "").expect("current generation");
 
-        assert!(prime_trace_has_open_prompt_with(&log, |_, _| true));
+        assert!(prime_trace_has_open_prompt_with(&log, |_, _, _| true));
     }
 
     #[test]
@@ -441,7 +500,85 @@ mod tests {
         )
         .expect("stale trace");
 
-        assert!(!prime_trace_has_open_prompt_with(&log, |_, _| false));
+        assert!(!prime_trace_has_open_prompt_with(&log, |_, _, _| false));
+    }
+
+    #[test]
+    fn prime_tail_read_is_capped_at_the_observed_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("agent.jsonl");
+        fs::write(&log, "discarded\nfirst\nsecond\n").expect("trace");
+
+        let lines = bounded_tail_lines_with_limit(&log, 13);
+
+        assert_eq!(lines, ["second"]);
+        assert!(lines.iter().map(String::len).sum::<usize>() <= 13);
+    }
+
+    #[test]
+    fn prime_last_activity_ignores_newer_diagnostics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("agent.jsonl");
+        fs::write(
+            &log,
+            concat!(
+                "{\"pid\":1,\"ts\":\"2026-01-01T00:00:00.123456789Z\",\"component\":\"trace\",\"name\":\"agent.prompt\",\"traceId\":\"a\",\"spanId\":\"b\",\"msg\":\"span_end\"}\n",
+                "{\"ts\":\"2027-01-01T00:00:00Z\",\"component\":\"trace\",\"name\":\"kernel.cell\",\"msg\":\"span_end\"}\n",
+            ),
+        )
+        .expect("trace");
+
+        let activity = prime_trace_last_activity(&log).expect("semantic activity");
+        assert_eq!(
+            activity.duration_since(UNIX_EPOCH).expect("after epoch"),
+            Duration::new(1_767_225_600, 123_456_789),
+        );
+    }
+
+    #[test]
+    fn prime_last_activity_requires_valid_prompt_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("agent.jsonl");
+        fs::write(
+            &log,
+            "{\"ts\":\"2026-01-01T00:00:00Z\",\"component\":\"trace\",\"name\":\"agent.prompt\"\n",
+        )
+        .expect("trace");
+
+        assert_eq!(prime_trace_last_activity(&log), None);
+    }
+
+    #[test]
+    fn prime_last_activity_rejects_missing_or_bogus_span_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("agent.jsonl");
+        fs::write(
+            &log,
+            concat!(
+                "{\"pid\":1,\"ts\":\"2026-01-01T00:00:00Z\",\"component\":\"trace\",\"name\":\"agent.prompt\",\"traceId\":\"a\",\"spanId\":\"b\"}\n",
+                "{\"pid\":1,\"ts\":\"2026-01-01T00:00:01Z\",\"component\":\"trace\",\"name\":\"agent.prompt\",\"traceId\":\"a\",\"spanId\":\"b\",\"msg\":\"diagnostic\"}\n",
+            ),
+        )
+        .expect("trace");
+
+        assert_eq!(prime_trace_last_activity(&log), None);
+    }
+
+    #[test]
+    fn prime_last_activity_requires_complete_span_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("agent.jsonl");
+        fs::write(
+            &log,
+            concat!(
+                "{\"ts\":\"2026-01-01T00:00:00Z\",\"component\":\"trace\",\"name\":\"agent.prompt\",\"traceId\":\"a\",\"spanId\":\"b\",\"msg\":\"span_start\"}\n",
+                "{\"pid\":1,\"ts\":\"2026-01-01T00:00:01Z\",\"component\":\"trace\",\"name\":\"agent.prompt\",\"spanId\":\"b\",\"msg\":\"span_start\"}\n",
+                "{\"pid\":1,\"ts\":\"2026-01-01T00:00:02Z\",\"component\":\"trace\",\"name\":\"agent.prompt\",\"traceId\":\"a\",\"msg\":\"span_end\"}\n",
+            ),
+        )
+        .expect("trace");
+
+        assert_eq!(prime_trace_last_activity(&log), None);
     }
 
     #[test]
@@ -450,10 +587,10 @@ mod tests {
         let log = dir.path().join("agent.jsonl");
         fs::write(
             &log,
-            r#"{"component":"trace","name":"kernel.cell","traceId":"a","spanId":"b","msg":"span_start"}\n"#,
+            "{\"component\":\"trace\",\"name\":\"kernel.cell\",\"traceId\":\"a\",\"spanId\":\"b\",\"msg\":\"span_start\"}\n",
         )
         .expect("trace");
-        assert!(!prime_trace_has_open_prompt_with(&log, |_, _| true));
+        assert!(!prime_trace_has_open_prompt_with(&log, |_, _, _| true));
     }
 
     #[test]

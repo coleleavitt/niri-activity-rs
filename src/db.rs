@@ -515,6 +515,13 @@ fn events_needing_agent_ms(
 /// and are not rescanned on the next startup. Only rows inside the grace window
 /// stay NULL, and those are few.
 pub fn heal_missing_agent_ms(conn: &mut Connection) -> Result<i64, Error> {
+    heal_missing_agent_ms_with(conn, backfill_agent_ms)
+}
+
+fn heal_missing_agent_ms_with(
+    conn: &mut Connection,
+    backfill: impl FnOnce(&mut Connection, i64) -> Result<i64, Error>,
+) -> Result<i64, Error> {
     // Malformed timestamps remain unknown rather than being stamped measured
     // zero. Exclude them from the boundary so they cannot wedge valid rows.
     let oldest: Option<i64> = conn.query_row(
@@ -528,7 +535,7 @@ pub fn heal_missing_agent_ms(conn: &mut Connection) -> Result<i64, Error> {
     let Some(oldest) = oldest else {
         return Ok(0);
     };
-    backfill_agent_ms(conn, oldest)
+    backfill(conn, oldest)
 }
 
 pub fn backfill_agent_ms(conn: &mut Connection, since_secs: i64) -> Result<i64, Error> {
@@ -1314,7 +1321,12 @@ mod tests {
             .timestamp();
         let before = Utc::now().timestamp() - AGENT_HEAL_GRACE_SECS;
         let busy = harness::BusyMinutes::default();
-        let settled = backfill_agent_ms_with_busy(&mut conn, oldest, before, &busy).expect("heal");
+        let mut selected_boundary = None;
+        let settled = heal_missing_agent_ms_with(&mut conn, |conn, since| {
+            selected_boundary = Some(since);
+            backfill_agent_ms_with_busy(conn, since, before, &busy)
+        })
+        .expect("heal");
         let malformed: Option<i64> = conn
             .query_row(
                 "SELECT agent_ms FROM events WHERE timestamp = 'not-a-timestamp'",
@@ -1330,6 +1342,7 @@ mod tests {
             )
             .expect("valid row");
 
+        assert_eq!(selected_boundary, Some(oldest));
         assert_eq!(settled, 1);
         assert_eq!(malformed, None, "malformed input must remain unknown");
         assert!(valid.is_some(), "valid rows still heal");
