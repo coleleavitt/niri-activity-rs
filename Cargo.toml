@@ -25,7 +25,7 @@ libc = "0.2"
 signal-hook = "0.4.3"
 backon = { version = "1", default-features = false, features = ["std-blocking-sleep"] }
 owo-colors = "4.3.0"
-ratatui = { version = "0.30.0", features = ["crossterm"] }
+ratatui = { version = "0.30.2", features = ["crossterm"] }
 crossterm = "0.29"
 regex = "1.12.3"
 rustix = { version = "1", features = ["event"] }
