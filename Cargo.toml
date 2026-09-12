@@ -7,6 +7,7 @@ name = "niri-activity-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 niri-ipc = "=26.4.0"
@@ -31,7 +32,7 @@ rustix = { version = "1", features = ["event"] }
 logind-zbus = "5.3"
 zbus = { version = "5.14.0", default-features = false, features = ["blocking-api"] }
 rust_xlsxwriter = { git = "https://github.com/coleleavitt/rust_xlsxwriter.git", rev = "1970a524c01b54b5cf7d194d8e970f540f3457ad" }
-lettre = "0.11.20"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "hostname", "pool", "ring", "rustls", "rustls-platform-verifier", "smtp-transport"] }
 tempfile = "3.27.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
