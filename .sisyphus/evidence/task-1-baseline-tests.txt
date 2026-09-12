@@ -1,0 +1,26 @@
+TASK 1: Establish Baseline & Release Profile
+==============================================
+
+BASELINE TEST RESULTS
+=====================
+
+Command: cargo test
+Date: 2026-04-02
+
+Test Output:
+running 11 tests
+test config::tests::glob_contains ... ok
+test config::tests::glob_suffix ... ok
+test config::tests::title_rule_substring_default ... ok
+test config::tests::glob_prefix ... ok
+test config::tests::glob_middle ... ok
+test config::tests::classify_glob_fallback ... ok
+test config::tests::glob_exact_match ... ok
+test config::tests::title_rule_regex_case_insensitive ... ok
+test config::tests::classify_exact_before_glob ... ok
+test config::tests::title_rule_regex ... ok
+test config::tests::title_rule_app_scoped_regex ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+VERIFICATION: ✓ All 11 existing tests pass (baseline verified)
