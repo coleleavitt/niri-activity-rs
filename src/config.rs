@@ -1173,7 +1173,7 @@ pub fn load_config() -> Result<Config, Error> {
     }
 }
 
-const DEFAULT_CONFIG: &str = r#"# Seconds without input before state transitions to Passive (default: 60)
+const DEFAULT_CONFIG: &str = r#"# Seconds without input before state transitions to Passive (default: 120)
 idle_threshold_secs = 120
 
 # Seconds without input before Passive transitions to Idle (default: 300)
@@ -1679,7 +1679,6 @@ regex = true
             "google-chrome-beta",
             "google-chrome-unstable",
             "com.google.Chrome",
-            "com.google.ChromeBeta",
             "com.google.ChromeDev",
             "chromium",
             "chromium-browser",
@@ -1936,6 +1935,13 @@ search_dirs = ["~/RustProjects/active", "~/projects", "/absolute/path"]
             config.project_aliases.get("ers-rs").unwrap(),
             "Entity Resolution"
         );
+    }
+
+    #[test]
+    fn generated_config_idle_threshold_matches_default() {
+        let raw: RawConfig = toml::from_str(DEFAULT_CONFIG).expect("generated config parses");
+        assert_eq!(raw.idle_threshold_secs, default_idle_threshold());
+        assert!(DEFAULT_CONFIG.contains("Passive (default: 120)"));
     }
 
     #[test]

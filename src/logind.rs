@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use logind_zbus::manager::ManagerProxyBlocking;
-use logind_zbus::session::SessionProxyBlocking;
+use logind_zbus::session::{SessionClass, SessionProxyBlocking, SessionState, SessionType};
 use zbus::blocking::Connection;
 
 use crate::error::Error;
@@ -42,46 +42,119 @@ impl LogindMonitor {
     }
 }
 
-/// Find our graphical session's D-Bus object path via logind.
+/// Properties used to choose the session whose `LockedHint` we monitor.
 ///
-/// Strategy: prefer the current user's UID, then fall back to uid >= 1000
-/// heuristic.
+/// `ListSessions` includes SSH and TTY sessions, and its order is not a
+/// selection guarantee. Keep the policy separate from D-Bus reads so the
+/// multi-session cases remain deterministic and testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionCandidate<'a> {
+    id: &'a str,
+    uid: u32,
+    seat: &'a str,
+    class: SessionClass,
+    type_: SessionType,
+    state: SessionState,
+    active: bool,
+    remote: bool,
+}
+
+impl SessionCandidate<'_> {
+    fn is_local_graphical_user(self, current_uid: u32) -> bool {
+        self.uid == current_uid
+            && self.class == SessionClass::User
+            && matches!(
+                self.type_,
+                SessionType::Wayland | SessionType::X11 | SessionType::MIR
+            )
+            && !self.remote
+            && self.state != SessionState::Closing
+    }
+}
+
+/// Select a local graphical session for the current user.
+///
+/// `XDG_SESSION_ID` breaks ties when it names a graphical session, but can be
+/// inherited from an SSH shell and therefore never makes a TTY eligible.
+/// Active, seated sessions are the fallback expected for a running compositor.
+fn select_session(
+    sessions: &[SessionCandidate<'_>],
+    current_uid: u32,
+    environment_session_id: Option<&str>,
+) -> Option<usize> {
+    sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, session)| session.is_local_graphical_user(current_uid))
+        .max_by_key(|(index, session)| {
+            (
+                environment_session_id == Some(session.id),
+                session.active || session.state == SessionState::Active,
+                !session.seat.is_empty(),
+                // Make the result independent of ListSessions ordering when
+                // all meaningful properties tie.
+                std::cmp::Reverse(session.id),
+                std::cmp::Reverse(*index),
+            )
+        })
+        .map(|(index, _)| index)
+}
+
+/// Find the current user's graphical session D-Bus object path via logind.
 fn find_user_session_path(
+    connection: &Connection,
     manager: &ManagerProxyBlocking<'_>,
 ) -> Result<zbus::zvariant::OwnedObjectPath, Error> {
     let sessions = manager
         .list_sessions()
         .map_err(|e| Error::Logind(format!("failed to list sessions: {e}")))?;
 
-    if sessions.is_empty() {
-        return Err(Error::LogindSessionNotFound);
-    }
-
-    // SAFETY: libc::getuid() is always safe to call
+    // SAFETY: libc::getuid() is always safe to call.
     #[allow(unsafe_code)]
     let current_uid = unsafe { libc::getuid() };
+    let environment_session_id = std::env::var("XDG_SESSION_ID").ok();
+    let mut candidates = Vec::new();
+    let mut paths = Vec::new();
 
-    // First, try to find a session matching the current user's UID
-    for session_info in &sessions {
-        if session_info.uid() == current_uid {
-            return Ok(session_info.path().clone());
+    for session_info in sessions
+        .iter()
+        .filter(|session| session.uid() == current_uid)
+    {
+        let session = SessionProxyBlocking::builder(connection)
+            .path(session_info.path().clone())
+            .map_err(|e| Error::Logind(format!("invalid session path: {e}")))?
+            .build()
+            .map_err(|e| Error::Logind(format!("failed to build session proxy: {e}")))?;
+
+        let properties = (|| {
+            Ok::<_, zbus::Error>(SessionCandidate {
+                id: session_info.sid(),
+                uid: session_info.uid(),
+                seat: session_info.seat(),
+                class: session.class()?,
+                type_: session.type_()?,
+                state: session.state()?,
+                active: session.active()?,
+                remote: session.remote()?,
+            })
+        })();
+
+        match properties {
+            Ok(candidate) => {
+                candidates.push(candidate);
+                paths.push(session_info.path().clone());
+            }
+            Err(error) => tracing::warn!(
+                session_id = session_info.sid(),
+                %error,
+                "ignoring logind session with unreadable selection properties"
+            ),
         }
     }
 
-    // Fall back to uid >= 1000 heuristic for multi-user systems
-    for session_info in &sessions {
-        if session_info.uid() >= 1000 {
-            tracing::debug!(
-                "no session for current uid {}, using session with uid {}",
-                current_uid,
-                session_info.uid()
-            );
-            return Ok(session_info.path().clone());
-        }
-    }
-
-    tracing::warn!("no session with uid >= 1000, using first session");
-    Ok(sessions[0].path().clone())
+    let selected = select_session(&candidates, current_uid, environment_session_id.as_deref())
+        .ok_or(Error::LogindSessionNotFound)?;
+    Ok(paths[selected].clone())
 }
 
 /// Maximum delay between attempts to restore a failed logind listener.
@@ -142,7 +215,7 @@ fn listen_for_locked_hint(lock_state: &AtomicU8) -> Result<(), Error> {
         .map_err(|e| Error::Logind(format!("failed to connect lock-state listener: {e}")))?;
     let manager = ManagerProxyBlocking::new(&connection)
         .map_err(|e| Error::Logind(format!("failed to create manager proxy: {e}")))?;
-    let session_path = find_user_session_path(&manager)?;
+    let session_path = find_user_session_path(&connection, &manager)?;
     let session = SessionProxyBlocking::builder(&connection)
         .path(session_path)
         .map_err(|e| Error::Logind(format!("invalid session path: {e}")))?
@@ -277,6 +350,70 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidate(id: &str, type_: SessionType, active: bool, remote: bool) -> SessionCandidate<'_> {
+        SessionCandidate {
+            id,
+            uid: 1000,
+            seat: if remote { "" } else { "seat0" },
+            class: SessionClass::User,
+            type_,
+            state: if active {
+                SessionState::Active
+            } else {
+                SessionState::Online
+            },
+            active,
+            remote,
+        }
+    }
+
+    #[test]
+    fn graphical_session_wins_over_earlier_same_uid_ssh_and_tty_sessions() {
+        let sessions = [
+            candidate("ssh", SessionType::TTY, true, true),
+            candidate("tty", SessionType::TTY, true, false),
+            candidate("niri", SessionType::Wayland, true, false),
+        ];
+
+        assert_eq!(select_session(&sessions, 1000, None), Some(2));
+    }
+
+    #[test]
+    fn environment_session_id_selects_graphical_session_but_not_ssh() {
+        let sessions = [
+            candidate("ssh", SessionType::TTY, true, true),
+            candidate("old", SessionType::Wayland, false, false),
+            candidate("niri", SessionType::Wayland, true, false),
+        ];
+
+        assert_eq!(select_session(&sessions, 1000, Some("old")), Some(1));
+        assert_eq!(select_session(&sessions, 1000, Some("ssh")), Some(2));
+    }
+
+    #[test]
+    fn selection_rejects_other_users_remote_and_non_user_sessions() {
+        let mut other_user = candidate("other", SessionType::Wayland, true, false);
+        other_user.uid = 1001;
+        let mut greeter = candidate("greeter", SessionType::Wayland, true, false);
+        greeter.class = SessionClass::Greeter;
+        let remote = candidate("remote", SessionType::Wayland, true, true);
+
+        assert_eq!(
+            select_session(&[other_user, greeter, remote], 1000, None),
+            None
+        );
+    }
+
+    #[test]
+    fn active_graphical_session_wins_without_environment_hint() {
+        let sessions = [
+            candidate("old", SessionType::Wayland, false, false),
+            candidate("niri", SessionType::Wayland, true, false),
+        ];
+
+        assert_eq!(select_session(&sessions, 1000, None), Some(1));
+    }
 
     #[test]
     fn initial_state_is_fail_closed_and_degraded() {

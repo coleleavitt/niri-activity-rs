@@ -178,9 +178,7 @@ fn email_period_name(range: &report::TimeRange) -> &'static str {
         }
         report::TimeRange::DateRange(start, end)
             if start.day() == 1
-                && end
-                    .succ_opt()
-                    .is_some_and(|next| next.day() == 1 && next.month() != start.month()) =>
+                && end.succ_opt() == start.checked_add_months(chrono::Months::new(1)) =>
         {
             "Monthly"
         }
@@ -634,6 +632,24 @@ mod tests {
             .expect("valid range")
             .expect("selected range");
         assert_eq!(email_period_name(&range), "Monthly");
+    }
+
+    #[test]
+    fn explicit_leap_february_email_range_is_monthly() {
+        let (days, time, _, _) = parse_email(&["--from", "2028-02-01", "--to", "2028-02-29"]);
+        let range = email_time_range(days, &time)
+            .expect("valid range")
+            .expect("selected range");
+        assert_eq!(email_period_name(&range), "Monthly");
+    }
+
+    #[test]
+    fn boundary_aligned_multi_month_email_range_uses_activity_label() {
+        let (days, time, _, _) = parse_email(&["--from", "2026-01-01", "--to", "2026-03-31"]);
+        let range = email_time_range(days, &time)
+            .expect("valid range")
+            .expect("selected range");
+        assert_eq!(email_period_name(&range), "Activity");
     }
 
     #[test]

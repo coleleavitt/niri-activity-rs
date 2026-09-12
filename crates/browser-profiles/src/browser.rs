@@ -82,7 +82,6 @@ impl Browser {
                 "google-chrome-beta",
                 "google-chrome-unstable",
                 "com.google.chrome",
-                "com.google.chromebeta",
                 "com.google.chromedev",
             ],
             Browser::Chromium => &["chromium", "chromium-browser", "org.chromium.chromium"],
@@ -153,6 +152,7 @@ impl Browser {
                 ".config/google-chrome-beta",
                 ".config/google-chrome-unstable",
                 ".var/app/com.google.Chrome/config/google-chrome",
+                ".var/app/com.google.ChromeDev/config/google-chrome-unstable",
             ],
             Browser::Chromium => &[
                 ".config/chromium",
@@ -288,9 +288,20 @@ mod tests {
             ".config/google-chrome",
             ".config/google-chrome-beta",
             ".config/google-chrome-unstable",
+            ".var/app/com.google.Chrome/config/google-chrome",
+            ".var/app/com.google.ChromeDev/config/google-chrome-unstable",
         ] {
             assert!(roots.contains(&root));
         }
+
+        // Flathub publishes Dev as com.google.ChromeDev. There is currently no
+        // published Chrome Beta or Canary Flatpak, so do not guess app IDs or
+        // profile roots for either channel.
+        assert!(is_browser_app_id("com.google.ChromeDev"));
+        assert!(!is_browser_app_id("com.google.ChromeBeta"));
+        assert!(!is_browser_app_id("com.google.ChromeCanary"));
+        assert!(!roots.contains(&".var/app/com.google.ChromeBeta/config/google-chrome-beta"));
+        assert!(!roots.contains(&".var/app/com.google.ChromeCanary/config/google-chrome-canary"));
 
         for brand in [
             "Google Chrome",

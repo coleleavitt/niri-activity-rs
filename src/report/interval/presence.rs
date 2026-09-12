@@ -34,9 +34,9 @@ pub(super) fn apply(
                     CAST(ROUND(active_ms + COALESCE(passive_ms, 0) + idle_ms) AS INTEGER)
                         AS total_ms,
                     input_offsets,
-                    CAST(ROUND(keystrokes) AS INTEGER) AS keystrokes,
-                    CAST(ROUND(mouse_clicks) AS INTEGER) AS mouse_clicks,
-                    CAST(ROUND(scroll_events) AS INTEGER) AS scroll_events
+                    keystrokes,
+                    mouse_clicks,
+                    scroll_events
                FROM events
               WHERE timestamp >= ?1 AND timestamp < ?2
              UNION ALL
@@ -44,9 +44,9 @@ pub(super) fn apply(
                     CAST(ROUND(active_ms + COALESCE(passive_ms, 0) + idle_ms) AS INTEGER)
                         AS total_ms,
                     input_offsets,
-                    CAST(ROUND(keystrokes) AS INTEGER) AS keystrokes,
-                    CAST(ROUND(mouse_clicks) AS INTEGER) AS mouse_clicks,
-                    CAST(ROUND(scroll_events) AS INTEGER) AS scroll_events
+                    keystrokes,
+                    mouse_clicks,
+                    scroll_events
                FROM events
               WHERE id = (
                     SELECT id FROM events
@@ -66,9 +66,9 @@ pub(super) fn apply(
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, Option<Vec<u8>>>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
+            row.get::<_, f64>(3)?,
+            row.get::<_, f64>(4)?,
+            row.get::<_, f64>(5)?,
         ))
     })?;
     let mut points = Vec::new();
@@ -84,7 +84,10 @@ pub(super) fn apply(
                     unknown.push(row_start..row_end);
                     continue;
                 };
-                if offsets.is_empty() && keys.saturating_add(clicks).saturating_add(scrolls) > 0 {
+                // Fractional repair rows still carry positive input evidence
+                // even when each persisted counter would round
+                // to zero independently.
+                if offsets.is_empty() && (keys > 0.0 || clicks > 0.0 || scrolls > 0.0) {
                     unknown.push(row_start..row_end);
                 } else {
                     points.extend(offsets.into_iter().map(|offset| {
@@ -299,6 +302,24 @@ mod tests {
         .expect("presence row");
     }
 
+    fn insert_fractional_input_row(
+        conn: &Connection,
+        offset_ms: i64,
+        duration_ms: i64,
+        counter: &str,
+    ) {
+        assert!(["keystrokes", "mouse_clicks", "scroll_events"].contains(&counter));
+        conn.execute(
+            &format!(
+                "INSERT INTO events
+                     (timestamp, active_ms, passive_ms, idle_ms, input_offsets, {counter})
+                 VALUES (?1, ?2, 0, 0, X'', 0.25)"
+            ),
+            params![timestamp(offset_ms), duration_ms],
+        )
+        .expect("fractional input row");
+    }
+
     fn event(offset_ms: i64, active_ms: i64, passive_ms: i64, idle_ms: i64) -> EventInterval {
         let start_ms = DateTime::parse_from_rfc3339(START)
             .expect("valid start")
@@ -378,6 +399,41 @@ mod tests {
         .expect("presence reconstruction");
 
         assert_eq!(totals(&intervals), (120_000, 180_000, 0));
+    }
+
+    #[test]
+    fn positive_fractional_input_counters_preserve_unknown_presence() {
+        for counter in ["keystrokes", "mouse_clicks", "scroll_events"] {
+            let conn = setup();
+            insert_fractional_input_row(&conn, 0, 300_000, counter);
+
+            let intervals = apply(
+                &conn,
+                &Config::default(),
+                vec![event(0, 60_000, 120_000, 120_000)],
+            )
+            .expect("presence reconstruction");
+
+            assert_eq!(
+                totals(&intervals),
+                (60_000, 120_000, 120_000),
+                "counter {counter} must remain positive before rounding"
+            );
+        }
+    }
+
+    #[test]
+    fn predecessor_preserves_positive_fractional_input_evidence() {
+        let conn = setup();
+        // This row begins just before the evidence range, so only the
+        // predecessor arm of the query can retrieve it. Its tail overlaps the
+        // requested event and must remain unknown rather than becoming idle.
+        insert_fractional_input_row(&conn, -300_001, 301_001, "keystrokes");
+
+        let intervals = apply(&conn, &Config::default(), vec![event(0, 1_000, 0, 0)])
+            .expect("presence reconstruction");
+
+        assert_eq!(totals(&intervals), (1_000, 0, 0));
     }
 
     #[test]
