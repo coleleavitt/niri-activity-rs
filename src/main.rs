@@ -13,6 +13,7 @@ mod scheduler;
 mod shell_hook;
 mod terminal;
 mod theme;
+mod tracker;
 mod tui;
 mod watcher;
 

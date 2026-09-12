@@ -2,14 +2,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
 use std::{fs, thread};
 
-use backon::{BlockingRetryable, ExponentialBuilder};
 use chrono::{Local, Utc};
-use niri_ipc::socket::Socket;
-use niri_ipc::{Event, Request, Response, Window};
 use owo_colors::OwoColorize;
 use rusqlite::Connection;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -24,6 +20,10 @@ use crate::input::{InputSnapshot, start_idle_monitor};
 use crate::logind::start_logind_monitor;
 use crate::project;
 use crate::scheduler::{Scheduler, check_scheduled_reports, discover_scheduled_reports};
+// Compatibility surface for persistence code while tracker ownership moves out
+// of the orchestration module. New code should import from `crate::tracker`.
+pub use crate::tracker::WindowInfo;
+use crate::tracker::{NiriTracker, Snapshot, Update, WindowId, WindowTracker};
 
 // Duration constants
 const FLUSH_INTERVAL_SECS: u64 = 300; // 5 minutes
@@ -33,9 +33,6 @@ const HEARTBEAT_CHECK_INTERVAL_SECS: u64 = 30;
 // debounce each change wrote a new events row, the production "flush storm"
 // that produced ~86k junk rows/day. App switches are never debounced.
 const TITLE_FLUSH_DEBOUNCE_SECS: u64 = 60;
-
-// Niri connection backoff constants (separate from flush/suspend semantics)
-const NIRI_BACKOFF_MAX_INTERVAL_SECS: u64 = 300;
 
 /// Saturating conversion from `Duration::as_millis()` (`u128`) to `u64`.
 /// Avoids silent truncation per JPL Rule 14 — practically unreachable
@@ -101,23 +98,6 @@ fn color_state(state: ActivityState) -> String {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct WindowInfo {
-    pub app_id: String,
-    pub title: String,
-    pub pid: Option<i32>,
-}
-
-impl From<&Window> for WindowInfo {
-    fn from(w: &Window) -> Self {
-        Self {
-            app_id: w.app_id.as_deref().unwrap_or("unknown").to_owned(),
-            title: w.title.as_deref().unwrap_or_default().to_owned(),
-            pid: w.pid,
-        }
-    }
-}
-
 /// Immutable context for flush operations, constructed once per watch session.
 struct FlushContext<'a> {
     conn: &'a Connection,
@@ -168,8 +148,8 @@ enum FlushReset {
 
 /// Mutable state for the watch loop, grouped for cleaner handler signatures.
 struct WatchState {
-    windows: HashMap<u64, WindowInfo>,
-    focused_id: Option<u64>,
+    windows: HashMap<WindowId, WindowInfo>,
+    focused_id: Option<WindowId>,
     focus_start: chrono::DateTime<chrono::Utc>,
     accumulated_active_ms: i64,
     accumulated_passive_ms: i64,
@@ -313,7 +293,8 @@ fn handle_shutdown(
     charge_boundary_elapsed(state, now_instant, agent_active);
     let info = state
         .focused_id
-        .and_then(|id| state.windows.get(&id))
+        .as_ref()
+        .and_then(|id| state.windows.get(id))
         .cloned();
     if let Some(ref info) = info {
         tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_shutdown");
@@ -406,7 +387,8 @@ fn handle_suspend_resume(
     let info = if has_data {
         state
             .focused_id
-            .and_then(|id| state.windows.get(&id))
+            .as_ref()
+            .and_then(|id| state.windows.get(id))
             .cloned()
     } else {
         None
@@ -466,7 +448,8 @@ fn handle_lock_unlock(
         charge_boundary_elapsed(state, now_instant, agent_active);
         let info = state
             .focused_id
-            .and_then(|id| state.windows.get(&id))
+            .as_ref()
+            .and_then(|id| state.windows.get(id))
             .cloned();
         if let Some(ref info) = info {
             tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_lock_unlock (lock)");
@@ -585,7 +568,10 @@ fn handle_idle_transitions(
     // indefinitely).
     let idle_duration_ms = now_ms.saturating_sub(last_input_ms);
 
-    let focused = state.focused_id.and_then(|id| state.windows.get(&id));
+    let focused = state
+        .focused_id
+        .as_ref()
+        .and_then(|id| state.windows.get(id));
     let agent_active = agent_monitor.is_active(
         idle_duration_ms,
         focused.map(|info| info.app_id.as_str()),
@@ -661,7 +647,8 @@ fn handle_enter_away(
     charge_boundary_elapsed(state, now_instant, agent_active);
     let info = state
         .focused_id
-        .and_then(|id| state.windows.get(&id))
+        .as_ref()
+        .and_then(|id| state.windows.get(id))
         .cloned();
     let (input, jiggler) = if info.is_some() {
         tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_enter_away");
@@ -714,7 +701,10 @@ fn detect_agent_activity(
 ) -> bool {
     let now_ms = millis_u64(monitor_start.elapsed());
     let idle_duration_ms = now_ms.saturating_sub(input_stats.last_activity_ms());
-    let focused = state.focused_id.and_then(|id| state.windows.get(&id));
+    let focused = state
+        .focused_id
+        .as_ref()
+        .and_then(|id| state.windows.get(id));
     agent_monitor.is_active(
         idle_duration_ms,
         focused.map(|info| info.app_id.as_str()),
@@ -779,7 +769,8 @@ fn handle_periodic_flush(
 ) -> Result<(), Error> {
     let info = state
         .focused_id
-        .and_then(|id| state.windows.get(&id))
+        .as_ref()
+        .and_then(|id| state.windows.get(id))
         .cloned();
     if let Some(ref info) = info {
         tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_periodic_flush");
@@ -813,8 +804,8 @@ fn handle_periodic_flush(
     Ok(())
 }
 
-/// Context for niri event handling, avoiding repeated parameter passing.
-struct NiriEventContext<'a> {
+/// Context for normalized window event handling.
+struct WindowEventContext<'a> {
     flush_ctx: &'a FlushContext<'a>,
     input_stats: &'a crate::input::InputStats,
     config: &'a Config,
@@ -826,46 +817,62 @@ struct NiriEventContext<'a> {
     logged_untracked: &'a mut std::collections::HashSet<String>,
 }
 
-fn handle_windows_changed(
+fn handle_snapshot(
     state: &mut WatchState,
-    ctx: &NiriEventContext<'_>,
-    win_list: Vec<Window>,
+    ctx: &WindowEventContext<'_>,
+    snapshot: Snapshot,
+    initial: bool,
 ) -> Result<(), Error> {
-    let info = state
-        .focused_id
-        .and_then(|id| state.windows.get(&id))
-        .cloned();
-    if let Some(ref info) = info {
-        tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_windows_changed");
-        let input = ctx.input_stats.snapshot();
-        let jiggler = ctx.input_stats.jiggler_detected();
-        flush_session(
-            ctx.flush_ctx,
-            Some(info),
-            &mut state.make_accum(),
-            &input,
-            jiggler,
-            FlushReset::NoReset,
-        )?;
+    if snapshot
+        .focused
+        .as_ref()
+        .is_some_and(|focused| !snapshot.windows.iter().any(|window| &window.id == focused))
+    {
+        return Err(Error::NiriIpc(
+            "window tracker snapshot focused an unknown window".to_owned(),
+        ));
+    }
+    // Startup establishes a baseline and must not flush an empty predecessor.
+    // A later snapshot is a conservative resync boundary: flush exactly once
+    // before replacing all potentially stale state.
+    if !initial {
+        let info = state
+            .focused_id
+            .as_ref()
+            .and_then(|id| state.windows.get(id))
+            .cloned();
+        if let Some(ref info) = info {
+            tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_snapshot");
+            let input = ctx.input_stats.snapshot();
+            let jiggler = ctx.input_stats.jiggler_detected();
+            flush_session(
+                ctx.flush_ctx,
+                Some(info),
+                &mut state.make_accum(),
+                &input,
+                jiggler,
+                FlushReset::NoReset,
+            )?;
+        }
     }
 
     state.reset_accumulators();
-    state.focused_id = None;
-    state.windows.clear();
+    state.windows = snapshot
+        .windows
+        .into_iter()
+        .map(|window| (window.id.clone(), window))
+        .collect();
+    state.focused_id = snapshot.focused;
 
-    for w in &win_list {
-        state.windows.insert(w.id, WindowInfo::from(w));
-        if w.is_focused {
-            state.focused_id = Some(w.id);
-            state.focus_start = ctx.now;
-            state.last_idle_check = ctx.now_instant;
-            state.last_flush = ctx.now_instant;
-            state.input_baseline_ms = ctx.input_stats.last_activity_ms();
-            state.session_start_mono_ms = millis_u64(ctx.monitor_start.elapsed());
-            state.last_seen_input_ms = state.input_baseline_ms;
-            state.input_offsets.clear();
-            state.input_offsets.push(0);
-        }
+    if state.focused_id.is_some() {
+        state.focus_start = ctx.now;
+        state.last_idle_check = ctx.now_instant;
+        state.last_flush = ctx.now_instant;
+        state.input_baseline_ms = ctx.input_stats.last_activity_ms();
+        state.session_start_mono_ms = millis_u64(ctx.monitor_start.elapsed());
+        state.last_seen_input_ms = state.input_baseline_ms;
+        state.input_offsets.clear();
+        state.input_offsets.push(0);
     }
 
     tracing::debug!(
@@ -878,14 +885,14 @@ fn handle_windows_changed(
 
 fn handle_window_closed(
     state: &mut WatchState,
-    ctx: &NiriEventContext<'_>,
-    id: u64,
+    ctx: &WindowEventContext<'_>,
+    id: &WindowId,
 ) -> Result<(), Error> {
-    if state.focused_id == Some(id) {
+    if state.focused_id.as_ref() == Some(id) {
         tracing::debug!(target: "input_debug", "SNAPSHOT caller: handle_window_closed");
         let input = ctx.input_stats.snapshot();
         let jiggler = ctx.input_stats.jiggler_detected();
-        let info = state.windows.get(&id).cloned();
+        let info = state.windows.get(id).cloned();
         if let Some(ref info) = info {
             flush_session(
                 ctx.flush_ctx,
@@ -899,7 +906,7 @@ fn handle_window_closed(
         state.focused_id = None;
         state.reset_accumulators();
     }
-    state.windows.remove(&id);
+    state.windows.remove(id);
     Ok(())
 }
 
@@ -920,11 +927,19 @@ enum MetadataChange {
     TitleChanged,
 }
 
-fn classify_metadata_change(state: &WatchState, id: u64, next: &WindowInfo) -> MetadataChange {
-    if state.focused_id != Some(id) {
+fn focused_upsert_changes_focus(state: &WatchState, id: &WindowId, focused: bool) -> bool {
+    focused && state.focused_id.as_ref() != Some(id)
+}
+
+fn classify_metadata_change(
+    state: &WatchState,
+    id: &WindowId,
+    next: &WindowInfo,
+) -> MetadataChange {
+    if state.focused_id.as_ref() != Some(id) {
         return MetadataChange::None;
     }
-    match state.windows.get(&id) {
+    match state.windows.get(id) {
         Some(current) if current.app_id != next.app_id => MetadataChange::AppChanged,
         Some(current) if current.title != next.title => MetadataChange::TitleChanged,
         _ => MetadataChange::None,
@@ -968,7 +983,7 @@ fn decide_metadata_change(
 
 fn handle_title_changed(
     state: &mut WatchState,
-    ctx: &mut NiriEventContext<'_>,
+    ctx: &mut WindowEventContext<'_>,
 ) -> Result<(), Error> {
     if state.is_locked {
         return Ok(());
@@ -979,7 +994,8 @@ fn handle_title_changed(
     let jiggler = ctx.input_stats.jiggler_detected();
     let info = state
         .focused_id
-        .and_then(|id| state.windows.get(&id))
+        .as_ref()
+        .and_then(|id| state.windows.get(id))
         .cloned();
     if let Some(ref info) = info {
         let flushed = flush_session(
@@ -1004,8 +1020,8 @@ fn handle_title_changed(
 
 fn handle_focus_changed(
     state: &mut WatchState,
-    ctx: &mut NiriEventContext<'_>,
-    new_focus_id: Option<u64>,
+    ctx: &mut WindowEventContext<'_>,
+    new_focus_id: Option<WindowId>,
 ) -> Result<(), Error> {
     if state.is_locked {
         state.focused_id = new_focus_id;
@@ -1025,7 +1041,8 @@ fn handle_focus_changed(
 
     let info = state
         .focused_id
-        .and_then(|id| state.windows.get(&id))
+        .as_ref()
+        .and_then(|id| state.windows.get(id))
         .cloned();
     if let Some(ref info) = info {
         let flushed = flush_session(
@@ -1056,7 +1073,7 @@ fn handle_focus_changed(
     Ok(())
 }
 
-fn log_untracked_app(info: &WindowInfo, ctx: &mut NiriEventContext<'_>) {
+fn log_untracked_app(info: &WindowInfo, ctx: &mut WindowEventContext<'_>) {
     use std::fs::OpenOptions;
     use std::io::Write;
 
@@ -1080,7 +1097,7 @@ fn print_focus_change_status(
     input: &InputSnapshot,
     jiggler: bool,
     focus_start: chrono::DateTime<chrono::Utc>,
-    ctx: &NiriEventContext<'_>,
+    ctx: &WindowEventContext<'_>,
 ) {
     let total = flushed
         .active_ms
@@ -1136,7 +1153,8 @@ fn flush_on_disconnect(
 ) {
     let info = state
         .focused_id
-        .and_then(|id| state.windows.get(&id))
+        .as_ref()
+        .and_then(|id| state.windows.get(id))
         .cloned();
     if let Some(ref info) = info {
         tracing::debug!(target: "input_debug", "SNAPSHOT caller: flush_on_disconnect");
@@ -1398,27 +1416,26 @@ fn flush_session(
     Ok(result)
 }
 
-/// Connect to the niri window manager with exponential backoff retry logic.
-pub fn connect_to_niri() -> Result<Socket, Error> {
-    let backoff = ExponentialBuilder::default()
-        .with_min_delay(Duration::from_millis(100))
-        .with_max_delay(Duration::from_secs(NIRI_BACKOFF_MAX_INTERVAL_SECS))
-        .with_max_times(20); // ~5 minutes with exponential growth
-
-    (|| {
-        Socket::connect().map_err(|e| {
-            tracing::warn!("Connection to niri failed: {}. Retrying...", e);
-            e
-        })
-    })
-    .retry(backoff)
-    .sleep(std::thread::sleep)
-    .call()
-    .map_err(|_| Error::NiriConnectionFailed)
+fn tracker_error_to_app(error: crate::tracker::TrackerError) -> Error {
+    Error::NiriIpc(format!("{:?}: {error}", error.kind()))
 }
 
-/// Monitor window focus and activity state, recording events to the database.
+fn invalidate_window_state(state: &mut WatchState) {
+    state.focused_id = None;
+    state.windows.clear();
+    state.reset_accumulators();
+}
+
+/// Monitor window focus using the default niri tracker.
 pub fn watch(quiet: bool) -> Result<(), Error> {
+    watch_with_tracker(quiet, &NiriTracker)
+}
+
+/// Monitor window focus using an explicitly selected compositor tracker.
+///
+/// Runtime backend selection can call this without changing the activity
+/// state machine or persistence path.
+pub fn watch_with_tracker(quiet: bool, tracker: &dyn WindowTracker) -> Result<(), Error> {
     use std::collections::HashSet;
 
     let mut config = load_config()?;
@@ -1503,33 +1520,19 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     };
     let input_active_ms = config.input_active_secs.saturating_mul(1000);
 
-    let mut socket = {
-        let _linkscope_niri_connect = linkscope::phase("watch.niri_connect");
-        connect_to_niri()?
+    let mut source = {
+        let _linkscope_tracker_connect = linkscope::phase("watch.tracker_connect");
+        tracker.connect().map_err(|error| {
+            tracing::error!(backend = tracker.backend_name(), %error, "window tracker connection failed");
+            tracker_error_to_app(error)
+        })?
     };
-    let reply = socket.send(Request::EventStream)?;
-    match reply {
-        Ok(Response::Handled) => {}
-        Ok(_other) => {
-            return Err(Error::UnexpectedResponse);
-        }
-        Err(e) => return Err(Error::NiriError(e)),
-    }
-
-    let (tx, rx) = mpsc::channel::<Event>();
-    thread::spawn(move || {
-        let mut read_event = socket.read_events();
-        while let Ok(event) = read_event() {
-            if tx.send(event).is_err() {
-                break;
-            }
-        }
-    });
 
     let mut state = WatchState::new(
         input_stats.last_activity_ms(),
         millis_u64(monitor_start.elapsed()),
     );
+    let mut received_initial_snapshot = false;
 
     let flush_ctx = FlushContext {
         conn: &conn,
@@ -1613,33 +1616,47 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             linkscope_report_interval,
         );
 
-        let event = {
+        let update = {
             let _linkscope_watch_recv = linkscope::phase("watch.recv_timeout");
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(ev) => {
+            match source.recv_timeout(Duration::from_secs(1)) {
+                Ok(Some(update)) => {
                     linkscope::record_items("watch.events", 1);
-                    Some(ev)
+                    update
                 }
-                Err(RecvTimeoutError::Timeout) => {
+                Ok(None) => {
                     linkscope::record_items("watch.recv_timeout", 1);
-                    None
+                    continue;
                 }
-                Err(RecvTimeoutError::Disconnected) => {
+                Err(error) => {
                     if shutdown.load(Ordering::SeqCst) {
                         continue;
                     }
+                    let boundary = Instant::now();
+                    let agent_active = detect_agent_activity(
+                        &state,
+                        &input_stats,
+                        &mut agent_monitor,
+                        monitor_start,
+                    );
+                    charge_boundary_elapsed(&mut state, boundary, agent_active);
                     flush_on_disconnect(&mut state, &flush_ctx, &input_stats);
-                    return Err(Error::NiriEventStreamClosed);
+                    invalidate_window_state(&mut state);
+                    return Err(tracker_error_to_app(error));
                 }
             }
         };
 
-        let Some(event) = event else {
-            continue;
-        };
+        if !received_initial_snapshot && !matches!(update, Update::Snapshot(_)) {
+            flush_on_disconnect(&mut state, &flush_ctx, &input_stats);
+            invalidate_window_state(&mut state);
+            return Err(Error::NiriIpc(format!(
+                "{} sent an incremental update before its mandatory initial snapshot",
+                tracker.backend_name()
+            )));
+        }
 
         let now = Utc::now();
-        let mut niri_ctx = NiriEventContext {
+        let mut window_ctx = WindowEventContext {
             flush_ctx: &flush_ctx,
             input_stats: &input_stats,
             config: &config,
@@ -1651,36 +1668,57 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
             logged_untracked: &mut logged_untracked,
         };
 
-        match event {
-            Event::WindowsChanged { windows: win_list } => {
-                let _linkscope_event = linkscope::phase("watch.event.windows_changed");
-                handle_windows_changed(&mut state, &niri_ctx, win_list)?;
+        match update {
+            Update::Snapshot(snapshot) => {
+                let _linkscope_event = linkscope::phase("watch.event.snapshot");
+                handle_snapshot(
+                    &mut state,
+                    &window_ctx,
+                    snapshot,
+                    !received_initial_snapshot,
+                )?;
+                received_initial_snapshot = true;
             }
-            Event::WindowOpenedOrChanged { window } => {
+            Update::Upsert { window, focused } => {
                 let _linkscope_event = linkscope::phase("watch.event.window_changed");
-                let info = WindowInfo::from(&window);
-                let change = classify_metadata_change(&state, window.id, &info);
+                let id = window.id.clone();
+                let change = classify_metadata_change(&state, &id, &window);
                 match decide_metadata_change(&state, change, now_instant) {
                     MetadataChangeDecision::CacheOnly => {}
                     MetadataChangeDecision::RolloverApp => {
-                        handle_focus_changed(&mut state, &mut niri_ctx, Some(window.id))?;
+                        handle_focus_changed(&mut state, &mut window_ctx, Some(id.clone()))?;
                     }
                     MetadataChangeDecision::RolloverTitle => {
-                        handle_title_changed(&mut state, &mut niri_ctx)?;
+                        handle_title_changed(&mut state, &mut window_ctx)?;
                         state.last_title_flush = now_instant;
                     }
                 }
-                state.windows.insert(window.id, info);
+                // Niri can introduce an already-focused window without a later
+                // focus event. Install that transition before caching metadata
+                // so the previous focused session is closed exactly once.
+                if focused_upsert_changes_focus(&state, &id, focused) {
+                    handle_focus_changed(&mut state, &mut window_ctx, Some(id.clone()))?;
+                }
+                state.windows.insert(id, window);
             }
-            Event::WindowClosed { id } => {
+            Update::Closed(id) => {
                 let _linkscope_event = linkscope::phase("watch.event.window_closed");
-                handle_window_closed(&mut state, &niri_ctx, id)?;
+                handle_window_closed(&mut state, &window_ctx, &id)?;
             }
-            Event::WindowFocusChanged { id: new_focus_id } => {
+            Update::Focused(new_focus_id) => {
                 let _linkscope_event = linkscope::phase("watch.event.focus_changed");
-                handle_focus_changed(&mut state, &mut niri_ctx, new_focus_id)?;
+                if new_focus_id
+                    .as_ref()
+                    .is_some_and(|id| !state.windows.contains_key(id))
+                {
+                    flush_on_disconnect(&mut state, &flush_ctx, &input_stats);
+                    invalidate_window_state(&mut state);
+                    return Err(Error::NiriIpc(
+                        "window tracker focused an unknown window".to_owned(),
+                    ));
+                }
+                handle_focus_changed(&mut state, &mut window_ctx, new_focus_id)?;
             }
-            _ => {}
         }
     }
 }
@@ -1979,75 +2017,61 @@ mod tests {
         assert_eq!(state.accumulated_agent_ms, 0);
     }
 
+    fn id(value: u64) -> WindowId {
+        WindowId::test(format!("test:{value}"))
+    }
+
+    fn info(value: u64, app_id: &str, title: &str, pid: Option<i32>) -> WindowInfo {
+        WindowInfo {
+            id: id(value),
+            app_id: app_id.to_owned(),
+            title: title.to_owned(),
+            pid,
+        }
+    }
+
     #[test]
     fn classify_metadata_change_distinguishes_app_title_and_noise() {
         let mut state = WatchState::new(0, 0);
-        state.focused_id = Some(7);
-        state.windows.insert(
-            7,
-            WindowInfo {
-                app_id: "zen".to_string(),
-                title: "GitHub".to_string(),
-                pid: Some(10),
-            },
-        );
+        state.focused_id = Some(id(7));
+        state
+            .windows
+            .insert(id(7), info(7, "zen", "GitHub", Some(10)));
 
-        let title_changed = WindowInfo {
-            app_id: "zen".to_string(),
-            title: "YouTube".to_string(),
-            pid: Some(10),
-        };
-        let app_changed = WindowInfo {
-            app_id: "foot".to_string(),
-            title: "GitHub".to_string(),
-            pid: Some(10),
-        };
-        let pid_only = WindowInfo {
-            app_id: "zen".to_string(),
-            title: "GitHub".to_string(),
-            pid: Some(11),
-        };
+        let title_changed = info(7, "zen", "YouTube", Some(10));
+        let app_changed = info(7, "foot", "GitHub", Some(10));
+        let pid_only = info(7, "zen", "GitHub", Some(11));
 
         assert_eq!(
-            classify_metadata_change(&state, 7, &title_changed),
+            classify_metadata_change(&state, &id(7), &title_changed),
             MetadataChange::TitleChanged
         );
         assert_eq!(
-            classify_metadata_change(&state, 7, &app_changed),
+            classify_metadata_change(&state, &id(7), &app_changed),
             MetadataChange::AppChanged
         );
         assert_eq!(
-            classify_metadata_change(&state, 7, &pid_only),
+            classify_metadata_change(&state, &id(7), &pid_only),
             MetadataChange::None
         );
-        // Not the focused window -> no change.
         assert_eq!(
-            classify_metadata_change(&state, 8, &title_changed),
+            classify_metadata_change(&state, &id(8), &title_changed),
             MetadataChange::None
         );
     }
 
     fn title_change_state(current_state: ActivityState) -> WatchState {
         let mut state = WatchState::new(0, 0);
-        state.focused_id = Some(7);
+        state.focused_id = Some(id(7));
         state.current_state = current_state;
-        state.windows.insert(
-            7,
-            WindowInfo {
-                app_id: "zen".to_string(),
-                title: "Before".to_string(),
-                pid: Some(10),
-            },
-        );
+        state
+            .windows
+            .insert(id(7), info(7, "zen", "Before", Some(10)));
         state
     }
 
     fn changed_title() -> WindowInfo {
-        WindowInfo {
-            app_id: "zen".to_string(),
-            title: "After".to_string(),
-            pid: Some(10),
-        }
+        info(7, "zen", "After", Some(10))
     }
 
     #[test]
@@ -2056,14 +2080,14 @@ mod tests {
         let previous_flush = state.last_title_flush;
         let now = previous_flush + Duration::from_secs(TITLE_FLUSH_DEBOUNCE_SECS + 1);
         let next = changed_title();
-        let change = classify_metadata_change(&state, 7, &next);
+        let change = classify_metadata_change(&state, &id(7), &next);
 
         assert_eq!(
             decide_metadata_change(&state, change, now),
             MetadataChangeDecision::CacheOnly
         );
-        state.windows.insert(7, next);
-        assert_eq!(state.windows[&7].title, "After");
+        state.windows.insert(id(7), next);
+        assert_eq!(state.windows[&id(7)].title, "After");
         assert_eq!(state.last_title_flush, previous_flush);
     }
 
@@ -2074,14 +2098,14 @@ mod tests {
         let previous_flush = state.last_title_flush;
         let now = previous_flush + Duration::from_secs(TITLE_FLUSH_DEBOUNCE_SECS + 1);
         let next = changed_title();
-        let change = classify_metadata_change(&state, 7, &next);
+        let change = classify_metadata_change(&state, &id(7), &next);
 
         assert_eq!(
             decide_metadata_change(&state, change, now),
             MetadataChangeDecision::CacheOnly
         );
-        state.windows.insert(7, next);
-        assert_eq!(state.windows[&7].title, "After");
+        state.windows.insert(id(7), next);
+        assert_eq!(state.windows[&id(7)].title, "After");
         assert_eq!(state.last_title_flush, previous_flush);
     }
 
@@ -2089,7 +2113,7 @@ mod tests {
     fn title_change_debounce_does_not_advance_last_flush() {
         let state = title_change_state(ActivityState::Active);
         let previous_flush = state.last_title_flush;
-        let change = classify_metadata_change(&state, 7, &changed_title());
+        let change = classify_metadata_change(&state, &id(7), &changed_title());
 
         assert_eq!(
             decide_metadata_change(&state, change, previous_flush),
@@ -2104,30 +2128,41 @@ mod tests {
         let previous_flush = state.last_title_flush;
         let now = previous_flush + Duration::from_secs(TITLE_FLUSH_DEBOUNCE_SECS + 1);
         let away_title = changed_title();
-        let change = classify_metadata_change(&state, 7, &away_title);
+        let change = classify_metadata_change(&state, &id(7), &away_title);
         assert_eq!(
             decide_metadata_change(&state, change, now),
             MetadataChangeDecision::CacheOnly
         );
-        state.windows.insert(7, away_title.clone());
+        state.windows.insert(id(7), away_title.clone());
 
         state.current_state = ActivityState::Active;
-        let unchanged = classify_metadata_change(&state, 7, &away_title);
+        let unchanged = classify_metadata_change(&state, &id(7), &away_title);
         assert_eq!(
             decide_metadata_change(&state, unchanged, now),
             MetadataChangeDecision::CacheOnly
         );
 
         let after_resume = WindowInfo {
-            title: "After resume".to_string(),
+            title: "After resume".to_owned(),
             ..away_title
         };
-        let changed = classify_metadata_change(&state, 7, &after_resume);
+        let changed = classify_metadata_change(&state, &id(7), &after_resume);
         assert_eq!(
             decide_metadata_change(&state, changed, now),
             MetadataChangeDecision::RolloverTitle
         );
         assert_eq!(state.last_title_flush, previous_flush);
+    }
+
+    #[test]
+    fn newly_seen_focused_upsert_is_a_focus_transition() {
+        let mut state = WatchState::new(0, 0);
+        state.focused_id = Some(id(1));
+        state.windows.insert(id(1), info(1, "old", "old", None));
+
+        assert!(focused_upsert_changes_focus(&state, &id(2), true));
+        assert!(!focused_upsert_changes_focus(&state, &id(2), false));
+        assert!(!focused_upsert_changes_focus(&state, &id(1), true));
     }
 
     #[test]
