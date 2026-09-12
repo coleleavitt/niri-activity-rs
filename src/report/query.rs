@@ -2998,12 +2998,12 @@ mod tests {
 
     #[test]
     fn reconstructed_agent_intervals_are_not_focus_switches() {
-        let app = create_test_app();
-        let today = app.config.local_date_today();
+        let app = create_utc_test_app();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 25).expect("valid date");
         for minute in [0, 2] {
             insert_test_event(
                 &app.conn,
-                &format!("{today}T10:{minute:02}:00+00:00"),
+                &format!("{date}T10:{minute:02}:00+00:00"),
                 "prime-agent-reconstructed",
                 "neutral",
                 0,
@@ -3015,7 +3015,7 @@ mod tests {
             .expect("reconstructed evidence");
         }
 
-        let report = query_report_range(&app, TimeRange::Days(0)).expect("report");
+        let report = query_report_range(&app, TimeRange::DateRange(date, date)).expect("report");
         assert_eq!(report.total_events, 2, "evidence rows remain visible");
         assert_eq!(report.daily.len(), 1);
         assert_eq!(report.daily[0].switches, 0, "no observed focus transition");

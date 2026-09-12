@@ -108,27 +108,7 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         && config.can_reclassify_all()
     {
         let tx = conn.transaction()?;
-        let mut stmt = tx.prepare("SELECT id, app_id, title FROM events")?;
-        let rows: Vec<(i64, String, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
-
-        let mut updated = 0i64;
-        for (id, app_id, title) in &rows {
-            let correct = config.classify(app_id, title);
-            let count = tx.execute(
-                "UPDATE events SET category = ?1 WHERE id = ?2 AND category != ?1",
-                params![correct.to_string(), id],
-            )?;
-            updated = updated.saturating_add(i64::try_from(count).unwrap_or(i64::MAX));
-        }
+        let updated = reclassify_page(&tx, config, None, i64::MAX)?.updated;
 
         tx.execute(
             "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
@@ -145,30 +125,7 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
 
     if !applied.contains(&"003_app_scoped_title_rules".to_string()) && config.can_reclassify_all() {
         let tx = conn.transaction()?;
-        let mut stmt = tx.prepare("SELECT id, app_id, title, category FROM events")?;
-        let rows: Vec<(i64, String, String, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
-
-        let mut updated = 0i64;
-        for (id, app_id, title, old_category) in &rows {
-            let correct = config.classify(app_id, title);
-            if correct.to_string() != *old_category {
-                tx.execute(
-                    "UPDATE events SET category = ?1 WHERE id = ?2",
-                    params![correct.to_string(), id],
-                )?;
-                updated = updated.saturating_add(1);
-            }
-        }
+        let updated = reclassify_page(&tx, config, None, i64::MAX)?.updated;
 
         tx.execute(
             "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
@@ -369,6 +326,57 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
     Ok(())
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct ReclassificationPage {
+    last_id: Option<i64>,
+    updated: i64,
+}
+
+/// Classify and update one ordered page inside the caller's transaction.
+///
+/// Migrations pass no cursor and an unbounded limit, while runtime callers
+/// advance the returned cursor across bounded transactions.
+fn reclassify_page(
+    conn: &Connection,
+    config: &Config,
+    after_id: Option<i64>,
+    limit: i64,
+) -> Result<ReclassificationPage, Error> {
+    let rows: Vec<(i64, String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, app_id, title, category
+               FROM events
+              WHERE ?1 IS NULL OR id > ?1
+              ORDER BY id
+              LIMIT ?2",
+        )?;
+        stmt.query_map(params![after_id, limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    let last_id = rows.last().map(|(id, _, _, _)| *id);
+    let mut updated = 0i64;
+
+    for (id, app_id, title, old_category) in rows {
+        let correct = config.classify(&app_id, &title).to_string();
+        if correct != old_category {
+            let count = conn.execute(
+                "UPDATE events SET category = ?1 WHERE id = ?2 AND category != ?1",
+                params![correct, id],
+            )?;
+            updated = updated.saturating_add(i64::try_from(count).unwrap_or(i64::MAX));
+        }
+    }
+
+    Ok(ReclassificationPage { last_id, updated })
+}
+
 /// Maximum rows read and updated in one reclassification transaction.
 const RECLASSIFY_BATCH_SIZE: usize = 10_000;
 
@@ -389,46 +397,19 @@ fn reclassify_all_in_batches(
     }
 
     let batch_size = i64::try_from(batch_size.max(1)).unwrap_or(i64::MAX);
-    let mut last_id: Option<i64> = None;
+    let mut last_id = None;
     let mut updated = 0i64;
 
     loop {
         let tx = conn.transaction()?;
-        let rows: Vec<(i64, String, String, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT id, app_id, title, category
-                   FROM events
-                  WHERE ?1 IS NULL OR id > ?1
-                  ORDER BY id
-                  LIMIT ?2",
-            )?;
-            stmt.query_map(params![last_id, batch_size], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        };
-        let Some((page_last_id, _, _, _)) = rows.last() else {
-            tx.commit()?;
+        let page = reclassify_page(&tx, config, last_id, batch_size)?;
+        tx.commit()?;
+        updated = updated.saturating_add(page.updated);
+
+        let Some(page_last_id) = page.last_id else {
             break;
         };
-        last_id = Some(*page_last_id);
-
-        for (id, app_id, title, old_category) in &rows {
-            let correct = config.classify(app_id, title).to_string();
-            if correct != *old_category {
-                tx.execute(
-                    "UPDATE events SET category = ?1 WHERE id = ?2",
-                    params![correct, id],
-                )?;
-                updated = updated.saturating_add(1);
-            }
-        }
-        tx.commit()?;
+        last_id = Some(page_last_id);
     }
 
     if updated > 0 {
@@ -939,7 +920,7 @@ fn backfill_projects_in_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Category, Config, DomainRule};
+    use crate::config::{Category, Config, DomainRule, TitleRule};
 
     #[test]
     fn migrations_initialize_a_fresh_database() {
@@ -1037,6 +1018,126 @@ mod tests {
             )
             .expect("count");
         assert_eq!(productive, 5);
+    }
+
+    #[test]
+    fn migrations_and_runtime_share_category_classification() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        init_db(&conn).expect("schema");
+        conn.execute(
+            "INSERT INTO events (timestamp, app_id, title, category, active_ms, idle_ms)
+             VALUES ('2026-08-16T12:00:00+00:00', 'foot', 'terminal work', 'neutral', 1, 0)",
+            [],
+        )
+        .expect("fixture");
+        let config = title_rule_config();
+
+        run_migrations(&mut conn, &config).expect("migrations");
+        let migration_category: String = conn
+            .query_row("SELECT category FROM events", [], |row| row.get(0))
+            .expect("migration category");
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM migrations
+                 WHERE name IN ('002_apply_title_rules', '003_app_scoped_title_rules')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("markers");
+
+        conn.execute("UPDATE events SET category = 'neutral'", [])
+            .expect("reset category");
+        reclassify_all(&mut conn, &config).expect("runtime reclassification");
+        let runtime_category: String = conn
+            .query_row("SELECT category FROM events", [], |row| row.get(0))
+            .expect("runtime category");
+
+        assert_eq!(migration_category, "unproductive");
+        assert_eq!(runtime_category, migration_category);
+        assert_eq!(marker_count, 2);
+    }
+
+    #[test]
+    fn migration_reclassification_rolls_back_category_and_marker_together() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        init_db(&conn).expect("schema");
+        conn.execute_batch(
+            "CREATE TABLE migrations (
+                 id INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE,
+                 applied_at TEXT NOT NULL
+             );
+             INSERT INTO migrations (name, applied_at)
+             VALUES ('001_fix_historical_categories', '2026-08-16T12:00:00Z');
+             INSERT INTO events (timestamp, app_id, title, category, active_ms, idle_ms)
+             VALUES ('2026-08-16T12:00:00+00:00', 'foot', 'terminal work', 'neutral', 1, 0);
+             CREATE TRIGGER reject_migration_marker
+             BEFORE INSERT ON migrations WHEN NEW.name = '002_apply_title_rules'
+             BEGIN SELECT RAISE(ABORT, 'reject test marker'); END;",
+        )
+        .expect("fixture");
+
+        run_migrations(&mut conn, &title_rule_config()).expect_err("migration must fail");
+
+        let category: String = conn
+            .query_row("SELECT category FROM events", [], |row| row.get(0))
+            .expect("category");
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM migrations WHERE name = '002_apply_title_rules'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("marker count");
+        assert_eq!(category, "neutral");
+        assert_eq!(marker_count, 0);
+    }
+
+    #[test]
+    fn runtime_reclassification_commits_completed_batches_before_failure() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        init_db(&conn).expect("schema");
+        for id in 1..=4 {
+            conn.execute(
+                "INSERT INTO events (id, timestamp, app_id, title, category, active_ms, idle_ms)
+                 VALUES (?1, '2026-08-16T12:00:00+00:00', 'foot', 'terminal work', 'neutral', 1, 0)",
+                [id],
+            )
+            .expect("fixture");
+        }
+        conn.execute_batch(
+            "CREATE TRIGGER reject_third_category_update
+             BEFORE UPDATE OF category ON events WHEN OLD.id = 3
+             BEGIN SELECT RAISE(ABORT, 'reject third update'); END;",
+        )
+        .expect("trigger");
+
+        reclassify_all_in_batches(&mut conn, &title_rule_config(), 2)
+            .expect_err("second batch must fail");
+
+        let categories: Vec<String> = conn
+            .prepare("SELECT category FROM events ORDER BY id")
+            .expect("query")
+            .query_map([], |row| row.get(0))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("categories");
+        assert_eq!(
+            categories,
+            ["unproductive", "unproductive", "neutral", "neutral"]
+        );
+    }
+
+    fn title_rule_config() -> Config {
+        Config {
+            title_rules: vec![TitleRule {
+                pattern: "terminal".to_string(),
+                category: Category::Unproductive,
+                app: vec!["foot".to_string()],
+                compiled: None,
+            }],
+            ..Config::default()
+        }
     }
 
     #[test]
