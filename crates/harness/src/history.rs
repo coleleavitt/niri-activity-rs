@@ -15,14 +15,33 @@ use crate::harness::Harness;
 pub const BUCKET_SECS: i64 = 60;
 
 /// Minute buckets during which an agent left evidence of working.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BusyMinutes {
     minutes: BTreeSet<i64>,
+    complete: bool,
+}
+
+impl Default for BusyMinutes {
+    fn default() -> Self {
+        Self {
+            minutes: BTreeSet::new(),
+            complete: true,
+        }
+    }
 }
 
 impl BusyMinutes {
     pub fn is_empty(&self) -> bool {
         self.minutes.is_empty()
+    }
+
+    /// Whether every configured historical source fit within its scan budget.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    fn mark_incomplete(&mut self) {
+        self.complete = false;
     }
 
     pub fn len(&self) -> usize {
@@ -202,6 +221,141 @@ fn scan_log(path: &Path, since: i64, until: i64, busy: &mut BusyMinutes) {
     }
 }
 
+/// Prime transcripts contain user and agent records in the same append-only
+/// file. Only completed assistant/tool-result messages prove agent work; a
+/// user prompt proves human input, not that a model produced anything.
+fn prime_message_timestamp(line: &str) -> Option<i64> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("type")?.as_str()? != "message" {
+        return None;
+    }
+    match value.get("message")?.get("role")?.as_str()? {
+        "assistant" | "toolResult" => {}
+        _ => return None,
+    }
+    value.get("timestamp")?.as_str().and_then(parse_rfc3339)
+}
+
+fn scan_prime_log(path: &Path, since: i64, until: i64, busy: &mut BusyMinutes) {
+    let Ok(file) = fs::File::open(path) else {
+        return;
+    };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if let Some(secs) = prime_message_timestamp(&line) {
+            if secs >= since && secs < until {
+                busy.insert(secs);
+            }
+        }
+    }
+}
+
+const MAX_PRIME_HISTORY_ENTRIES: usize = 50_000;
+const MAX_PRIME_HISTORY_FILES: usize = 10_000;
+const MAX_PRIME_HISTORY_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_PRIME_HISTORY_DEPTH: usize = 32;
+
+fn bounded_recent_prime_files(
+    roots: impl IntoIterator<Item = PathBuf>,
+    since: i64,
+) -> Option<Vec<PathBuf>> {
+    bounded_recent_prime_files_with_limits(
+        roots,
+        since,
+        MAX_PRIME_HISTORY_ENTRIES,
+        MAX_PRIME_HISTORY_FILES,
+        MAX_PRIME_HISTORY_BYTES,
+    )
+}
+
+fn bounded_recent_prime_files_with_limits(
+    roots: impl IntoIterator<Item = PathBuf>,
+    since: i64,
+    max_entries: usize,
+    max_files: usize,
+    max_bytes: u64,
+) -> Option<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut bytes = 0u64;
+    let mut entries_seen = 0usize;
+    let mut stack: Vec<_> = roots.into_iter().map(|root| (root, 0usize)).collect();
+    while let Some((current, depth)) = stack.pop() {
+        let Ok(entries) = fs::read_dir(current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            entries_seen = entries_seen.saturating_add(1);
+            if entries_seen > max_entries {
+                return None;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                if depth < MAX_PRIME_HISTORY_DEPTH {
+                    stack.push((entry.path(), depth + 1));
+                }
+                continue;
+            }
+            let path = entry.path();
+            if path
+                .extension()
+                .is_none_or(|extension| extension != "jsonl")
+            {
+                continue;
+            }
+            let fresh = metadata.modified().is_ok_and(|modified| {
+                modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .is_ok_and(|duration| {
+                        i64::try_from(duration.as_secs()).unwrap_or(i64::MAX) >= since
+                    })
+            });
+            if !fresh {
+                continue;
+            }
+            files.push(path);
+            bytes = bytes.saturating_add(metadata.len());
+            if files.len() > max_files || bytes > max_bytes {
+                return None;
+            }
+        }
+    }
+    Some(files)
+}
+
+fn scan_prime_roots(
+    roots: impl IntoIterator<Item = PathBuf>,
+    since: i64,
+    until: i64,
+    busy: &mut BusyMinutes,
+) {
+    let Some(files) = bounded_recent_prime_files(roots, since) else {
+        busy.mark_incomplete();
+        return;
+    };
+    for path in files {
+        scan_prime_log(&path, since, until, busy);
+    }
+}
+
+fn prime_session_roots() -> Vec<PathBuf> {
+    let sessions = std::env::var_os("PRIME_AGENT_SESSION_DIR")
+        .or_else(|| std::env::var_os("PRIME_AGENT_CODING_AGENT_SESSION_DIR"))
+        .map(PathBuf::from)
+        .or_else(|| detect::expand_tilde("~/.prime/agent/sessions"));
+    let Some(sessions) = sessions else {
+        return Vec::new();
+    };
+    let artifacts = sessions
+        .parent()
+        .map(|parent| parent.join("session-artifacts"));
+    std::iter::once(sessions).chain(artifacts).collect()
+}
+
+fn scan_prime(since: i64, until: i64, busy: &mut BusyMinutes) {
+    scan_prime_roots(prime_session_roots(), since, until, busy);
+}
+
 const OPENCODE_STEP_TIMES: &str = "\
     SELECT time_updated / 1000 FROM part \
     WHERE time_updated BETWEEN ?1 AND ?2 \
@@ -257,9 +411,10 @@ pub fn busy_minutes(since: i64, until: i64) -> BusyMinutes {
     }
 
     scan_opencode(since, until, &mut busy);
+    scan_prime(since, until, &mut busy);
 
     for harness in Harness::ALL {
-        if *harness == Harness::OpenCode {
+        if matches!(harness, Harness::OpenCode | Harness::PrimeAgent) {
             continue;
         }
         for signal in harness.signals() {
@@ -365,6 +520,109 @@ mod tests {
         let start = 1_767_225_600 * 1000;
         // Spans three minutes, of which the first and third are busy.
         assert_eq!(busy.overlap_ms(start, start + 180_000), 120_000);
+    }
+
+    #[test]
+    fn prime_history_counts_only_agent_generated_messages() {
+        let assistant = r#"{"type":"message","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant"}}"#;
+        let tool = r#"{"type":"message","timestamp":"2026-01-01T00:01:00Z","message":{"role":"toolResult"}}"#;
+        let user =
+            r#"{"type":"message","timestamp":"2026-01-01T00:02:00Z","message":{"role":"user"}}"#;
+        let custom = r#"{"type":"custom_message","timestamp":"2026-01-01T00:03:00Z","message":{"role":"assistant"}}"#;
+
+        assert_eq!(prime_message_timestamp(assistant), Some(1_767_225_600));
+        assert_eq!(prime_message_timestamp(tool), Some(1_767_225_660));
+        assert_eq!(prime_message_timestamp(user), None);
+        assert_eq!(prime_message_timestamp(custom), None);
+        assert_eq!(prime_message_timestamp("not json"), None);
+    }
+
+    #[test]
+    fn prime_history_scans_top_level_and_nested_session_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let top = dir.path().join("sessions/top.jsonl");
+        let child = dir
+            .path()
+            .join("session-artifacts/root/child/session.jsonl");
+        fs::create_dir_all(top.parent().expect("top parent")).expect("mkdir");
+        fs::create_dir_all(child.parent().expect("child parent")).expect("mkdir");
+        fs::write(
+            &top,
+            concat!(
+                r#"{"type":"message","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant"}}"#,
+                "\n",
+                r#"{"type":"message","timestamp":"2026-01-01T00:01:00Z","message":{"role":"user"}}"#,
+                "\n",
+            ),
+        )
+        .expect("top transcript");
+        fs::write(
+            &child,
+            concat!(
+                r#"{"type":"message","timestamp":"2026-01-01T00:02:00Z","message":{"role":"toolResult"}}"#,
+                "\n",
+            ),
+        )
+        .expect("child transcript");
+
+        let mut busy = BusyMinutes::default();
+        scan_prime_roots(
+            [
+                dir.path().join("sessions"),
+                dir.path().join("session-artifacts"),
+            ],
+            1_767_225_500,
+            1_767_225_800,
+            &mut busy,
+        );
+        assert_eq!(busy.len(), 2);
+        assert!(busy.contains(1_767_225_600));
+        assert!(!busy.contains(1_767_225_660));
+        assert!(busy.contains(1_767_225_720));
+    }
+
+    #[test]
+    fn prime_history_budget_overflow_is_explicit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("sessions/one.jsonl");
+        fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
+        fs::write(&transcript, "{}\n").expect("transcript");
+
+        assert!(
+            bounded_recent_prime_files_with_limits(
+                [dir.path().join("sessions")],
+                0,
+                0,
+                usize::MAX,
+                u64::MAX,
+            )
+            .is_none(),
+            "overflow must not look like a complete empty scan"
+        );
+    }
+
+    #[test]
+    fn prime_history_reports_complete_for_a_bounded_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("sessions/one.jsonl");
+        fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"message","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant"}}"#,
+                "\n",
+            ),
+        )
+        .expect("transcript");
+        let mut busy = BusyMinutes::default();
+        scan_prime_roots(
+            [dir.path().join("sessions")],
+            1_767_225_500,
+            1_767_225_800,
+            &mut busy,
+        );
+        assert!(busy.is_complete());
+        assert_eq!(busy.len(), 1);
     }
 
     fn create_opencode(path: &Path, seconds: i64) {

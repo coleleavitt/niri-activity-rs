@@ -483,6 +483,9 @@ pub fn query_report_range(app: &App, range: TimeRange) -> Result<ReportData, Err
     let mut schedule_totals = (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
     for event in &events {
         if event.source_start_ms == event.start_ms
+            // Reconstructed agent evidence has no observed focused window, so
+            // each disjoint evidence run must not masquerade as a focus switch.
+            && event.app_id != "prime-agent-reconstructed"
             && let Some(timestamp) = event.local_start(&app.config)
         {
             let day = timestamp.format("%Y-%m-%d").to_string();
@@ -2961,6 +2964,31 @@ mod tests {
         assert_eq!(result.total_clicks, 150);
         assert!(!result.categories.is_empty());
         assert!(!result.top_apps.is_empty());
+    }
+
+    #[test]
+    fn reconstructed_agent_intervals_are_not_focus_switches() {
+        let app = create_test_app();
+        let today = app.config.local_date_today();
+        for minute in [0, 2] {
+            insert_test_event(
+                &app.conn,
+                &format!("{today}T10:{minute:02}:00+00:00"),
+                "prime-agent-reconstructed",
+                "neutral",
+                0,
+                0,
+                60_000,
+                0,
+                0,
+            )
+            .expect("reconstructed evidence");
+        }
+
+        let report = query_report_range(&app, TimeRange::Days(0)).expect("report");
+        assert_eq!(report.total_events, 2, "evidence rows remain visible");
+        assert_eq!(report.daily.len(), 1);
+        assert_eq!(report.daily[0].switches, 0, "no observed focus transition");
     }
 
     #[test]

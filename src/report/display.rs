@@ -86,11 +86,7 @@ pub fn show_metrics_range(app: &App, range: TimeRange) -> Result<(), Error> {
     println!(
         "Productive Idle:         {} {}",
         fmt_duration(m.productive_idle_ms).dimmed(),
-        pct(
-            m.productive_idle_ms,
-            m.productive_ms.saturating_add(m.productive_idle_ms)
-        )
-        .dimmed()
+        pct(m.productive_idle_ms, m.productive_ms).dimmed()
     );
     Ok(())
 }

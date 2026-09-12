@@ -533,17 +533,26 @@ pub fn heal_missing_agent_ms(conn: &mut Connection) -> Result<i64, Error> {
 
 pub fn backfill_agent_ms(conn: &mut Connection, since_secs: i64) -> Result<i64, Error> {
     let now_secs = Utc::now().timestamp();
-    // Settle boundary: rows newer than this may still be filled by the live
-    // watcher, so the healer leaves them NULL to avoid a race.
     let before_secs = now_secs.saturating_sub(AGENT_HEAL_GRACE_SECS);
     if before_secs <= since_secs {
         return Ok(0);
     }
 
-    // Log discovery is substantially more expensive than the indexed event
-    // query. Compute it once for the requested interval, then reuse it while
-    // draining bounded database batches.
     let busy = harness::busy_minutes(since_secs, before_secs);
+    if !busy.is_complete() {
+        return Err(Error::NiriError(
+            "agent-history scan exceeded its safety budget; pending rows remain unmeasured".into(),
+        ));
+    }
+    backfill_agent_ms_with_busy(conn, since_secs, before_secs, &busy)
+}
+
+fn backfill_agent_ms_with_busy(
+    conn: &mut Connection,
+    since_secs: i64,
+    before_secs: i64,
+    busy: &harness::BusyMinutes,
+) -> Result<i64, Error> {
     let mut settled = 0i64;
     let mut cursor: Option<(String, i64)> = None;
 
@@ -1240,7 +1249,10 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
             .expect("fixed")
             .timestamp();
-        let settled = backfill_agent_ms(&mut conn, since).expect("backfill");
+        let before = Utc::now().timestamp() - AGENT_HEAL_GRACE_SECS;
+        let busy = harness::BusyMinutes::default();
+        let settled =
+            backfill_agent_ms_with_busy(&mut conn, since, before, &busy).expect("backfill");
         assert_eq!(settled, 2, "progress includes measured-zero rows");
 
         let still_null: i64 = conn
@@ -1277,7 +1289,10 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
             .expect("fixed")
             .timestamp();
-        let settled = backfill_agent_ms(&mut conn, since).expect("backfill");
+        let before = Utc::now().timestamp() - AGENT_HEAL_GRACE_SECS;
+        let busy = harness::BusyMinutes::default();
+        let settled =
+            backfill_agent_ms_with_busy(&mut conn, since, before, &busy).expect("backfill");
         let still_null: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM events WHERE agent_ms IS NULL",
@@ -1294,7 +1309,12 @@ mod tests {
     fn malformed_oldest_timestamp_does_not_wedge_healing() {
         let mut conn = db_with_events(&["not-a-timestamp", "2026-01-01T00:00:00+00:00"]);
 
-        let settled = heal_missing_agent_ms(&mut conn).expect("heal");
+        let oldest = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
+            .expect("fixed")
+            .timestamp();
+        let before = Utc::now().timestamp() - AGENT_HEAL_GRACE_SECS;
+        let busy = harness::BusyMinutes::default();
+        let settled = backfill_agent_ms_with_busy(&mut conn, oldest, before, &busy).expect("heal");
         let malformed: Option<i64> = conn
             .query_row(
                 "SELECT agent_ms FROM events WHERE timestamp = 'not-a-timestamp'",

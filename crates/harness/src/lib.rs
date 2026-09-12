@@ -16,6 +16,11 @@
 //!     // The user is waiting on an agent, not idle.
 //! }
 //! ```
+//!
+//! Prime Agent live detection reads semantic `agent.prompt` trace spans rather
+//! than raw log mtimes, so idle daemon maintenance is not mistaken for work.
+//! Historical reconstruction reads finalized assistant/tool-result messages
+//! from both top-level and recursive child session transcripts.
 
 mod detect;
 mod harness;

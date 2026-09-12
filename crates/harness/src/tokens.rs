@@ -395,6 +395,7 @@ mod tests {
     fn only_some_harnesses_report_tokens() {
         assert!(Harness::OpenCode.token_source().is_some());
         assert!(Harness::Codex.token_source().is_some());
+        assert!(Harness::PrimeAgent.token_source().is_none());
         assert!(Harness::ClaudeCode.token_source().is_none());
     }
 

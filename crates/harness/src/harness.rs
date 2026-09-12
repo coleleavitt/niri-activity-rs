@@ -4,6 +4,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Harness {
     OpenCode,
+    PrimeAgent,
     ClaudeCode,
     Codex,
     Grok,
@@ -31,12 +32,18 @@ pub enum Signal {
     LogDir(&'static str),
     /// A single append-only log file.
     LogFile(&'static str),
+    /// Prime Agent's structured trace log. Only live `agent.prompt` spans
+    /// count; unrelated daemon diagnostics in the same file do not.
+    PrimeTrace(&'static str),
 }
 
 impl Signal {
     pub fn path(self) -> &'static str {
         match self {
-            Signal::Database(p) | Signal::LogDir(p) | Signal::LogFile(p) => p,
+            Signal::Database(p)
+            | Signal::LogDir(p)
+            | Signal::LogFile(p)
+            | Signal::PrimeTrace(p) => p,
         }
     }
 }
@@ -44,6 +51,7 @@ impl Signal {
 impl Harness {
     pub const ALL: &'static [Harness] = &[
         Harness::OpenCode,
+        Harness::PrimeAgent,
         Harness::ClaudeCode,
         Harness::Codex,
         Harness::Grok,
@@ -64,6 +72,7 @@ impl Harness {
     pub fn process_name(self) -> &'static str {
         match self {
             Harness::OpenCode => "opencode",
+            Harness::PrimeAgent => "prime-agent",
             Harness::ClaudeCode => "claude",
             Harness::Codex => "codex",
             Harness::Grok => "grok",
@@ -87,6 +96,12 @@ impl Harness {
             Harness::OpenCode => &[
                 Signal::Database("~/.local/share/opencode/opencode*.db"),
                 Signal::LogDir("~/.local/share/opencode/storage/session"),
+            ],
+            Harness::PrimeAgent => &[
+                // Prime's shared log also contains idle daemon maintenance, so
+                // generic mtime detection would overcount. Match only open
+                // `agent.prompt` spans and require a live Prime process.
+                Signal::PrimeTrace("~/.prime/agent/logs/agent.jsonl"),
             ],
             Harness::ClaudeCode => &[
                 Signal::LogDir("~/.claude/transcripts"),
@@ -129,6 +144,7 @@ impl Harness {
     pub fn name(self) -> &'static str {
         match self {
             Harness::OpenCode => "OpenCode",
+            Harness::PrimeAgent => "Prime Agent",
             Harness::ClaudeCode => "Claude Code",
             Harness::Codex => "Codex",
             Harness::Grok => "Grok",
@@ -169,6 +185,14 @@ mod tests {
         for h in Harness::ALL {
             assert!(!h.signals().is_empty(), "{h} has no signal to check");
         }
+    }
+
+    #[test]
+    fn prime_uses_the_bounded_structured_log_for_live_detection() {
+        assert_eq!(
+            Harness::PrimeAgent.signals(),
+            &[Signal::PrimeTrace("~/.prime/agent/logs/agent.jsonl")]
+        );
     }
 
     #[test]

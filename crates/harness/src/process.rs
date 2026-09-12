@@ -9,6 +9,36 @@ fn is_current_user(entry_uid: u32, current_uid: u32) -> bool {
     entry_uid == current_uid
 }
 
+#[cfg(unix)]
+pub(crate) fn pid_matches_harness_since(pid: u64, harness: Harness, trace_start_secs: i64) -> bool {
+    let path = std::path::PathBuf::from("/proc").join(pid.to_string());
+    let Ok(current_uid) = fs::metadata("/proc/self").map(|metadata| metadata.uid()) else {
+        return false;
+    };
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !is_current_user(metadata.uid(), current_uid) {
+        return false;
+    }
+    // procfs directory ctime is the process creation time on Linux. Reject a
+    // trace emitted before the current process existed, which closes the PID
+    // reuse hole left by an unmatched span from a crashed worker.
+    if trace_start_secs < metadata.ctime() {
+        return false;
+    }
+    fs::read_to_string(path.join("comm")).is_ok_and(|comm| comm.trim() == harness.process_name())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn pid_matches_harness_since(
+    _pid: u64,
+    _harness: Harness,
+    _trace_start_secs: i64,
+) -> bool {
+    false
+}
+
 /// Harnesses with a matching process currently running.
 ///
 /// Presence alone does not mean an agent is working — a CLI left open at a
