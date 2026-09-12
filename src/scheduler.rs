@@ -165,6 +165,25 @@ fn ensure_jobs(conn: &Connection, jobs: &[Job]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Materialize overdue report jobs without claiming or sending them.
+///
+/// This belongs in the watcher's critical startup path so later maintenance
+/// failures cannot erase knowledge of a report that is due.
+pub fn discover_scheduled_reports(conn: &Connection, config: &Config) -> Result<(), Error> {
+    discover_scheduled_reports_on(conn, config, config.local_now().date_naive())
+}
+
+fn discover_scheduled_reports_on(
+    conn: &Connection,
+    config: &Config,
+    today: NaiveDate,
+) -> Result<(), Error> {
+    if !config.email.enabled {
+        return Ok(());
+    }
+    ensure_jobs(conn, &candidate_jobs(today))
+}
+
 fn claim_job(
     conn: &mut Connection,
     job: &Job,
@@ -612,6 +631,54 @@ mod tests {
             claim_job_unless_stopping(&mut conn, &job, "restart", Utc::now(), CLAIM_LEASE, &stop,)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn discovery_materializes_completed_week_without_sending() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema(&conn);
+        let mut config = Config::default();
+        config.email.enabled = true;
+
+        discover_scheduled_reports_on(
+            &conn,
+            &config,
+            NaiveDate::from_ymd_opt(2026, 9, 12).unwrap(),
+        )
+        .unwrap();
+
+        let range: (String, String, String) = conn
+            .query_row(
+                "SELECT range_start, range_end, state FROM scheduled_report_jobs
+                 WHERE period_type = 'weekly' AND period_key = '2026-09-05'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            range,
+            ("2026-09-05".into(), "2026-09-11".into(), "pending".into())
+        );
+    }
+
+    #[test]
+    fn discovery_is_a_no_op_when_email_is_disabled() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema(&conn);
+
+        discover_scheduled_reports_on(
+            &conn,
+            &Config::default(),
+            NaiveDate::from_ymd_opt(2026, 9, 12).unwrap(),
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scheduled_report_jobs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

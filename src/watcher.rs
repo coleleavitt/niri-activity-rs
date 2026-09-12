@@ -23,7 +23,7 @@ use crate::fmt::{cat_colored, cat_label, fmt_duration_compact, truncate};
 use crate::input::{InputSnapshot, start_idle_monitor};
 use crate::logind::start_logind_monitor;
 use crate::project;
-use crate::scheduler::{Scheduler, check_scheduled_reports};
+use crate::scheduler::{Scheduler, check_scheduled_reports, discover_scheduled_reports};
 
 // Duration constants
 const FLUSH_INTERVAL_SECS: u64 = 300; // 5 minutes
@@ -1446,6 +1446,7 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
         let _linkscope_db_init = linkscope::phase("watch.db_init");
         init_db(&conn)?;
         run_migrations(&mut conn, &config)?;
+        discover_scheduled_reports(&conn, &config)?;
         reclassify_all(&mut conn, &config)?;
         match crate::db::heal_missing_agent_ms(&mut conn) {
             Ok(0) => {}
@@ -1459,6 +1460,9 @@ pub fn watch(quiet: bool) -> Result<(), Error> {
     // Report generation and SMTP live on a dedicated bounded worker. The
     // watcher only performs non-blocking queue pokes.
     let mut scheduler = Scheduler::start(quiet)?;
+    // Discover overdue jobs immediately. Waiting for the first five-minute
+    // maintenance tick can lose catch-up mail if the watcher exits early.
+    check_scheduled_reports(&scheduler, &config);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
