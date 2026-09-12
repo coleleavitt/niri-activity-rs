@@ -2,3 +2,4 @@
 .sisyphus/boulder.json
 !Cargo.lock
 research/
+.pi/
