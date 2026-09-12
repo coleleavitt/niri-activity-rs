@@ -189,7 +189,7 @@ fn email_period_name(range: &report::TimeRange) -> &'static str {
 
 #[derive(Parser)]
 #[command(name = "niri-activity-rs")]
-#[command(about = "Track window focus on Niri compositor")]
+#[command(about = "Track focused-window activity across Wayland compositors")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -202,6 +202,16 @@ enum Commands {
         /// Suppress per-event output (still logs untracked apps)
         #[arg(short, long)]
         quiet: bool,
+        /// Window-tracking backend. Auto selects only a capability-proven
+        /// backend.
+        #[arg(long, value_enum, default_value_t = tracker::Backend::Auto)]
+        backend: tracker::Backend,
+    },
+    /// Show compositor hints, capability probes, and selected backend.
+    Info {
+        /// Backend to probe, or auto for capability-based selection.
+        #[arg(long, value_enum, default_value_t = tracker::Backend::Auto)]
+        backend: tracker::Backend,
     },
     /// Show today's activity
     Today,
@@ -374,7 +384,15 @@ fn main() {
         Some(Commands::Tui { days, time }) => {
             parse_time_range(days, &time).and_then(tui::run_tui_range)
         }
-        Some(Commands::Watch { quiet }) => watcher::watch(quiet),
+        Some(Commands::Watch { quiet, backend }) => tracker::select_runtime(backend)
+            .map_err(|error| Error::Tracker(error.to_string()))
+            .and_then(|selected| watcher::watch_with_tracker(quiet, selected.tracker.as_ref())),
+        Some(Commands::Info { backend }) => tracker::select_runtime(backend)
+            .map(|selected| println!("{}", selected.report.format_info()))
+            .map_err(|error| {
+                eprintln!("{}", error.report.format_info());
+                Error::Tracker(error.to_string())
+            }),
         Some(Commands::Today) => report::App::open().and_then(|app| report::show_today(&app)),
         Some(Commands::Metrics { days, time }) => parse_time_range(days, &time).and_then(|range| {
             report::App::open().and_then(|app| report::show_metrics_range(&app, range))

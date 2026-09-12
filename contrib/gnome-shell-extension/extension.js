@@ -17,7 +17,7 @@ function sanitizeString(value, maxCodepoints) {
     // D-Bus strings cannot contain NUL. Other control characters have no useful
     // identity semantics and can corrupt diagnostics produced by clients.
     const sanitized = value
-        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, ' ');
+        .replace(/[\u0000-\u001f\u007f-\u009f]/gu, ' ');
     return [...sanitized].slice(0, maxCodepoints).join('');
 }
 

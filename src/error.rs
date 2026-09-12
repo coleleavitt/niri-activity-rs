@@ -4,6 +4,8 @@ use thiserror::Error;
 #[allow(clippy::enum_variant_names)]
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("window tracker: {0}")]
+    Tracker(String),
     #[error("niri ipc: {0}")]
     NiriIpc(String),
     #[error("io: {0}")]

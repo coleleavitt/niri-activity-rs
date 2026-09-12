@@ -23,7 +23,7 @@ use crate::scheduler::{Scheduler, check_scheduled_reports, discover_scheduled_re
 // Compatibility surface for persistence code while tracker ownership moves out
 // of the orchestration module. New code should import from `crate::tracker`.
 pub use crate::tracker::WindowInfo;
-use crate::tracker::{NiriTracker, Snapshot, Update, WindowId, WindowTracker};
+use crate::tracker::{Snapshot, Update, WindowId, WindowTracker};
 
 // Duration constants
 const FLUSH_INTERVAL_SECS: u64 = 300; // 5 minutes
@@ -817,21 +817,36 @@ struct WindowEventContext<'a> {
     logged_untracked: &'a mut std::collections::HashSet<String>,
 }
 
+fn validate_snapshot(snapshot: &Snapshot) -> Result<(), Error> {
+    let mut ids = std::collections::HashSet::with_capacity(snapshot.windows.len());
+    if snapshot
+        .windows
+        .iter()
+        .any(|window| !ids.insert(&window.id))
+    {
+        return Err(Error::Tracker(
+            "window tracker snapshot contains duplicate window IDs".to_owned(),
+        ));
+    }
+    if snapshot
+        .focused
+        .as_ref()
+        .is_some_and(|focused| !ids.contains(focused))
+    {
+        return Err(Error::Tracker(
+            "window tracker snapshot focused an unknown window".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn handle_snapshot(
     state: &mut WatchState,
     ctx: &WindowEventContext<'_>,
     snapshot: Snapshot,
     initial: bool,
 ) -> Result<(), Error> {
-    if snapshot
-        .focused
-        .as_ref()
-        .is_some_and(|focused| !snapshot.windows.iter().any(|window| &window.id == focused))
-    {
-        return Err(Error::NiriIpc(
-            "window tracker snapshot focused an unknown window".to_owned(),
-        ));
-    }
+    validate_snapshot(&snapshot)?;
     // Startup establishes a baseline and must not flush an empty predecessor.
     // A later snapshot is a conservative resync boundary: flush exactly once
     // before replacing all potentially stale state.
@@ -1146,33 +1161,6 @@ fn print_focus_change_status(
     );
 }
 
-fn flush_on_disconnect(
-    state: &mut WatchState,
-    flush_ctx: &FlushContext<'_>,
-    input_stats: &crate::input::InputStats,
-) {
-    let info = state
-        .focused_id
-        .as_ref()
-        .and_then(|id| state.windows.get(id))
-        .cloned();
-    if let Some(ref info) = info {
-        tracing::debug!(target: "input_debug", "SNAPSHOT caller: flush_on_disconnect");
-        let input = input_stats.snapshot();
-        let jiggler = input_stats.jiggler_detected();
-        if let Err(e) = flush_session(
-            flush_ctx,
-            Some(info),
-            &mut state.make_accum(),
-            &input,
-            jiggler,
-            FlushReset::NoReset,
-        ) {
-            tracing::warn!("flush on disconnect failed: {}", e);
-        }
-    }
-}
-
 /// Flush the current session: reclassify false-active time, insert the DB
 /// event, and optionally reset accumulators based on `reset` mode.
 /// Maximum age of the pwd file (written by shell hooks) before we consider it
@@ -1417,7 +1405,7 @@ fn flush_session(
 }
 
 fn tracker_error_to_app(error: crate::tracker::TrackerError) -> Error {
-    Error::NiriIpc(format!("{:?}: {error}", error.kind()))
+    Error::Tracker(format!("{:?}: {error}", error.kind()))
 }
 
 fn invalidate_window_state(state: &mut WatchState) {
@@ -1426,9 +1414,47 @@ fn invalidate_window_state(state: &mut WatchState) {
     state.reset_accumulators();
 }
 
-/// Monitor window focus using the default niri tracker.
-pub fn watch(quiet: bool) -> Result<(), Error> {
-    watch_with_tracker(quiet, &NiriTracker)
+fn close_tracker_boundary(
+    state: &mut WatchState,
+    flush_ctx: &FlushContext<'_>,
+    input: &InputSnapshot,
+    jiggler: bool,
+    boundary: Instant,
+    agent_active: bool,
+) {
+    charge_boundary_elapsed(state, boundary, agent_active);
+    let info = state
+        .focused_id
+        .as_ref()
+        .and_then(|id| state.windows.get(id))
+        .cloned();
+    if let Some(ref info) = info
+        && let Err(error) = flush_session(
+            flush_ctx,
+            Some(info),
+            &mut state.make_accum(),
+            input,
+            jiggler,
+            FlushReset::NoReset,
+        )
+    {
+        tracing::error!(%error, "failed to persist window tracker failure boundary");
+    }
+    invalidate_window_state(state);
+}
+
+fn close_tracker_failure(
+    state: &mut WatchState,
+    flush_ctx: &FlushContext<'_>,
+    input_stats: &crate::input::InputStats,
+    agent_monitor: &mut AgentMonitor,
+    monitor_start: Instant,
+    boundary: Instant,
+) {
+    let agent_active = detect_agent_activity(state, input_stats, agent_monitor, monitor_start);
+    let input = input_stats.snapshot();
+    let jiggler = input_stats.jiggler_detected();
+    close_tracker_boundary(state, flush_ctx, &input, jiggler, boundary, agent_active);
 }
 
 /// Monitor window focus using an explicitly selected compositor tracker.
@@ -1631,25 +1657,29 @@ pub fn watch_with_tracker(quiet: bool, tracker: &dyn WindowTracker) -> Result<()
                     if shutdown.load(Ordering::SeqCst) {
                         continue;
                     }
-                    let boundary = Instant::now();
-                    let agent_active = detect_agent_activity(
-                        &state,
+                    close_tracker_failure(
+                        &mut state,
+                        &flush_ctx,
                         &input_stats,
                         &mut agent_monitor,
                         monitor_start,
+                        Instant::now(),
                     );
-                    charge_boundary_elapsed(&mut state, boundary, agent_active);
-                    flush_on_disconnect(&mut state, &flush_ctx, &input_stats);
-                    invalidate_window_state(&mut state);
                     return Err(tracker_error_to_app(error));
                 }
             }
         };
 
         if !received_initial_snapshot && !matches!(update, Update::Snapshot(_)) {
-            flush_on_disconnect(&mut state, &flush_ctx, &input_stats);
-            invalidate_window_state(&mut state);
-            return Err(Error::NiriIpc(format!(
+            close_tracker_failure(
+                &mut state,
+                &flush_ctx,
+                &input_stats,
+                &mut agent_monitor,
+                monitor_start,
+                Instant::now(),
+            );
+            return Err(Error::Tracker(format!(
                 "{} sent an incremental update before its mandatory initial snapshot",
                 tracker.backend_name()
             )));
@@ -1671,6 +1701,17 @@ pub fn watch_with_tracker(quiet: bool, tracker: &dyn WindowTracker) -> Result<()
         match update {
             Update::Snapshot(snapshot) => {
                 let _linkscope_event = linkscope::phase("watch.event.snapshot");
+                if let Err(error) = validate_snapshot(&snapshot) {
+                    close_tracker_failure(
+                        &mut state,
+                        &flush_ctx,
+                        &input_stats,
+                        &mut agent_monitor,
+                        monitor_start,
+                        Instant::now(),
+                    );
+                    return Err(error);
+                }
                 handle_snapshot(
                     &mut state,
                     &window_ctx,
@@ -1711,9 +1752,15 @@ pub fn watch_with_tracker(quiet: bool, tracker: &dyn WindowTracker) -> Result<()
                     .as_ref()
                     .is_some_and(|id| !state.windows.contains_key(id))
                 {
-                    flush_on_disconnect(&mut state, &flush_ctx, &input_stats);
-                    invalidate_window_state(&mut state);
-                    return Err(Error::NiriIpc(
+                    close_tracker_failure(
+                        &mut state,
+                        &flush_ctx,
+                        &input_stats,
+                        &mut agent_monitor,
+                        monitor_start,
+                        Instant::now(),
+                    );
+                    return Err(Error::Tracker(
                         "window tracker focused an unknown window".to_owned(),
                     ));
                 }
@@ -2172,5 +2219,61 @@ mod tests {
             decide_metadata_change(&state, MetadataChange::AppChanged, state.last_title_flush),
             MetadataChangeDecision::RolloverApp
         );
+    }
+
+    #[test]
+    fn malformed_resync_persists_current_segment_before_invalidation() {
+        let mut conn = Connection::open_in_memory().expect("database");
+        init_db(&conn).expect("schema");
+        let config = Config::default();
+        run_migrations(&mut conn, &config).expect("migrations");
+        let flush_ctx = FlushContext {
+            conn: &conn,
+            config: &config,
+            input_active_ms: 60_000,
+            quiet: true,
+        };
+        let mut state = WatchState::new(0, 0);
+        state.focused_id = Some(id(1));
+        state
+            .windows
+            .insert(id(1), info(1, "old-app", "old title", None));
+        state.accumulated_active_ms = 5_000;
+        let malformed = Snapshot {
+            windows: vec![info(2, "new-app", "new title", None)],
+            focused: Some(id(99)),
+        };
+
+        assert!(validate_snapshot(&malformed).is_err());
+        let boundary = state.last_idle_check;
+        close_tracker_boundary(
+            &mut state,
+            &flush_ctx,
+            &InputSnapshot::default(),
+            false,
+            boundary,
+            false,
+        );
+
+        let saved: (String, String, i64) = conn
+            .query_row(
+                "SELECT app_id, title, active_ms + passive_ms + idle_ms FROM events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("saved old focus");
+        assert_eq!(saved, ("old-app".to_owned(), "old title".to_owned(), 5_000));
+        assert!(state.focused_id.is_none());
+        assert!(state.windows.is_empty());
+        assert_eq!(state.accumulated_active_ms, 0);
+    }
+
+    #[test]
+    fn snapshot_rejects_duplicate_ids() {
+        let duplicate = Snapshot {
+            windows: vec![info(7, "one", "one", None), info(7, "two", "two", None)],
+            focused: Some(id(7)),
+        };
+        assert!(validate_snapshot(&duplicate).is_err());
     }
 }

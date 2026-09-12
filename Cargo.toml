@@ -10,7 +10,7 @@ rust-version = "1.85"
 license = "GPL-3.0-or-later"
 
 [dependencies]
-niri-ipc = "=26.4.0"
+niri-ipc = { version = "=26.4.0", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4.44", features = ["serde"] }
@@ -23,12 +23,12 @@ toml = "1.1.2"
 input = { version = "0.9", features = ["libinput_1_21"] }
 libc = "0.2"
 signal-hook = "0.4.3"
-backon = { version = "1", default-features = false, features = ["std-blocking-sleep"] }
+backon = { version = "1", optional = true, default-features = false, features = ["std-blocking-sleep"] }
 owo-colors = "4.3.0"
 ratatui = { version = "0.30.2", features = ["crossterm"] }
 crossterm = "0.29"
 regex = "1.12.3"
-rustix = { version = "1", features = ["event"] }
+rustix = { version = "1", features = ["event", "net"] }
 logind-zbus = "5.3"
 zbus = { version = "5.14.0", default-features = false, features = ["blocking-api"] }
 rust_xlsxwriter = { git = "https://github.com/coleleavitt/rust_xlsxwriter.git", rev = "1970a524c01b54b5cf7d194d8e970f540f3457ad" }
@@ -40,12 +40,18 @@ dirs = "6.0.0"
 linkscope = { git = "https://github.com/Miasin-Labs/linkscope.git", rev = "3c76713b531a5bf75d41e89ce132a33f42f31f5f" }
 browser-profiles = { path = "crates/browser-profiles" }
 harness = { path = "crates/harness" }
+wayland-client = { version = "0.31.15", optional = true, features = ["log"] }
+wayland-protocols-wlr = { version = "0.3.12", optional = true, features = ["client"] }
 
 [dev-dependencies]
 filetime = "0.2"
 
 [features]
-default = []
+default = ["niri"]
+niri = ["dep:backon", "dep:niri-ipc"]
+wlr-toplevel = ["dep:wayland-client", "dep:wayland-protocols-wlr"]
+gnome = []
+kde = []
 excel-extra-sheets = []  # Enables Weekly Summary and App Breakdown sheets in Excel export
 
 [lints.rust]

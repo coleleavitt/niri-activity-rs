@@ -5,18 +5,35 @@
 //! and scoped to that source connection; consumers must not persist or compare
 //! them across reconnects.
 
+#[cfg(feature = "gnome")]
+mod gnome;
+#[cfg(feature = "kde")]
+mod kde;
+#[cfg(feature = "niri")]
 mod niri;
+mod select;
+#[cfg(feature = "wlr-toplevel")]
+mod wlr;
 
 use std::error::Error;
 use std::fmt;
 use std::time::Duration;
 
-pub use niri::NiriTracker;
+pub use select::{Backend, select_runtime};
 
 /// Opaque identity of an open window within one tracker connection.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct WindowId(Box<str>);
 
+#[cfg_attr(
+    not(any(
+        feature = "niri",
+        feature = "wlr-toplevel",
+        feature = "gnome",
+        feature = "kde"
+    )),
+    allow(dead_code)
+)]
 impl WindowId {
     pub(crate) fn new(value: impl Into<Box<str>>) -> Self {
         Self(value.into())
@@ -51,6 +68,12 @@ pub struct Snapshot {
 }
 
 /// One normalized update from a compositor backend.
+/// Shared event vocabulary; focused-only adapters do not construct every
+/// variant.
+#[cfg_attr(
+    not(any(feature = "niri", feature = "wlr-toplevel", feature = "kde")),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Update {
     /// Mandatory first update and authoritative resynchronization barrier.
@@ -68,6 +91,15 @@ pub enum Update {
 }
 
 /// Broad error class used for backend selection and failure policy.
+#[cfg_attr(
+    not(any(
+        feature = "niri",
+        feature = "wlr-toplevel",
+        feature = "gnome",
+        feature = "kde"
+    )),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackerErrorKind {
     Unavailable,
@@ -84,6 +116,15 @@ pub struct TrackerError {
     source: Option<Box<dyn Error + Send + Sync>>,
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "niri",
+        feature = "wlr-toplevel",
+        feature = "gnome",
+        feature = "kde"
+    )),
+    allow(dead_code)
+)]
 impl TrackerError {
     pub fn new(kind: TrackerErrorKind, message: impl Into<Box<str>>) -> Self {
         Self {

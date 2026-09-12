@@ -12,6 +12,7 @@
     var MAX_ID = 1024;
     var MAX_TITLE = 4096;
     var RESNAPSHOT_INTERVAL_MS = 15000;
+    var MAX_PAYLOAD_CODE_UNITS = 512 * 1024;
 
     // A fresh generation lets the receiver discard events from a prior KWin
     // script instance. seq is monotonic within this generation.
@@ -70,7 +71,20 @@
     }
 
     function send(method, payload) {
-        callDBus(SERVICE, PATH, INTERFACE, method, JSON.stringify(payload));
+        var encoded = JSON.stringify(payload);
+        if (encoded.length > MAX_PAYLOAD_CODE_UNITS) {
+            encoded = JSON.stringify({
+                protocol: PROTOCOL,
+                generation: generation,
+                seq: seq,
+                complete: false,
+                windows: [],
+                active_uuid: null
+            });
+            method = "Snapshot";
+            overflowed = true;
+        }
+        callDBus(SERVICE, PATH, INTERFACE, method, encoded);
     }
 
     function nextEvent(kind, windowRecord) {
