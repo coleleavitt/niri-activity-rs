@@ -21,6 +21,7 @@ use crate::error::Error;
 pub struct LogindMonitor {
     lock_state: Arc<AtomicU8>,
     suspend_resumed: Arc<AtomicBool>,
+    sleep_health: Arc<AtomicU8>,
 }
 
 impl LogindMonitor {
@@ -33,6 +34,18 @@ impl LogindMonitor {
     /// after each resume from suspend, then resets to `false`.
     pub fn take_suspend_resumed(&self) -> bool {
         self.suspend_resumed.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether `PrepareForSleep` is currently unobserved.
+    ///
+    /// While this is true a suspend can start and end without any signal, so
+    /// the caller must treat the wall clock as its only evidence and read it
+    /// more suspiciously. `Starting` reports `false`: the process has not been
+    /// deaf for any window yet, it simply has not subscribed. Recovering from
+    /// `Degraded` also raises `take_suspend_resumed`, so the gap itself still
+    /// produces exactly one boundary.
+    pub fn is_sleep_degraded(&self) -> bool {
+        decode_sleep_health(self.sleep_health.load(Ordering::Acquire)) == SleepHealth::Degraded
     }
 
     /// Whether lock monitoring is currently fail-closed due to an unavailable
@@ -388,6 +401,7 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
     Ok(LogindMonitor {
         lock_state,
         suspend_resumed,
+        sleep_health,
     })
 }
 
@@ -464,10 +478,15 @@ mod tests {
         let monitor = LogindMonitor {
             lock_state: Arc::new(AtomicU8::new(LOCK_STATE_DEGRADED)),
             suspend_resumed: Arc::new(AtomicBool::new(false)),
+            sleep_health: Arc::new(AtomicU8::new(SLEEP_HEALTH_STARTING)),
         };
 
         assert!(monitor.is_locked());
         assert!(monitor.is_lock_degraded());
+        assert!(
+            !monitor.is_sleep_degraded(),
+            "a listener that has not subscribed yet was never deaf to a suspend"
+        );
     }
 
     #[test]
@@ -475,6 +494,7 @@ mod tests {
         let monitor = LogindMonitor {
             lock_state: Arc::new(AtomicU8::new(LOCK_STATE_HEALTHY_UNLOCKED)),
             suspend_resumed: Arc::new(AtomicBool::new(false)),
+            sleep_health: Arc::new(AtomicU8::new(SLEEP_HEALTH_HEALTHY)),
         };
 
         assert!(!monitor.is_locked());
@@ -503,6 +523,32 @@ mod tests {
         apply_lock_event(LockMonitorEvent::Observed(false), &state);
 
         assert_eq!(state.load(Ordering::Acquire), LOCK_STATE_HEALTHY_UNLOCKED);
+    }
+
+    #[test]
+    fn a_degraded_sleep_listener_is_visible_to_its_consumer() {
+        let sleep_health = Arc::new(AtomicU8::new(SLEEP_HEALTH_STARTING));
+        let monitor = LogindMonitor {
+            lock_state: Arc::new(AtomicU8::new(LOCK_STATE_HEALTHY_UNLOCKED)),
+            suspend_resumed: Arc::new(AtomicBool::new(false)),
+            sleep_health: Arc::clone(&sleep_health),
+        };
+
+        assert!(!monitor.is_sleep_degraded());
+        publish_sleep_subscribed(&sleep_health);
+        assert!(!monitor.is_sleep_degraded());
+
+        publish_sleep_failed(&sleep_health);
+        assert!(
+            monitor.is_sleep_degraded(),
+            "a failed listener must be readable, or nobody can distrust the wall clock"
+        );
+
+        assert!(
+            publish_sleep_subscribed(&sleep_health),
+            "the recovery still owes the consumer one suspend boundary"
+        );
+        assert!(!monitor.is_sleep_degraded());
     }
 
     #[test]

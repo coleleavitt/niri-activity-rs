@@ -177,6 +177,9 @@ struct WatchState {
     input_baseline_ms: u64,
     session_start_mono_ms: u64,
     logind_warned: bool,
+    /// Whether the degraded sleep listener has already been reported, so a
+    /// permanent D-Bus failure warns once instead of once per loop.
+    sleep_listener_warned: bool,
     input_offsets: Vec<u32>,
     last_seen_input_ms: u64,
     last_heartbeat_value: u64,
@@ -208,6 +211,7 @@ impl WatchState {
             input_baseline_ms,
             session_start_mono_ms,
             logind_warned: false,
+            sleep_listener_warned: false,
             // The watcher deliberately starts a fresh session as Active.
             // Persist that decision so report reconstruction has a defensible
             // presence point even when the first real input arrives later.
@@ -250,6 +254,37 @@ impl WatchState {
         self.input_baseline_ms = input_baseline;
         self.session_start_mono_ms = session_mono;
         self.last_seen_input_ms = input_baseline;
+        self.input_offsets.clear();
+        self.input_offsets.push(0);
+    }
+
+    /// Begin a session for a newly focused window without asserting that a
+    /// human did the focusing.
+    ///
+    /// A focus change is a window-manager event, not input. Focus-follows-mouse
+    /// under a mouse jiggler, a dialog stealing focus, and a scripted
+    /// `focus-window` all arrive with nobody at the keyboard, so declaring the
+    /// session Active here restarted the presence clock from machine activity
+    /// and could hold a jiggled session out of Passive and Idle indefinitely.
+    /// Real input has already refreshed the input clock, so the next
+    /// maintenance tick promotes the session within one loop iteration — the
+    /// error direction is a sub-second undercount, never invented presence.
+    fn start_focus_session(
+        &mut self,
+        focused_id: Option<WindowId>,
+        focus_start: chrono::DateTime<chrono::Utc>,
+        now_instant: Instant,
+        input_baseline_ms: u64,
+        session_start_mono_ms: u64,
+    ) {
+        self.focused_id = focused_id;
+        self.focus_start = focus_start;
+        self.reset_accumulators();
+        self.last_idle_check = now_instant;
+        self.last_flush = now_instant;
+        self.input_baseline_ms = input_baseline_ms;
+        self.session_start_mono_ms = session_start_mono_ms;
+        self.last_seen_input_ms = input_baseline_ms;
         self.input_offsets.clear();
         self.input_offsets.push(0);
     }
@@ -338,6 +373,32 @@ fn handle_shutdown(
     Ok(true)
 }
 
+/// Wall-clock jump that counts as a resume while `PrepareForSleep` is being
+/// observed. Deliberately large: the D-Bus signal is the primary evidence, so
+/// the fallback only has to catch a suspend the signal missed entirely, and a
+/// wide margin keeps NTP steps and loop jitter out of it.
+const SUSPEND_JUMP_THRESHOLD_SECS: i64 = 30;
+
+/// Wall-clock jump that counts as a resume while the sleep listener is down.
+///
+/// Without `PrepareForSleep` no suspend announces itself, and a suspend shorter
+/// than the healthy threshold is charged in full to the focused window. A
+/// degraded listener therefore means "a suspend boundary may have been
+/// missed", never "the user was here": the watcher believes a much smaller
+/// jump. The loop wakes at least once a second, so five seconds still clears
+/// scheduling jitter and the two clocks' second-truncation, and a false
+/// positive only ends a session early — it cannot invent presence.
+const DEGRADED_SUSPEND_JUMP_THRESHOLD_SECS: i64 = 5;
+
+/// The wall-clock jump that counts as a resume, given sleep-listener health.
+const fn suspend_jump_threshold_secs(sleep_degraded: bool) -> i64 {
+    if sleep_degraded {
+        DEGRADED_SUSPEND_JUMP_THRESHOLD_SECS
+    } else {
+        SUSPEND_JUMP_THRESHOLD_SECS
+    }
+}
+
 /// Handle suspend/resume detection via wall-clock jump or D-Bus signal.
 /// Returns true if resume was detected and handled.
 ///
@@ -354,7 +415,17 @@ fn handle_suspend_resume(
     now_instant: Instant,
     quiet: bool,
 ) -> Result<bool, Error> {
-    const SUSPEND_JUMP_THRESHOLD_SECS: i64 = 30;
+    let sleep_degraded = logind.is_sleep_degraded();
+    if sleep_degraded && !state.sleep_listener_warned {
+        tracing::warn!(
+            "logind sleep monitoring degraded; a {}s wall-clock jump now counts as a suspend",
+            DEGRADED_SUSPEND_JUMP_THRESHOLD_SECS
+        );
+        state.sleep_listener_warned = true;
+    } else if !sleep_degraded && state.sleep_listener_warned {
+        tracing::info!("logind sleep monitoring recovered");
+        state.sleep_listener_warned = false;
+    }
 
     let wall_now = Utc::now();
     let wall_elapsed_secs = (wall_now - state.last_wall_time).num_seconds();
@@ -366,7 +437,7 @@ fn handle_suspend_resume(
     .unwrap_or(i64::MAX);
     let time_jump_secs = wall_elapsed_secs.saturating_sub(mono_elapsed_secs);
 
-    let wall_clock_resume = time_jump_secs > SUSPEND_JUMP_THRESHOLD_SECS;
+    let wall_clock_resume = time_jump_secs > suspend_jump_threshold_secs(sleep_degraded);
     let dbus_resume_signalled = logind.take_suspend_resumed();
     let dbus_resume = dbus_resume_signalled && !wall_clock_resume;
 
@@ -1051,12 +1122,26 @@ fn handle_title_changed(
     Ok(())
 }
 
+/// Whether a focus change arrives inside an already-paused session.
+///
+/// A locked screen and an Away session both had their segment closed at the
+/// boundary, so a rollover here would persist an empty event and reset the
+/// session clock from a window-manager event. Title changes are already
+/// cache-only in both states (see [`decide_metadata_change`]); focus changes
+/// were not, so a mouse jiggler under focus-follows-mouse re-armed the session
+/// on every pointer crossing and forced Away to be entered again and again.
+const fn focus_change_is_paused(is_locked: bool, current: ActivityState) -> bool {
+    // `Locked` is matched as well as the flag: the two are set together, and a
+    // paused session must stay paused even if they ever drift apart.
+    is_locked || matches!(current, ActivityState::Away | ActivityState::Locked)
+}
+
 fn handle_focus_changed(
     state: &mut WatchState,
     ctx: &mut WindowEventContext<'_>,
     new_focus_id: Option<WindowId>,
 ) -> Result<(), Error> {
-    if state.is_locked {
+    if focus_change_is_paused(state.is_locked, state.current_state) {
         state.focused_id = new_focus_id;
         state.focus_start = ctx.now;
         state.reset_accumulators();
@@ -1091,17 +1176,13 @@ fn handle_focus_changed(
         print_focus_change_status(info, &flushed, &input, jiggler, focus_start, ctx);
     }
 
-    state.focused_id = new_focus_id;
-    state.focus_start = ctx.now;
-    state.reset_accumulators();
-    state.current_state = ActivityState::Active;
-    state.last_idle_check = ctx.now_instant;
-    state.last_flush = ctx.now_instant;
-    state.input_baseline_ms = ctx.input_stats.last_activity_ms();
-    state.session_start_mono_ms = millis_u64(ctx.monitor_start.elapsed());
-    state.last_seen_input_ms = state.input_baseline_ms;
-    state.input_offsets.clear();
-    state.input_offsets.push(0);
+    state.start_focus_session(
+        new_focus_id,
+        ctx.now,
+        ctx.now_instant,
+        ctx.input_stats.last_activity_ms(),
+        millis_u64(ctx.monitor_start.elapsed()),
+    );
 
     Ok(())
 }
@@ -1966,6 +2047,79 @@ mod tests {
             compute_activity_state(1_800_001, true, &thresholds()),
             ActivityState::Away
         );
+    }
+
+    #[test]
+    fn a_focus_change_does_not_claim_presence_the_input_clock_denies() {
+        let mut state = WatchState::new(1_000, 1_000);
+        state.current_state = ActivityState::Idle;
+        state.accumulated_active_ms = 10;
+        state.accumulated_idle_ms = 30;
+        state.input_offsets = vec![100, 200];
+
+        state.start_focus_session(Some(id(7)), Utc::now(), Instant::now(), 1_000, 400_000);
+
+        assert_eq!(
+            state.current_state,
+            ActivityState::Idle,
+            "a window-manager event must not stand in for human input"
+        );
+        assert_eq!(state.focused_id, Some(id(7)));
+        assert_eq!(state.input_baseline_ms, 1_000);
+        assert_eq!(state.last_seen_input_ms, 1_000);
+        assert_eq!(state.session_start_mono_ms, 400_000);
+        assert_eq!(state.accumulated_active_ms, 0);
+        assert_eq!(state.accumulated_idle_ms, 0);
+        assert_eq!(state.input_offsets, vec![0]);
+    }
+
+    #[test]
+    fn a_degraded_sleep_listener_believes_a_smaller_clock_jump() {
+        assert_eq!(
+            suspend_jump_threshold_secs(false),
+            SUSPEND_JUMP_THRESHOLD_SECS
+        );
+
+        // A ten-second suspend is invisible to the wall-clock fallback at the
+        // healthy threshold, which is only safe while the D-Bus signal reports
+        // it. With the listener down, that same suspend must still end the
+        // session instead of being charged to the focused window.
+        let short_suspend_secs = 10;
+        assert!(
+            short_suspend_secs > suspend_jump_threshold_secs(true),
+            "an unobserved short suspend must still produce a boundary"
+        );
+        assert!(
+            short_suspend_secs <= suspend_jump_threshold_secs(false),
+            "while the signal works the wall clock stays a coarse fallback"
+        );
+        assert!(
+            suspend_jump_threshold_secs(true) > 1,
+            "the loop's own one-second tick must never read as a suspend"
+        );
+    }
+
+    #[test]
+    fn focus_changes_stay_paused_while_locked_or_away() {
+        for live in [
+            ActivityState::Active,
+            ActivityState::Passive,
+            ActivityState::Idle,
+        ] {
+            assert!(
+                !focus_change_is_paused(false, live),
+                "{live} still owns a live segment to roll over"
+            );
+            assert!(
+                focus_change_is_paused(true, live),
+                "a locked screen pauses the session whatever it was"
+            );
+        }
+        assert!(
+            focus_change_is_paused(false, ActivityState::Away),
+            "an away session was already flushed; rolling it over re-arms presence"
+        );
+        assert!(focus_change_is_paused(false, ActivityState::Locked));
     }
 
     fn advanced_state(current: ActivityState, agent_active: bool) -> WatchState {
