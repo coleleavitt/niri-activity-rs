@@ -13,7 +13,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # Pinned to the commit behind tag v7.0.1; v4 runs on the deprecated
+      # Node 20 runtime, which the runner now forces onto Node 24 anyway.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
