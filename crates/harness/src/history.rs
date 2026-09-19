@@ -225,6 +225,12 @@ fn scan_log(path: &Path, since: i64, until: i64, busy: &mut BusyMinutes) {
 /// file. Only completed assistant/tool-result messages prove agent work; a
 /// user prompt proves human input, not that a model produced anything.
 fn prime_message_timestamp(line: &str) -> Option<i64> {
+    // Transcripts are gigabytes of mostly non-message records, and a full JSON
+    // parse of every line dominates a repair scan. These substrings must be
+    // present in any line the checks below can accept.
+    if !line.contains("\"message\"") || !line.contains("\"timestamp\"") {
+        return None;
+    }
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     if value.get("type")?.as_str()? != "message" {
         return None;
@@ -262,9 +268,23 @@ fn scan_prime_log(path: &Path, since: i64, until: i64, busy: &mut BusyMinutes) {
     }
 }
 
-const MAX_PRIME_HISTORY_ENTRIES: usize = 50_000;
+/// Entry budget for one Prime history scan.
+///
+/// Sized for a real long-lived store rather than a fresh install: a session
+/// tree that has accumulated for months holds ~100k entries (sessions plus
+/// their per-session artifacts), and exceeding the budget fails the whole
+/// backfill closed, which leaves `agent_ms` unmeasured forever. The scan only
+/// stats each entry, so this bound still finishes in well under a second.
+const MAX_PRIME_HISTORY_ENTRIES: usize = 1_000_000;
 const MAX_PRIME_HISTORY_FILES: usize = 10_000;
-const MAX_PRIME_HISTORY_BYTES: u64 = 1024 * 1024 * 1024;
+/// Byte budget for one Prime history scan.
+///
+/// A single week of heavy multi-session use already writes well over a
+/// gigabyte of transcripts, and the budget is fail-closed: exceeding it aborts
+/// the whole backfill instead of measuring part of it. Only the first repair
+/// of a long gap reads anything near this much, because the healer then leaves
+/// only a grace window of unmeasured rows behind.
+const MAX_PRIME_HISTORY_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_PRIME_HISTORY_DEPTH: usize = 32;
 
 fn metadata_modified_is_fresh(
