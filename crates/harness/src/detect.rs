@@ -122,6 +122,10 @@ fn walk_log_files_with_budget(
         let Ok(entries) = fs::read_dir(current) else {
             continue;
         };
+        // Descend into the most recently touched subtree first. The budget can
+        // only cover part of a large history tree, so the part it does cover
+        // has to be the part a working agent would have changed.
+        let mut subdirs: Vec<(SystemTime, PathBuf)> = Vec::new();
         for entry in entries.flatten() {
             if remaining == 0 {
                 return WalkOutcome::Truncated;
@@ -135,19 +139,38 @@ fn walk_log_files_with_budget(
                     return WalkOutcome::Found;
                 }
             } else if file_type.is_dir() && depth < MAX_LOG_TREE_DEPTH {
-                stack.push((entry.path(), depth + 1));
+                let stamp = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                subdirs.push((stamp, entry.path()));
             }
         }
+        // The stack pops from the back, so the newest subtree must be pushed
+        // last.
+        subdirs.sort_by_key(|(stamp, _)| *stamp);
+        stack.extend(subdirs.into_iter().map(|(_, path)| (path, depth + 1)));
     }
     WalkOutcome::Complete
 }
 
 /// Whether any regular file beneath a directory was written recently.
+///
+/// A truncated scan is not evidence of activity. Reporting "active" on
+/// truncation pins every oversized history tree active forever — including one
+/// whose newest write is weeks old — and the watcher then credits `agent_ms`
+/// for every second of every day, which reattributes all unproductive and
+/// neutral time to productive. Under-crediting a genuinely busy agent is
+/// recoverable from its session history; silently rewriting a user's whole
+/// activity record is not.
 fn dir_written_within(dir: &Path, window: Duration) -> bool {
-    // An incomplete bounded scan cannot prove inactivity. Treat truncation as
-    // active so a large or adversarial tree cannot hide a working agent.
+    dir_written_within_with_budget(dir, window, MAX_LOG_TREE_ENTRIES)
+}
+
+fn dir_written_within_with_budget(dir: &Path, window: Duration, budget: usize) -> bool {
     window != Duration::ZERO
-        && walk_log_files(dir, |path| written_within(path, window)) != WalkOutcome::Complete
+        && walk_log_files_with_budget(dir, budget, |path| written_within(path, window))
+            == WalkOutcome::Found
 }
 
 fn consider_file(path: &Path, consider: &mut impl FnMut(SystemTime)) {
@@ -602,6 +625,58 @@ mod tests {
         let outcome = walk_log_files_with_budget(dir.path(), 1, |_| false);
         assert_eq!(outcome, WalkOutcome::Truncated);
         assert_ne!(outcome, WalkOutcome::Complete);
+    }
+
+    #[test]
+    fn an_oversized_tree_without_a_recent_write_reads_inactive() {
+        // A history tree larger than the scan budget used to read "active"
+        // forever, which credited agent time for every second of every day
+        // and reattributed all unproductive time to productive.
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..4 {
+            touch(&dir.path().join(format!("session-{index}.jsonl")));
+        }
+        sleep(Duration::from_millis(1100));
+
+        assert_eq!(
+            walk_log_files_with_budget(dir.path(), 2, |_| false),
+            WalkOutcome::Truncated,
+        );
+        assert!(!dir_written_within_with_budget(
+            dir.path(),
+            Duration::from_millis(500),
+            2,
+        ));
+    }
+
+    #[test]
+    fn a_truncated_scan_still_reports_a_recent_write_it_reached() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        touch(&dir.path().join("fresh.jsonl"));
+
+        assert!(dir_written_within_with_budget(
+            dir.path(),
+            Duration::from_millis(500),
+            1,
+        ));
+    }
+
+    #[test]
+    fn the_newest_subtree_is_scanned_before_the_budget_runs_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..8 {
+            touch(&dir.path().join(format!("stale-{index}/session.jsonl")));
+        }
+        sleep(Duration::from_millis(1100));
+        touch(&dir.path().join("live/session.jsonl"));
+
+        // The budget covers the nine directory entries plus the two entries of
+        // one subtree, so only a newest-first descent reaches the live file.
+        assert!(dir_written_within_with_budget(
+            dir.path(),
+            Duration::from_millis(500),
+            11,
+        ));
     }
 
     #[test]
