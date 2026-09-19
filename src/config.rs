@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::{fmt, fs};
@@ -533,6 +533,14 @@ pub struct Config {
     /// missing exactly the titles that profile knew about. Bulk rewrites of
     /// stored categories must not run on that evidence.
     pub title_domains_complete: bool,
+    /// Titles browser history has seen but could not pin to a single domain,
+    /// because several sites share the title or the URL has no host.
+    ///
+    /// These are not "no browser evidence": they are evidence that the domain
+    /// is unknown to this scan. [`Config::title_domains`] cannot express that
+    /// difference, and a bulk rewrite that cannot tell them apart silently
+    /// demotes such a row to whatever a weaker title or app rule says.
+    pub unresolved_titles: HashSet<String>,
 }
 
 fn default_idle_threshold() -> u64 {
@@ -746,6 +754,7 @@ impl TryFrom<RawConfig> for Config {
                 .collect(),
             title_domains: HashMap::new(),
             title_domains_complete: false,
+            unresolved_titles: HashSet::new(),
         })
     }
 }
@@ -775,6 +784,7 @@ impl Default for Config {
             domain_rules: Vec::new(),
             title_domains: HashMap::new(),
             title_domains_complete: false,
+            unresolved_titles: HashSet::new(),
         }
     }
 }
@@ -933,11 +943,16 @@ impl Config {
                 // missing, so live classification may use what was read while
                 // bulk rewrites stay blocked.
                 self.title_domains_complete = domains.is_complete();
+                // Kept alongside the resolved map so a bulk rewrite can tell
+                // "history says nothing about this title" from "history saw
+                // this title and could not agree on its domain".
+                self.unresolved_titles.clone_from(domains.unresolved());
                 self.title_domains = domains.into_titles();
                 self.title_domains.len()
             }
             Err(e) => {
                 self.title_domains.clear();
+                self.unresolved_titles.clear();
                 self.title_domains_complete = false;
                 tracing::debug!("browser history unavailable, domain rules inert: {e}");
                 0
@@ -954,6 +969,33 @@ impl Config {
     pub fn can_reclassify_all(&self) -> bool {
         self.domain_rules.is_empty()
             || (!self.title_domains.is_empty() && self.title_domains_complete)
+    }
+
+    /// Whether browser history saw this title but could not resolve which
+    /// domain served it.
+    ///
+    /// The row is then *unknown-but-seen*, which is not the same as "no
+    /// browser evidence". A bulk rewrite must keep the category such a row
+    /// already carries: the domain rule that owns it may well exist, and
+    /// history simply cannot prove which one applies, so reclassifying it from
+    /// a lower-priority title or app rule stores a guess that is afterwards
+    /// indistinguishable from a measured classification. Missing a
+    /// reclassification is recoverable; rewriting history is not.
+    ///
+    /// Only browser windows qualify, and only while domain rules exist —
+    /// without them the domain behind a page never affects classification, so
+    /// there is nothing to protect.
+    pub fn has_ambiguous_domain(&self, app_id: &str, title: &str) -> bool {
+        if self.domain_rules.is_empty() || !browser_profiles::is_browser_app_id(app_id) {
+            return false;
+        }
+        // Same lookup order as `domain_category`: a title that resolves is
+        // classified from its domain and is not ambiguous at all.
+        let key = browser_profiles::strip_window_suffix(title);
+        if self.title_domains.contains_key(key) || self.title_domains.contains_key(title) {
+            return false;
+        }
+        self.unresolved_titles.contains(key) || self.unresolved_titles.contains(title)
     }
 
     fn domain_category(&self, title: &str) -> Option<Category> {
@@ -2021,6 +2063,50 @@ search_dirs = ["~/RustProjects/active", "~/projects", "/absolute/path"]
             ..Default::default()
         };
         assert!(without_rules.can_reclassify_all());
+    }
+
+    #[test]
+    fn an_ambiguous_title_is_unknown_rather_than_unseen() {
+        let config = Config {
+            domain_rules: vec![DomainRule {
+                domain: "youtube.com".to_string(),
+                category: Category::Unproductive,
+            }],
+            title_domains: HashMap::from([("Some Video".to_string(), "youtube.com".to_string())]),
+            title_domains_complete: true,
+            unresolved_titles: HashSet::from(["Dashboard".to_string()]),
+            ..Default::default()
+        };
+
+        assert!(
+            config.has_ambiguous_domain("zen", "Dashboard — Zen Browser"),
+            "history saw this title on several domains, so its category is unknown"
+        );
+        assert!(
+            config.has_ambiguous_domain("zen", "Dashboard"),
+            "an unbranded window title must match the same evidence"
+        );
+        assert!(
+            !config.has_ambiguous_domain("zen", "Some Video — Zen Browser"),
+            "a title whose domain resolved is classified, not ambiguous"
+        );
+        assert!(
+            !config.has_ambiguous_domain("zen", "Never Seen — Zen Browser"),
+            "history saying nothing is not the same as history disagreeing"
+        );
+        assert!(
+            !config.has_ambiguous_domain("foot", "Dashboard"),
+            "a non-browser window never had browser evidence to lose"
+        );
+
+        let without_rules = Config {
+            unresolved_titles: HashSet::from(["Dashboard".to_string()]),
+            ..Default::default()
+        };
+        assert!(
+            !without_rules.has_ambiguous_domain("zen", "Dashboard"),
+            "without domain rules the domain behind a page changes nothing"
+        );
     }
 
     #[test]

@@ -84,6 +84,15 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         let tx = conn.transaction()?;
         let mut updated = 0i64;
         for (app_id, category) in &config.categories {
+            // A browser window's category comes from the domain that served
+            // the page, which an app-wide UPDATE cannot see. Migration 003
+            // classifies the same rows through `Config::classify`, which
+            // honours domain rules and keeps titles browser history could not
+            // resolve; rewriting them from the app category here would destroy
+            // that evidence before 003 ever looks at it.
+            if !config.domain_rules.is_empty() && browser_profiles::is_browser_app_id(app_id) {
+                continue;
+            }
             let count = tx.execute(
                 "UPDATE events SET category = ?1 WHERE app_id = ?2 AND category != ?1",
                 params![category.to_string(), app_id],
@@ -330,6 +339,10 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
 struct ReclassificationPage {
     last_id: Option<i64>,
     updated: i64,
+    /// Rows left alone because browser history saw their title but could not
+    /// resolve its domain. Reported so a skipped rewrite is visible in the
+    /// log instead of looking like a no-op.
+    preserved: i64,
 }
 
 /// Classify and update one ordered page inside the caller's transaction.
@@ -362,8 +375,20 @@ fn reclassify_page(
     };
     let last_id = rows.last().map(|(id, _, _, _)| *id);
     let mut updated = 0i64;
+    let mut preserved = 0i64;
 
     for (id, app_id, title, old_category) in rows {
+        // Browser history that saw this title without agreeing on its domain
+        // proves the row is unknown, not unclassified. `classify` cannot see
+        // that — it falls through to title and app rules — so a rewrite here
+        // would replace a possibly-correct stored category with a weaker
+        // guess. Leaving the row as it is only risks undercounting a
+        // reclassification, which a later scan with better evidence can still
+        // fix; a rewritten row is indistinguishable from a measured one.
+        if config.has_ambiguous_domain(&app_id, &title) {
+            preserved = preserved.saturating_add(1);
+            continue;
+        }
         let correct = config.classify(&app_id, &title).to_string();
         if correct != old_category {
             let count = conn.execute(
@@ -374,7 +399,11 @@ fn reclassify_page(
         }
     }
 
-    Ok(ReclassificationPage { last_id, updated })
+    Ok(ReclassificationPage {
+        last_id,
+        updated,
+        preserved,
+    })
 }
 
 /// Maximum rows read and updated in one reclassification transaction.
@@ -395,14 +424,28 @@ fn reclassify_every_page(
     let limit = i64::try_from(batch_size.max(1)).unwrap_or(i64::MAX);
     let mut last_id = None;
     let mut updated = 0i64;
+    let mut preserved = 0i64;
 
     loop {
         let page = reclassify_page(conn, config, last_id, limit)?;
         updated = updated.saturating_add(page.updated);
+        preserved = preserved.saturating_add(page.preserved);
         let Some(page_last_id) = page.last_id else {
+            log_preserved_rows(preserved);
             return Ok(updated);
         };
         last_id = Some(page_last_id);
+    }
+}
+
+/// Report rows a rewrite deliberately left alone, so an evidence gap is
+/// visible rather than looking like a config that simply matched.
+fn log_preserved_rows(preserved: i64) {
+    if preserved > 0 {
+        tracing::info!(
+            "Kept {} stored categories whose browser evidence could not resolve a domain",
+            preserved
+        );
     }
 }
 
@@ -425,12 +468,14 @@ fn reclassify_all_in_batches(
     let batch_size = i64::try_from(batch_size.max(1)).unwrap_or(i64::MAX);
     let mut last_id = None;
     let mut updated = 0i64;
+    let mut preserved = 0i64;
 
     loop {
         let tx = conn.transaction()?;
         let page = reclassify_page(&tx, config, last_id, batch_size)?;
         tx.commit()?;
         updated = updated.saturating_add(page.updated);
+        preserved = preserved.saturating_add(page.preserved);
 
         let Some(page_last_id) = page.last_id else {
             break;
@@ -438,6 +483,7 @@ fn reclassify_all_in_batches(
         last_id = Some(page_last_id);
     }
 
+    log_preserved_rows(preserved);
     if updated > 0 {
         tracing::info!("Reclassified {} events to match current config", updated);
     }
@@ -1335,6 +1381,117 @@ mod tests {
             (5, 5),
             "every page must be replayed, not just the first"
         );
+    }
+
+    /// Browser evidence that resolves one title, cannot resolve another, and
+    /// carries a title rule that would otherwise claim both.
+    fn ambiguous_domain_config() -> Config {
+        Config {
+            domain_rules: vec![DomainRule {
+                domain: "youtube.com".to_string(),
+                category: Category::Unproductive,
+            }],
+            title_domains: std::collections::HashMap::from([(
+                "Some Video".to_string(),
+                "www.youtube.com".to_string(),
+            )]),
+            title_domains_complete: true,
+            unresolved_titles: std::collections::HashSet::from(["Dashboard".to_string()]),
+            title_rules: vec![TitleRule {
+                pattern: "dashboard".to_string(),
+                category: Category::Neutral,
+                app: vec!["zen".to_string()],
+                compiled: None,
+            }],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_browser_title_keeps_its_stored_category() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        init_db(&conn).expect("schema");
+        for (id, app_id, title, category) in [
+            (1, "zen", "Dashboard — Zen Browser", "productive"),
+            (2, "zen", "Some Video — Zen Browser", "productive"),
+        ] {
+            conn.execute(
+                "INSERT INTO events (id, timestamp, app_id, title, category, active_ms, idle_ms)
+                 VALUES (?1, '2026-08-16T12:00:00+00:00', ?2, ?3, ?4, 1, 0)",
+                params![id, app_id, title, category],
+            )
+            .expect("fixture");
+        }
+
+        reclassify_all_in_batches(&mut conn, &ambiguous_domain_config(), 10).expect("reclassify");
+
+        let categories: Vec<String> = conn
+            .prepare("SELECT category FROM events ORDER BY id")
+            .expect("query")
+            .query_map([], |row| row.get(0))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("categories");
+        assert_eq!(
+            categories,
+            ["productive", "unproductive"],
+            "an unresolvable title keeps what it had; a resolved one follows its domain rule"
+        );
+    }
+
+    #[test]
+    fn app_wide_migration_leaves_browser_rows_to_domain_aware_classification() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        init_db(&conn).expect("schema");
+        for (id, app_id, title, category) in [
+            (1, "zen", "Dashboard — Zen Browser", "productive"),
+            (2, "zen", "Some Video — Zen Browser", "neutral"),
+            (3, "foot", "terminal", "productive"),
+        ] {
+            conn.execute(
+                "INSERT INTO events (id, timestamp, app_id, title, category, active_ms, idle_ms)
+                 VALUES (?1, '2026-08-16T12:00:00+00:00', ?2, ?3, ?4, 1, 0)",
+                params![id, app_id, title, category],
+            )
+            .expect("fixture");
+        }
+        let mut config = ambiguous_domain_config();
+        config.categories = std::collections::HashMap::from([
+            ("zen".to_string(), Category::Neutral),
+            ("foot".to_string(), Category::Unproductive),
+        ]);
+
+        run_migrations(&mut conn, &config).expect("migrations");
+
+        let categories: Vec<String> = conn
+            .prepare("SELECT category FROM events ORDER BY id")
+            .expect("query")
+            .query_map([], |row| row.get(0))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("categories");
+        assert_eq!(
+            categories,
+            ["productive", "unproductive", "unproductive"],
+            "the app category may not overrule browser evidence it cannot read"
+        );
+    }
+
+    #[test]
+    fn preserved_rows_are_counted_rather_than_silently_skipped() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        init_db(&conn).expect("schema");
+        conn.execute(
+            "INSERT INTO events (id, timestamp, app_id, title, category, active_ms, idle_ms)
+             VALUES (1, '2026-08-16T12:00:00+00:00', 'zen', 'Dashboard — Zen Browser', 'productive', 1, 0)",
+            [],
+        )
+        .expect("fixture");
+
+        let page = reclassify_page(&conn, &ambiguous_domain_config(), None, 10).expect("page");
+
+        assert_eq!(page.updated, 0);
+        assert_eq!(page.preserved, 1);
     }
 
     fn title_rule_config() -> Config {
