@@ -76,6 +76,19 @@ pub enum ActivityState {
     Away,
 }
 
+impl ActivityState {
+    /// Whether an interval spent in this state is charged to a counter.
+    ///
+    /// `Locked` and `Away` pause the session: the interval is attributed to no
+    /// bucket, so nothing — human or agent — may be credited for it.
+    fn is_accounted(self) -> bool {
+        matches!(
+            self,
+            ActivityState::Active | ActivityState::Passive | ActivityState::Idle
+        )
+    }
+}
+
 impl std::fmt::Display for ActivityState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -727,7 +740,12 @@ fn accumulate_state_time(state: &mut WatchState, now_instant: Instant, agent_act
             .as_millis(),
     )
     .unwrap_or(i64::MAX);
-    if agent_active {
+    // Agent time overlaps the state counters, so it may only be charged for an
+    // interval those counters also charge. Locked and Away pause the session
+    // and attribute the interval nowhere; crediting the agent there pushed
+    // `agent_ms` past the event's own duration and let a paused session be
+    // reported as fully agent-driven work.
+    if agent_active && state.current_state.is_accounted() {
         state.accumulated_agent_ms = state
             .accumulated_agent_ms
             .saturating_add(elapsed_since_last_check);
@@ -2029,6 +2047,44 @@ mod tests {
             0,
         );
         assert_eq!(state.accumulated_agent_ms, 0);
+    }
+
+    #[test]
+    fn a_paused_session_accrues_no_agent_time() {
+        // Locked and Away charge no state counter, so charging agent time
+        // there pushed `agent_ms` past the event's own duration and made a
+        // paused session report as fully agent-driven work.
+        for paused in [ActivityState::Locked, ActivityState::Away] {
+            let state = advanced_state(paused, true);
+            assert_eq!(state.accumulated_agent_ms, 0, "{paused} charged agent time");
+            assert_eq!(
+                state.accumulated_active_ms
+                    + state.accumulated_passive_ms
+                    + state.accumulated_idle_ms,
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn agent_time_never_exceeds_the_accounted_interval() {
+        for current in [
+            ActivityState::Active,
+            ActivityState::Passive,
+            ActivityState::Idle,
+            ActivityState::Locked,
+            ActivityState::Away,
+        ] {
+            let state = advanced_state(current, true);
+            let accounted = state.accumulated_active_ms
+                + state.accumulated_passive_ms
+                + state.accumulated_idle_ms;
+            assert!(
+                state.accumulated_agent_ms <= accounted,
+                "{current} accrued {} agent ms against {accounted} accounted ms",
+                state.accumulated_agent_ms,
+            );
+        }
     }
 
     #[test]
