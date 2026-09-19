@@ -264,10 +264,49 @@ fn run_lock_listener(lock_state: &AtomicU8) -> ! {
     }
 }
 
-fn listen_for_sleep(
-    suspend_resumed: &AtomicBool,
-    sleep_degraded: &AtomicBool,
-) -> Result<(), Error> {
+/// Health of the `PrepareForSleep` listener.
+///
+/// `Starting` is distinct from `Degraded` because the first subscription of
+/// the process has no deaf window behind it, while a reconnect always does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SleepHealth {
+    Starting,
+    Healthy,
+    Degraded,
+}
+
+const SLEEP_HEALTH_STARTING: u8 = 0;
+const SLEEP_HEALTH_HEALTHY: u8 = 1;
+const SLEEP_HEALTH_DEGRADED: u8 = 2;
+
+const fn decode_sleep_health(raw: u8) -> SleepHealth {
+    match raw {
+        SLEEP_HEALTH_HEALTHY => SleepHealth::Healthy,
+        SLEEP_HEALTH_DEGRADED => SleepHealth::Degraded,
+        _ => SleepHealth::Starting,
+    }
+}
+
+/// Publish a successful subscription and report whether the gap behind it
+/// needs a synthetic resume boundary.
+///
+/// While the listener was down, a suspend could start and end unobserved. The
+/// wall-clock fallback only notices jumps over 30 seconds, so a short suspend
+/// inside that window was silently charged as activity. Reporting a resume on
+/// reconnect closes the session at the boundary instead, which can only shorten
+/// a measurement, never invent one.
+fn publish_sleep_subscribed(health: &AtomicU8) -> bool {
+    let previous = decode_sleep_health(health.swap(SLEEP_HEALTH_HEALTHY, Ordering::AcqRel));
+    previous == SleepHealth::Degraded
+}
+
+/// Publish a listener failure, reporting whether it was healthy before.
+fn publish_sleep_failed(health: &AtomicU8) -> bool {
+    decode_sleep_health(health.swap(SLEEP_HEALTH_DEGRADED, Ordering::AcqRel))
+        == SleepHealth::Healthy
+}
+
+fn listen_for_sleep(suspend_resumed: &AtomicBool, sleep_health: &AtomicU8) -> Result<(), Error> {
     let connection = Connection::system()
         .map_err(|e| Error::Logind(format!("failed to connect sleep listener: {e}")))?;
     let manager = ManagerProxyBlocking::new(&connection)
@@ -275,7 +314,12 @@ fn listen_for_sleep(
     let signals = manager
         .receive_prepare_for_sleep()
         .map_err(|e| Error::Logind(format!("failed to subscribe to PrepareForSleep: {e}")))?;
-    sleep_degraded.store(false, Ordering::Release);
+    if publish_sleep_subscribed(sleep_health) {
+        suspend_resumed.store(true, Ordering::Release);
+        tracing::warn!(
+            "sleep listener reconnected; assuming a suspend boundary for the unobserved window"
+        );
+    }
 
     for signal in signals {
         let args = signal
@@ -294,11 +338,11 @@ fn listen_for_sleep(
     ))
 }
 
-fn run_sleep_listener(suspend_resumed: &AtomicBool, sleep_degraded: &AtomicBool) -> ! {
+fn run_sleep_listener(suspend_resumed: &AtomicBool, sleep_health: &AtomicU8) -> ! {
     let mut backoff = ReconnectBackoff::new();
     loop {
-        if let Err(error) = listen_for_sleep(suspend_resumed, sleep_degraded) {
-            let was_healthy = !sleep_degraded.swap(true, Ordering::AcqRel);
+        if let Err(error) = listen_for_sleep(suspend_resumed, sleep_health) {
+            let was_healthy = publish_sleep_failed(sleep_health);
             if was_healthy {
                 backoff.reset();
             }
@@ -322,7 +366,7 @@ fn run_sleep_listener(suspend_resumed: &AtomicBool, sleep_degraded: &AtomicBool)
 pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
     let lock_state = Arc::new(AtomicU8::new(LOCK_STATE_DEGRADED));
     let suspend_resumed = Arc::new(AtomicBool::new(false));
-    let sleep_degraded = Arc::new(AtomicBool::new(true));
+    let sleep_health = Arc::new(AtomicU8::new(SLEEP_HEALTH_STARTING));
 
     {
         let lock_state = Arc::clone(&lock_state);
@@ -334,10 +378,10 @@ pub fn start_logind_monitor() -> Result<LogindMonitor, Error> {
 
     {
         let suspend_resumed = Arc::clone(&suspend_resumed);
-        let sleep_degraded = Arc::clone(&sleep_degraded);
+        let sleep_health = Arc::clone(&sleep_health);
         thread::Builder::new()
             .name("logind-sleep".into())
-            .spawn(move || run_sleep_listener(&suspend_resumed, &sleep_degraded))
+            .spawn(move || run_sleep_listener(&suspend_resumed, &sleep_health))
             .map_err(|e| Error::Logind(format!("failed to spawn sleep thread: {e}")))?;
     }
 
@@ -459,6 +503,29 @@ mod tests {
         apply_lock_event(LockMonitorEvent::Observed(false), &state);
 
         assert_eq!(state.load(Ordering::Acquire), LOCK_STATE_HEALTHY_UNLOCKED);
+    }
+
+    #[test]
+    fn a_reconnected_sleep_listener_reports_a_suspend_boundary() {
+        let health = AtomicU8::new(SLEEP_HEALTH_STARTING);
+
+        assert!(
+            !publish_sleep_subscribed(&health),
+            "the first subscription has no unobserved window behind it"
+        );
+        assert!(publish_sleep_failed(&health));
+        assert!(
+            !publish_sleep_failed(&health),
+            "a repeated failure is not a fresh degradation"
+        );
+        assert!(
+            publish_sleep_subscribed(&health),
+            "a reconnect must declare the window it could not observe"
+        );
+        assert!(
+            !publish_sleep_subscribed(&health),
+            "a healthy listener must not fabricate resume boundaries"
+        );
     }
 
     #[test]

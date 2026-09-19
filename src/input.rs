@@ -28,6 +28,10 @@ pub const BTN_MIDDLE: u16 = 274;
 
 const SCROLL_NOTCH_THRESHOLD: f64 = 15.0;
 
+/// libinput reports high-resolution wheels in 1/120 of a notch, so a single
+/// detent is 120 units and a fine-grained wheel sends fractions of it.
+const WHEEL_V120_NOTCH: f64 = 120.0;
+
 pub const KEY_BACKSPACE: u16 = 14;
 pub const KEY_DELETE: u16 = 111;
 pub const KEY_LEFTCTRL: u16 = 29;
@@ -93,6 +97,10 @@ pub struct InputCounters {
     pub scroll_down: AtomicU64,
     pub scroll_horizontal: AtomicU64,
     pub jiggler_pattern: AtomicBool,
+    /// Mouse-only artificial pattern, kept separate from
+    /// [`InputCounters::jiggler_pattern`] so an auto-typer does not discount
+    /// genuine pointer presence.
+    pub jiggler_pattern_mouse: AtomicBool,
     pub jiggler_process: AtomicBool,
     pub last_keyboard_ms: AtomicU64,
     pub heartbeat: AtomicU64,
@@ -116,6 +124,7 @@ impl InputCounters {
             scroll_down: AtomicU64::new(0),
             scroll_horizontal: AtomicU64::new(0),
             jiggler_pattern: AtomicBool::new(false),
+            jiggler_pattern_mouse: AtomicBool::new(false),
             jiggler_process: AtomicBool::new(false),
             last_keyboard_ms: AtomicU64::new(0),
             heartbeat: AtomicU64::new(0),
@@ -291,8 +300,36 @@ fn update_jiggler_pattern(
     let mouse_artificial = mouse.is_artificial() && keyboard_age_ms >= mouse.window_ms;
     let artificial = keyboard.is_artificial() || mouse_artificial;
     counters
+        .jiggler_pattern_mouse
+        .store(mouse_artificial, Ordering::Release);
+    counters
         .jiggler_pattern
         .store(artificial, Ordering::Release);
+}
+
+/// Whether pointer motion currently looks machine-generated.
+fn artificial_motion_active(counters: &InputCounters) -> bool {
+    counters.jiggler_process.load(Ordering::Acquire)
+        || counters.jiggler_pattern_mouse.load(Ordering::Acquire)
+}
+
+/// Count a qualifying pointer movement, refreshing the presence clock only
+/// when the movement is not attributable to a jiggler.
+///
+/// The detection result was persisted as a row flag but still fed
+/// `last_activity_ms`, so a jiggler crossing the distance threshold every few
+/// seconds held the session Active and blocked Passive, Idle and Away for as
+/// long as it ran. Keystrokes, clicks and scrolling still refresh presence, so
+/// a user who is really there is unaffected; the movement itself is still
+/// measured in the counters.
+fn record_qualifying_motion(counters: &InputCounters, now: u64) {
+    counters
+        .qualifying_mouse_movements
+        .fetch_add(1, Ordering::Release);
+    if artificial_motion_active(counters) {
+        return;
+    }
+    counters.last_activity_ms.store(now, Ordering::Release);
 }
 
 /// Detect if any jiggler/artificial input software is currently running.
@@ -375,8 +412,24 @@ fn process_scroll_accumulators(
     counters: &InputCounters,
     now: u64,
 ) {
-    let v_notches_signed = (*v_accum / SCROLL_NOTCH_THRESHOLD) as i64;
-    let h_notches_signed = (*h_accum / SCROLL_NOTCH_THRESHOLD) as i64;
+    process_notch_accumulators(v_accum, h_accum, SCROLL_NOTCH_THRESHOLD, counters, now);
+}
+
+/// Convert accumulated scroll into whole notches, keeping the remainder.
+///
+/// The remainder is what makes sub-notch input countable: a wheel that emits
+/// 40 v120 units per step used to be discarded on every event, so three steps
+/// of a high-resolution wheel produced no scroll at all and left the session
+/// looking input-free.
+fn process_notch_accumulators(
+    v_accum: &mut f64,
+    h_accum: &mut f64,
+    notch: f64,
+    counters: &InputCounters,
+    now: u64,
+) {
+    let v_notches_signed = (*v_accum / notch) as i64;
+    let h_notches_signed = (*h_accum / notch) as i64;
     let v_notches = v_notches_signed.unsigned_abs();
     let h_notches = h_notches_signed.unsigned_abs();
 
@@ -391,13 +444,13 @@ fn process_scroll_accumulators(
             } else {
                 counters.scroll_up.fetch_add(v_notches, Ordering::Release);
             }
-            *v_accum = (v_notches_signed as f64).mul_add(-SCROLL_NOTCH_THRESHOLD, *v_accum);
+            *v_accum = (v_notches_signed as f64).mul_add(-notch, *v_accum);
         }
         if h_notches > 0 {
             counters
                 .scroll_horizontal
                 .fetch_add(h_notches, Ordering::Release);
-            *h_accum = (h_notches_signed as f64).mul_add(-SCROLL_NOTCH_THRESHOLD, *h_accum);
+            *h_accum = (h_notches_signed as f64).mul_add(-notch, *h_accum);
         }
 
         counters.last_activity_ms.store(now, Ordering::Release);
@@ -435,6 +488,8 @@ fn unified_input_loop(
 
     let mut v_accum: f64 = 0.0;
     let mut h_accum: f64 = 0.0;
+    let mut wheel_v_accum: f64 = 0.0;
+    let mut wheel_h_accum: f64 = 0.0;
 
     const JIGGLER_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -547,10 +602,7 @@ fn unified_input_loop(
 
                                 if window_expired || above_threshold {
                                     if above_threshold {
-                                        counters
-                                            .qualifying_mouse_movements
-                                            .fetch_add(1, Ordering::Release);
-                                        counters.last_activity_ms.store(now, Ordering::Release);
+                                        record_qualifying_motion(counters, now);
                                     }
                                     motion_dx = 0.0;
                                     motion_dy = 0.0;
@@ -585,39 +637,22 @@ fn unified_input_loop(
                             if s.has_axis(Axis::Vertical) {
                                 let v_v120 = s.scroll_value_v120(Axis::Vertical);
                                 if v_v120.is_finite() && v_v120 != 0.0 {
-                                    let v_notches = (v_v120.abs() / 120.0) as u64;
-                                    if v_notches > 0 {
-                                        counters
-                                            .scroll_events
-                                            .fetch_add(v_notches, Ordering::Release);
-                                        if v_v120 > 0.0 {
-                                            counters
-                                                .scroll_down
-                                                .fetch_add(v_notches, Ordering::Release);
-                                        } else {
-                                            counters
-                                                .scroll_up
-                                                .fetch_add(v_notches, Ordering::Release);
-                                        }
-                                        counters.last_activity_ms.store(now, Ordering::Release);
-                                    }
+                                    wheel_v_accum += v_v120;
                                 }
                             }
                             if s.has_axis(Axis::Horizontal) {
                                 let h_v120 = s.scroll_value_v120(Axis::Horizontal);
                                 if h_v120.is_finite() && h_v120 != 0.0 {
-                                    let h_notches = (h_v120.abs() / 120.0) as u64;
-                                    if h_notches > 0 {
-                                        counters
-                                            .scroll_events
-                                            .fetch_add(h_notches, Ordering::Release);
-                                        counters
-                                            .scroll_horizontal
-                                            .fetch_add(h_notches, Ordering::Release);
-                                        counters.last_activity_ms.store(now, Ordering::Release);
-                                    }
+                                    wheel_h_accum += h_v120;
                                 }
                             }
+                            process_notch_accumulators(
+                                &mut wheel_v_accum,
+                                &mut wheel_h_accum,
+                                WHEEL_V120_NOTCH,
+                                counters,
+                                now,
+                            );
                         }
 
                         Event::Pointer(PointerEvent::ScrollFinger(s)) => {
@@ -820,6 +855,76 @@ mod tests {
 
         assert!(!tracker.is_artificial());
         assert!(tracker.timestamps_ms.is_empty());
+    }
+
+    #[test]
+    fn sub_notch_wheel_input_accumulates_instead_of_being_dropped() {
+        let counters = InputCounters::new();
+        let mut v_accum = 0.0;
+        let mut h_accum = 0.0;
+
+        // A high-resolution wheel emits 40 v120 units per step; each step
+        // alone is below one notch.
+        for step in 1..=3 {
+            v_accum += 40.0;
+            process_notch_accumulators(
+                &mut v_accum,
+                &mut h_accum,
+                WHEEL_V120_NOTCH,
+                &counters,
+                step * 1_000,
+            );
+        }
+
+        assert_eq!(counters.scroll_events.load(Ordering::Acquire), 1);
+        assert_eq!(counters.scroll_down.load(Ordering::Acquire), 1);
+        assert_eq!(counters.last_activity_ms.load(Ordering::Acquire), 3_000);
+        assert!(v_accum.abs() < f64::EPSILON, "remainder: {v_accum}");
+    }
+
+    #[test]
+    fn artificial_motion_is_counted_but_does_not_refresh_presence() {
+        let counters = InputCounters::new();
+        counters.jiggler_process.store(true, Ordering::Release);
+
+        record_qualifying_motion(&counters, 5_000);
+
+        assert_eq!(
+            counters.qualifying_mouse_movements.load(Ordering::Acquire),
+            1,
+            "the movement is still measured"
+        );
+        assert_eq!(
+            counters.last_activity_ms.load(Ordering::Acquire),
+            0,
+            "a jiggler must not hold the session present"
+        );
+
+        counters.jiggler_process.store(false, Ordering::Release);
+        record_qualifying_motion(&counters, 6_000);
+        assert_eq!(counters.last_activity_ms.load(Ordering::Acquire), 6_000);
+    }
+
+    #[test]
+    fn only_mouse_side_artificial_patterns_discount_pointer_presence() {
+        let mut keyboard = tracker(120, 3);
+        let mut mouse = tracker(120, 3);
+        let counters = InputCounters::new();
+        for timestamp in [0, 30_000, 60_000] {
+            keyboard.record(timestamp);
+            counters
+                .last_keyboard_ms
+                .store(timestamp, Ordering::Release);
+        }
+
+        update_jiggler_pattern(&mut keyboard, &mut mouse, &counters, 60_000);
+
+        assert!(counters.jiggler_pattern.load(Ordering::Acquire));
+        assert!(
+            !counters.jiggler_pattern_mouse.load(Ordering::Acquire),
+            "an artificial keyboard pattern must not discount real pointer input"
+        );
+        assert!(!artificial_motion_active(&counters));
     }
 
     #[test]

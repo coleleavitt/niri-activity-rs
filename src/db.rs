@@ -108,7 +108,7 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
         && config.can_reclassify_all()
     {
         let tx = conn.transaction()?;
-        let updated = reclassify_page(&tx, config, None, i64::MAX)?.updated;
+        let updated = reclassify_every_page(&tx, config, RECLASSIFY_BATCH_SIZE)?;
 
         tx.execute(
             "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
@@ -125,7 +125,7 @@ pub fn run_migrations(conn: &mut Connection, config: &Config) -> Result<(), Erro
 
     if !applied.contains(&"003_app_scoped_title_rules".to_string()) && config.can_reclassify_all() {
         let tx = conn.transaction()?;
-        let updated = reclassify_page(&tx, config, None, i64::MAX)?.updated;
+        let updated = reclassify_every_page(&tx, config, RECLASSIFY_BATCH_SIZE)?;
 
         tx.execute(
             "INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)",
@@ -380,6 +380,32 @@ fn reclassify_page(
 /// Maximum rows read and updated in one reclassification transaction.
 const RECLASSIFY_BATCH_SIZE: usize = 10_000;
 
+/// Reclassify every event inside the caller's transaction, one bounded page at
+/// a time, returning the number of rows updated.
+///
+/// The migrations used to pass `i64::MAX`, which loaded the whole `events`
+/// table into one `Vec` before the first `UPDATE` ran. A cursor keeps peak
+/// memory at one page while preserving the migration's all-or-nothing
+/// transaction.
+fn reclassify_every_page(
+    conn: &Connection,
+    config: &Config,
+    batch_size: usize,
+) -> Result<i64, Error> {
+    let limit = i64::try_from(batch_size.max(1)).unwrap_or(i64::MAX);
+    let mut last_id = None;
+    let mut updated = 0i64;
+
+    loop {
+        let page = reclassify_page(conn, config, last_id, limit)?;
+        updated = updated.saturating_add(page.updated);
+        let Some(page_last_id) = page.last_id else {
+            return Ok(updated);
+        };
+        last_id = Some(page_last_id);
+    }
+}
+
 /// Reclassify all events in the database according to the current
 /// configuration.
 pub fn reclassify_all(conn: &mut Connection, config: &Config) -> Result<(), Error> {
@@ -584,19 +610,59 @@ fn backfill_agent_ms_with_busy(
     Ok(settled)
 }
 
+/// Rows the live watcher would itself have reclassified as passive.
+///
+/// This must mirror `watcher::reclassify_false_active`, which demotes a
+/// session only when it saw no keystroke, click, scroll or qualifying mouse
+/// movement, and the active span reached (not exceeded) the threshold. The
+/// repair previously ignored scrolling, so a long reading session with no
+/// typing lost its active time. `mouse_distance = 0` is the stored proxy for
+/// "no movement qualified": every motion event adds distance, so zero distance
+/// proves no movement could have qualified, while a positive distance leaves
+/// the row alone rather than guessing.
+const FALSE_ACTIVE_PREDICATE: &str = "keystrokes = 0 \
+     AND mouse_clicks = 0 \
+     AND scroll_events = 0 \
+     AND mouse_distance = 0 \
+     AND active_ms >= ?1";
+
 /// Reclassify events with zero input as passive instead of active, returning
 /// count updated.
 pub fn fix_false_active(conn: &Connection, input_active_ms: u64) -> Result<i64, Error> {
     let updated = conn.execute(
-        "UPDATE events
-            SET passive_ms = passive_ms + active_ms,
-                active_ms = 0
-          WHERE keystrokes = 0
-            AND mouse_clicks = 0
-            AND active_ms > ?1",
+        &format!(
+            "UPDATE events
+                SET passive_ms = passive_ms + active_ms,
+                    active_ms = 0
+              WHERE {FALSE_ACTIVE_PREDICATE}"
+        ),
         params![i64::try_from(input_active_ms).unwrap_or(i64::MAX)],
     )?;
     Ok(i64::try_from(updated).unwrap_or(i64::MAX))
+}
+
+/// Count and total active time of the rows [`fix_false_active`] would change.
+///
+/// Shares one predicate with the update so `--dry-run` cannot promise a
+/// different repair than the one that runs.
+pub fn false_active_preview(conn: &Connection, input_active_ms: u64) -> Result<(i64, i64), Error> {
+    let threshold = i64::try_from(input_active_ms).unwrap_or(i64::MAX);
+    let count: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM events WHERE {FALSE_ACTIVE_PREDICATE}"),
+        params![threshold],
+        |row| row.get(0),
+    )?;
+    let total_ms: i64 = conn.query_row(
+        // Repairs can leave REAL values in this integer-affinity column, so
+        // round before binding the sum to an integer.
+        &format!(
+            "SELECT CAST(ROUND(COALESCE(SUM(active_ms), 0)) AS INTEGER) \
+               FROM events WHERE {FALSE_ACTIVE_PREDICATE}"
+        ),
+        params![threshold],
+        |row| row.get(0),
+    )?;
+    Ok((count, total_ms))
 }
 
 /// Insert a session event into the database with all activity metrics.
@@ -760,62 +826,97 @@ pub fn reclassify_with_thresholds(
         )));
     }
 
+    reclassify_with_thresholds_in_batches(
+        conn,
+        idle_threshold_secs,
+        deep_idle_secs,
+        THRESHOLD_REPLAY_BATCH_SIZE,
+    )
+}
+
+/// Rows whose input-offset BLOBs are held in memory at once.
+///
+/// Each offset BLOB holds one `u32` per recorded input event, so loading the
+/// whole history before the first `UPDATE` scaled with total input, not with
+/// the work in flight.
+const THRESHOLD_REPLAY_BATCH_SIZE: i64 = 5_000;
+
+fn reclassify_with_thresholds_in_batches(
+    conn: &mut Connection,
+    idle_threshold_secs: u64,
+    deep_idle_secs: u64,
+    batch_size: i64,
+) -> Result<(i64, i64), Error> {
     let idle_threshold_ms = idle_threshold_secs.saturating_mul(1000);
     let deep_idle_threshold_ms = deep_idle_secs.saturating_mul(1000);
+    let limit = batch_size.max(1);
 
-    #[allow(clippy::type_complexity)] // One-shot DB row tuple, not worth a named struct
-    let rows: Vec<(i64, Option<Vec<u8>>, i64, i64, i64)> = {
-        let mut stmt = conn.prepare(
-            "SELECT id, input_offsets, active_ms, passive_ms, idle_ms
-               FROM events
-              WHERE input_offsets IS NOT NULL AND length(input_offsets) > 0",
-        )?;
-        stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<Vec<u8>>>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-    };
-
-    let total_rows = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+    let mut total_rows: i64 = 0;
     let mut updated: i64 = 0;
+    let mut last_id: Option<i64> = None;
 
-    let tx = conn.transaction()?;
-    for (id, blob_opt, old_active, old_passive, old_idle) in rows {
-        if let Some(blob) = blob_opt {
-            if blob.len() % 4 != 0 {
-                continue;
-            }
-            let total_duration = old_active
-                .saturating_add(old_passive)
-                .saturating_add(old_idle);
-            let Some(offsets) = normalize_input_offsets(&blob, total_duration) else {
-                continue;
-            };
-            let (new_active, new_passive, new_idle) = replay_classification(
-                &offsets,
-                total_duration,
-                idle_threshold_ms,
-                deep_idle_threshold_ms,
-            );
+    loop {
+        #[allow(clippy::type_complexity)] // One-shot DB row tuple, not worth a named struct
+        let rows: Vec<(i64, Option<Vec<u8>>, i64, i64, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, input_offsets, active_ms, passive_ms, idle_ms
+                   FROM events
+                  WHERE input_offsets IS NOT NULL AND length(input_offsets) > 0
+                    AND (?1 IS NULL OR id > ?1)
+                  ORDER BY id
+                  LIMIT ?2",
+            )?;
+            stmt.query_map(params![last_id, limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
 
-            if new_active != old_active || new_passive != old_passive || new_idle != old_idle {
-                tx.execute(
-                    "UPDATE events SET active_ms = ?1, passive_ms = ?2, idle_ms = ?3 WHERE id = ?4",
-                    params![new_active, new_passive, new_idle, id],
-                )?;
-                updated = updated.saturating_add(1);
+        let Some(page_last_id) = rows.last().map(|(id, ..)| *id) else {
+            return Ok((updated, total_rows));
+        };
+        total_rows = total_rows.saturating_add(i64::try_from(rows.len()).unwrap_or(i64::MAX));
+
+        // One transaction per page: a repair over a long history stays
+        // interruptible and never holds the write lock for the whole scan.
+        let tx = conn.transaction()?;
+        for (id, blob_opt, old_active, old_passive, old_idle) in rows {
+            if let Some(blob) = blob_opt {
+                if blob.len() % 4 != 0 {
+                    continue;
+                }
+                let total_duration = old_active
+                    .saturating_add(old_passive)
+                    .saturating_add(old_idle);
+                let Some(offsets) = normalize_input_offsets(&blob, total_duration) else {
+                    continue;
+                };
+                let (new_active, new_passive, new_idle) = replay_classification(
+                    &offsets,
+                    total_duration,
+                    idle_threshold_ms,
+                    deep_idle_threshold_ms,
+                );
+
+                if new_active != old_active || new_passive != old_passive || new_idle != old_idle {
+                    tx.execute(
+                        "UPDATE events SET active_ms = ?1, passive_ms = ?2, idle_ms = ?3 WHERE id = ?4",
+                        params![new_active, new_passive, new_idle, id],
+                    )?;
+                    updated = updated.saturating_add(1);
+                }
             }
         }
-    }
-    tx.commit()?;
+        tx.commit()?;
 
-    Ok((updated, total_rows))
+        last_id = Some(page_last_id);
+    }
 }
 
 /// Backfill the `project` column for terminal events that have NULL project.
@@ -1125,6 +1226,114 @@ mod tests {
         assert_eq!(
             categories,
             ["unproductive", "unproductive", "neutral", "neutral"]
+        );
+    }
+
+    #[test]
+    fn migration_reclassification_drains_bounded_pages() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        init_db(&conn).expect("schema");
+        for id in 1..=5 {
+            conn.execute(
+                "INSERT INTO events (id, timestamp, app_id, title, category, active_ms, idle_ms)
+                 VALUES (?1, '2026-08-16T12:00:00+00:00', 'foot', 'terminal work', 'neutral', 1, 0)",
+                [id],
+            )
+            .expect("fixture");
+        }
+
+        let tx = conn.transaction().expect("transaction");
+        let config = title_rule_config();
+        // One page is deliberately smaller than the table, so a caller that
+        // forgets the cursor leaves rows behind.
+        let first_page = reclassify_page(&tx, &config, None, 2).expect("one page");
+        assert_eq!(first_page.updated, 2);
+        tx.rollback().expect("rollback");
+
+        let tx = conn.transaction().expect("transaction");
+        let updated = reclassify_every_page(&tx, &config, 2).expect("pages");
+        tx.commit().expect("commit");
+
+        let unproductive: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE category = 'unproductive'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(updated, 5, "every page must be reclassified, not just one");
+        assert_eq!(unproductive, 5);
+    }
+
+    #[test]
+    fn false_active_repair_matches_the_live_watcher_predicate() {
+        let conn = db_with_events(&[]);
+        // id 1: scroll-only reading session — the watcher keeps it active.
+        // id 2: exactly at the threshold — the watcher demotes it.
+        // id 3: mouse moved — unproven, so the repair leaves it alone.
+        // id 4: no input at all — the repair demotes it.
+        for (id, scroll, distance, active_ms) in [
+            (1, 12, 0, 120_000),
+            (2, 0, 0, 60_000),
+            (3, 0, 40, 120_000),
+            (4, 0, 0, 120_000),
+        ] {
+            conn.execute(
+                "INSERT INTO events (
+                     id, timestamp, app_id, title, category, active_ms, passive_ms, idle_ms,
+                     keystrokes, mouse_clicks, scroll_events, mouse_distance
+                 ) VALUES (
+                     ?1, '2026-08-16T12:00:00+00:00', 'zen', 'A Video', 'neutral',
+                     ?2, 0, 0, 0, 0, ?3, ?4
+                 )",
+                params![id, active_ms, scroll, distance],
+            )
+            .expect("fixture");
+        }
+
+        let (preview_count, preview_ms) = false_active_preview(&conn, 60_000).expect("preview");
+        let fixed = fix_false_active(&conn, 60_000).expect("repair");
+        let still_active: Vec<i64> = conn
+            .prepare("SELECT id FROM events WHERE active_ms > 0 ORDER BY id")
+            .expect("query")
+            .query_map([], |row| row.get(0))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("ids");
+
+        assert_eq!(fixed, 2, "only rows the watcher would demote may change");
+        assert_eq!((preview_count, preview_ms), (2, 180_000));
+        assert_eq!(still_active, [1, 3], "scroll and mouse motion stay active");
+    }
+
+    #[test]
+    fn threshold_reclassification_drains_bounded_pages() {
+        let mut conn = db_with_events(&[]);
+        for id in 1..=5 {
+            let blob = [30_000u32, 90_000]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            conn.execute(
+                "INSERT INTO events (
+                     id, timestamp, app_id, title, category, active_ms, passive_ms, idle_ms,
+                     input_offsets
+                 ) VALUES (
+                     ?1, '2026-08-16T12:00:00+00:00', 'foot', 'terminal', 'productive',
+                     120000, 0, 0, ?2
+                 )",
+                params![id, blob],
+            )
+            .expect("fixture");
+        }
+
+        let (updated, total) =
+            reclassify_with_thresholds_in_batches(&mut conn, 20, 40, 2).expect("reclassify");
+
+        assert_eq!(
+            (updated, total),
+            (5, 5),
+            "every page must be replayed, not just the first"
         );
     }
 

@@ -42,6 +42,11 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
     }
 
     let bounds = range.resolve(&app.config)?;
+    // Filename, subject, body and attachment must describe one period. The
+    // exporter resolves the range again, so an open range generated across
+    // local midnight produced an attachment for a different window than the
+    // subject announced.
+    let export_range = pinned_range(&bounds);
     let filename = format!(
         "activity_report_{}_{}.xlsx",
         bounds.start_date.format("%Y%m%d"),
@@ -54,7 +59,7 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
         .map_err(|e| Error::NiriError(format!("Failed to create temp file: {}", e)))?;
     let temp_path = temp_file.path().to_path_buf();
 
-    report::export_xlsx_range(app, range, &temp_path.to_string_lossy())?;
+    report::export_xlsx_range(app, export_range, &temp_path.to_string_lossy())?;
     let xlsx_bytes = fs::read(&temp_path)
         .map_err(|e| Error::NiriError(format!("Failed to read generated XLSX: {}", e)))?;
     drop(temp_file); // Explicitly remove the temp file
@@ -150,6 +155,15 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
     ));
 
     Ok(())
+}
+
+/// Freeze resolved bounds into a range that resolves to the same dates.
+///
+/// Relative ranges ("this week", "last 7 days") resolve against the clock, so
+/// two resolutions around midnight disagree. The dates are already decided
+/// here; re-deciding them is what created the mismatch.
+fn pinned_range(bounds: &report::TimeBounds) -> TimeRange {
+    TimeRange::DateRange(bounds.start_date, bounds.end_date)
 }
 
 fn report_subject(email: &Email, bounds: &report::TimeBounds, period_name: &str) -> String {
@@ -333,9 +347,36 @@ pub fn secure_config_permissions(config_path: &Path) -> Result<(), Error> {
 mod tests {
     use chrono::NaiveDate;
 
-    use super::report_subject;
-    use crate::config::Email;
-    use crate::report::TimeBounds;
+    use super::{pinned_range, report_subject};
+    use crate::config::{Config, Email};
+    use crate::report::{TimeBounds, TimeRange};
+
+    #[test]
+    fn the_attachment_covers_exactly_the_announced_period() {
+        let start = NaiveDate::from_ymd_opt(2026, 9, 12).expect("date");
+        let end = NaiveDate::from_ymd_opt(2026, 9, 18).expect("date");
+        let bounds = TimeBounds {
+            since_utc: String::new(),
+            until_utc: None,
+            since_str: String::new(),
+            now_str: String::new(),
+            start_date: start,
+            end_date: end,
+        };
+
+        let export_range = pinned_range(&bounds);
+        assert!(
+            matches!(export_range, TimeRange::DateRange(from, to) if from == start && to == end),
+            "the export range must be pinned to the announced dates"
+        );
+
+        // Resolving the exported range again cannot move the window, whatever
+        // the clock does between the two resolutions.
+        let resolved = export_range
+            .resolve(&Config::default())
+            .expect("resolve pinned range");
+        assert_eq!((resolved.start_date, resolved.end_date), (start, end));
+    }
 
     #[test]
     fn weekly_subject_matches_the_scheduled_email_default() {

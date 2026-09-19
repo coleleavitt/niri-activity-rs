@@ -390,7 +390,15 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
     for c in s.chars() {
         if c.is_ascii_digit() || c == '.' {
             current_num.push(c);
-        } else if !current_num.is_empty() {
+        } else if current_num.is_empty() {
+            // A unit with no number in front of it is junk, not a separator.
+            // Ignoring it silently accepted "8hgarbage" as "8h", so a typo in
+            // the goal became a target the reports compared against as if the
+            // user had written it.
+            if !c.is_whitespace() {
+                return None;
+            }
+        } else {
             let num: f64 = current_num.parse().ok()?;
             current_num.clear();
             match c {
@@ -518,6 +526,13 @@ pub struct Config {
     /// Page title to domain, built from browser history. Empty until
     /// [`Config::load_browser_history`] runs.
     pub title_domains: HashMap<String, String>,
+    /// Whether every discovered browser profile was readable when
+    /// [`Config::load_browser_history`] built [`Config::title_domains`].
+    ///
+    /// A locked or corrupt profile produces a map that looks usable but is
+    /// missing exactly the titles that profile knew about. Bulk rewrites of
+    /// stored categories must not run on that evidence.
+    pub title_domains_complete: bool,
 }
 
 fn default_idle_threshold() -> u64 {
@@ -730,6 +745,7 @@ impl TryFrom<RawConfig> for Config {
                 })
                 .collect(),
             title_domains: HashMap::new(),
+            title_domains_complete: false,
         })
     }
 }
@@ -758,6 +774,7 @@ impl Default for Config {
             title_rules: Vec::new(),
             domain_rules: Vec::new(),
             title_domains: HashMap::new(),
+            title_domains_complete: false,
         }
     }
 }
@@ -910,21 +927,33 @@ impl Config {
     /// database is not an error — domain rules simply stay inert and
     /// classification falls back to title matching alone.
     pub fn load_browser_history(&mut self) -> usize {
-        match browser_profiles::title_to_domain() {
-            Ok(map) => {
-                self.title_domains = map;
+        match browser_profiles::title_domains() {
+            Ok(domains) => {
+                // A profile that could not be read knows titles this map is
+                // missing, so live classification may use what was read while
+                // bulk rewrites stay blocked.
+                self.title_domains_complete = domains.is_complete();
+                self.title_domains = domains.into_titles();
                 self.title_domains.len()
             }
             Err(e) => {
                 self.title_domains.clear();
+                self.title_domains_complete = false;
                 tracing::debug!("browser history unavailable, domain rules inert: {e}");
                 0
             }
         }
     }
 
+    /// Whether stored categories may be rewritten in bulk from this config.
+    ///
+    /// Rewriting on a partial title map silently demotes rows a domain rule
+    /// owns to lower-priority title and app rules, which is indistinguishable
+    /// afterwards from a genuine classification. Incomplete evidence therefore
+    /// blocks the rewrite instead of approximating it.
     pub fn can_reclassify_all(&self) -> bool {
-        self.domain_rules.is_empty() || !self.title_domains.is_empty()
+        self.domain_rules.is_empty()
+            || (!self.title_domains.is_empty() && self.title_domains_complete)
     }
 
     fn domain_category(&self, title: &str) -> Option<Category> {
@@ -962,6 +991,10 @@ impl Config {
                 continue;
             }
 
+            // An unscoped rule may not override an explicit [categories]
+            // entry: a global keyword rule was reclassifying Discord channels
+            // whose titles happened to contain it. Scoping a rule with
+            // `app = [...]` is the documented way to override an app category.
             if !scoped && explicit_cat.is_some() {
                 continue;
             }
@@ -986,15 +1019,6 @@ impl Schedule {
             return true;
         }
 
-        let weekday = dt.weekday().to_string();
-        let matches_day = self
-            .days
-            .iter()
-            .any(|day| day.eq_ignore_ascii_case(&weekday));
-        if !matches_day {
-            return false;
-        }
-
         let start = match NaiveTime::parse_from_str(&self.start, "%H:%M") {
             Ok(time) => time,
             Err(_) => return false,
@@ -1006,10 +1030,25 @@ impl Schedule {
         let current = dt.time();
 
         if start <= end {
-            current >= start && current <= end
-        } else {
-            current >= start || current <= end
+            return self.covers_weekday(dt.weekday()) && current >= start && current <= end;
         }
+
+        // An overnight shift belongs to the day it started on. Testing the
+        // early-morning tail against the calendar day it lands in cut Friday
+        // night's shift short at midnight and credited Monday's pre-dawn hours
+        // to a shift that never started.
+        if current >= start {
+            self.covers_weekday(dt.weekday())
+        } else if current <= end {
+            self.covers_weekday(dt.weekday().pred())
+        } else {
+            false
+        }
+    }
+
+    fn covers_weekday(&self, weekday: chrono::Weekday) -> bool {
+        let name = weekday.to_string();
+        self.days.iter().any(|day| day.eq_ignore_ascii_case(&name))
     }
 
     pub fn count_workdays(
@@ -1142,6 +1181,21 @@ fn validate_agent_activity_config(config: &AgentActivityConfig) -> Result<(), Er
     Ok(())
 }
 
+/// Reject thresholds that would disable a measurement instead of tuning it.
+///
+/// A zero mouse threshold makes every pointer event, including a jiggler's,
+/// qualify as human activity, so idle and Away could never be reached again.
+fn validate_input_thresholds(config: &RawConfig) -> Result<(), Error> {
+    if config.mouse_idle_threshold == 0 {
+        return Err(Error::InvalidArgument(
+            "mouse_idle_threshold must be at least 1; zero counts every pointer \
+             event as activity and prevents idle detection"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_jiggler_config(config: &JigglerConfig) -> Result<(), Error> {
     if !config.enabled {
         return Ok(());
@@ -1167,6 +1221,7 @@ pub fn load_config() -> Result<Config, Error> {
         let raw: RawConfig = toml::from_str(&content)?;
         validate_jiggler_config(&raw.jiggler)?;
         validate_agent_activity_config(&raw.agent_activity)?;
+        validate_input_thresholds(&raw)?;
         Config::try_from(raw)
     } else {
         Ok(Config::default())
@@ -1196,7 +1251,7 @@ window_secs = 600          # 10-min observation window
 min_events = 10            # need this many events to evaluate
 variance_threshold_ms = 100 # max-min interval < this = artificial
 process_blacklist = [
-    "xdotool", "ydotool", "caffeine", "keep-presence",
+    "xdotool", "ydotool", "xdg-screensaver", "caffeine", "keep-presence",
     "mouse-jiggler", "movemouse", "jiggler", "wiggle"
 ]
 
@@ -1246,7 +1301,10 @@ mpv = "unproductive"
 # Title rules — override category based on window title (case-insensitive).
 # Default: substring match. Add regex = true for regex patterns.
 # Optional: app = [\"zen\", \"firefox\"] limits rule to those apps.
-# Checked BEFORE app-level categories.
+# An app-scoped rule is checked BEFORE the app's [categories] entry and wins.
+# An unscoped rule is skipped for apps that have their own [categories] entry,
+# so a keyword in a Discord channel title cannot reclassify Discord; scope the
+# rule with app = [...] when it should override one.
 
 # Browser-only: one regex rule replaces many substring rules
 [[title_rules]]
@@ -1934,6 +1992,127 @@ search_dirs = ["~/RustProjects/active", "~/projects", "/absolute/path"]
         assert_eq!(
             config.project_aliases.get("ers-rs").unwrap(),
             "Entity Resolution"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_title_map_blocks_bulk_reclassification() {
+        let mut config = Config {
+            domain_rules: vec![DomainRule {
+                domain: "youtube.com".to_string(),
+                category: Category::Unproductive,
+            }],
+            title_domains: HashMap::from([("Some Video".to_string(), "youtube.com".to_string())]),
+            title_domains_complete: false,
+            ..Default::default()
+        };
+
+        assert!(
+            !config.can_reclassify_all(),
+            "an unreadable profile must block a bulk rewrite even though the map is non-empty"
+        );
+
+        config.title_domains_complete = true;
+        assert!(config.can_reclassify_all());
+
+        // Without domain rules there is nothing to be incomplete about.
+        let without_rules = Config {
+            title_domains_complete: false,
+            ..Default::default()
+        };
+        assert!(without_rules.can_reclassify_all());
+    }
+
+    #[test]
+    fn a_goal_with_trailing_junk_is_rejected_instead_of_truncated() {
+        for goal in ["8hgarbage", "8h!", "h8h", "8x", "eight hours"] {
+            assert_eq!(parse_duration_ms(goal), None, "accepted {goal:?}");
+        }
+        assert_eq!(parse_duration_ms("8h"), Some(8 * 3_600_000));
+        assert_eq!(parse_duration_ms("1h 30m"), Some(5_400_000));
+        assert_eq!(parse_duration_ms(" 45m "), Some(2_700_000));
+    }
+
+    #[test]
+    fn an_overnight_schedule_follows_the_shift_that_started_it() {
+        let schedule = Schedule {
+            enabled: true,
+            start: "22:00".to_string(),
+            end: "06:00".to_string(),
+            days: ["Mon", "Tue", "Wed", "Thu", "Fri"]
+                .iter()
+                .map(|day| (*day).to_string())
+                .collect(),
+            holidays: Vec::new(),
+        };
+        let at = |year, month, day, hour| {
+            chrono::Local
+                .with_ymd_and_hms(year, month, day, hour, 0, 0)
+                .single()
+                .expect("unambiguous local time")
+        };
+
+        // Friday 2026-09-18 22:00 runs into Saturday morning.
+        assert!(schedule.is_in_schedule(&at(2026, 9, 18, 23)));
+        assert!(schedule.is_in_schedule(&at(2026, 9, 19, 2)));
+        // Monday pre-dawn belongs to a Sunday shift that never started.
+        assert!(!schedule.is_in_schedule(&at(2026, 9, 21, 2)));
+        assert!(schedule.is_in_schedule(&at(2026, 9, 21, 23)));
+        // Mid-afternoon is outside the shift on any day.
+        assert!(!schedule.is_in_schedule(&at(2026, 9, 21, 14)));
+    }
+
+    #[test]
+    fn generated_config_jiggler_blacklist_matches_the_code_default() {
+        let raw: RawConfig = toml::from_str(DEFAULT_CONFIG).expect("generated config parses");
+        assert_eq!(raw.jiggler.process_blacklist, default_jiggler_blacklist());
+    }
+
+    #[test]
+    fn a_zero_mouse_threshold_is_rejected_instead_of_disabling_idle() {
+        let raw: RawConfig =
+            toml::from_str("mouse_idle_threshold = 0").expect("test config must parse");
+        let error = validate_input_thresholds(&raw).expect_err("zero threshold must be rejected");
+        assert!(
+            error.to_string().contains("mouse_idle_threshold"),
+            "{error}"
+        );
+
+        let raw: RawConfig =
+            toml::from_str("mouse_idle_threshold = 1").expect("test config must parse");
+        assert!(validate_input_thresholds(&raw).is_ok());
+    }
+
+    #[test]
+    fn an_unscoped_title_rule_never_overrides_an_explicit_app_category() {
+        let config = Config {
+            categories: HashMap::from([("vesktop".to_string(), Category::Unproductive)]),
+            title_rules: vec![
+                TitleRule {
+                    pattern: "Claude".to_string(),
+                    category: Category::Productive,
+                    app: vec![],
+                    compiled: None,
+                },
+                TitleRule {
+                    pattern: "Claude".to_string(),
+                    category: Category::Productive,
+                    app: vec!["zen".to_string()],
+                    compiled: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.classify("vesktop", "#claude-chat"),
+            Category::Unproductive,
+            "an unscoped rule must not reclassify an explicitly categorized app"
+        );
+        assert_eq!(
+            config.classify("zen", "Claude"),
+            Category::Productive,
+            "an app-scoped rule still overrides"
         );
     }
 

@@ -13,7 +13,9 @@ pub struct AgentMonitor {
     enabled: bool,
     poll_interval_ms: u64,
     activity_window_ms: i64,
-    databases: Vec<PathBuf>,
+    /// Configured patterns, not resolved paths: the watcher outlives agent
+    /// installs, so resolution happens per poll.
+    database_patterns: Vec<String>,
     process_whitelist: HashSet<String>,
     process_recency_ms: u64,
     last_poll: Instant,
@@ -24,18 +26,7 @@ pub struct AgentMonitor {
 impl AgentMonitor {
     pub fn new(config: &AgentActivityConfig) -> Self {
         let _linkscope_agent_new = linkscope::phase("agent.new");
-        let mut seen_databases = HashSet::new();
-        let databases = config
-            .databases
-            .iter()
-            .flat_map(|path| expand_database_paths(path))
-            .filter(|p| p.exists())
-            .filter(|p| seen_databases.insert(p.clone()))
-            .collect::<Vec<_>>();
-        linkscope::record_items(
-            "agent.databases",
-            u64::try_from(databases.len()).unwrap_or(u64::MAX),
-        );
+        let database_patterns = config.databases.clone();
 
         let process_whitelist = config
             .process_whitelist
@@ -51,7 +42,7 @@ impl AgentMonitor {
             activity_window_ms: i64::try_from(config.activity_window_secs)
                 .unwrap_or(30)
                 .saturating_mul(1000),
-            databases,
+            database_patterns,
             process_whitelist,
             process_recency_ms: config.process_recency_secs.saturating_mul(1000),
             last_poll: Instant::now()
@@ -119,14 +110,30 @@ impl AgentMonitor {
         active
     }
 
+    /// Resolve the configured patterns against the filesystem.
+    ///
+    /// Resolving once at startup dropped every database that did not exist
+    /// yet, so installing or first-running an agent left it undetectable for
+    /// the life of the watcher process. Missing paths cost a failed stat in
+    /// `database_recently_changed`, which is cheaper than the SQL scan it
+    /// guards.
+    fn resolve_databases(&self) -> Vec<PathBuf> {
+        let mut seen = HashSet::new();
+        self.database_patterns
+            .iter()
+            .flat_map(|pattern| expand_database_paths(pattern))
+            .filter(|path| seen.insert(path.clone()))
+            .collect()
+    }
+
     fn check_databases(&self) -> bool {
         let _linkscope_agent_dbs = linkscope::phase("agent.databases");
-        for db_path in &self.databases {
-            if self.check_opencode_db(db_path) {
-                return true;
-            }
-        }
-        false
+        let databases = self.resolve_databases();
+        linkscope::record_items(
+            "agent.databases",
+            u64::try_from(databases.len()).unwrap_or(u64::MAX),
+        );
+        databases.iter().any(|path| self.check_opencode_db(path))
     }
 
     fn check_opencode_db(&self, path: &Path) -> bool {
@@ -145,8 +152,10 @@ impl AgentMonitor {
             Err(_) => return false,
         };
 
+        let now_ms = unix_now_ms();
+        let lower_bound_ms = now_ms.saturating_sub(self.activity_window_ms);
         OPENCODE_ACTIVITY_COLUMNS.iter().any(|(table, column)| {
-            has_recent_timestamp(&conn, table, column, self.activity_window_ms)
+            has_recent_timestamp(&conn, table, column, lower_bound_ms, now_ms)
         })
     }
 
@@ -209,19 +218,42 @@ const OPENCODE_ACTIVITY_COLUMNS: &[(&str, &str)] = &[
     ("session_message", "time_updated"),
 ];
 
+/// Current wall clock in milliseconds, or 0 if the clock predates the epoch.
+///
+/// A broken clock yields an empty activity window rather than a wide one, so
+/// unmeasurable time is never credited as agent work.
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// Whether the table holds a row whose timestamp lies inside the activity
+/// window.
+///
+/// The bounds are half-open on both sides and the column is cast, because
+/// SQLite orders every numeric value before every text value: an un-cast
+/// comparison made a malformed `'yesterday'` string, and any clock-skewed
+/// future timestamp, look like activity that just happened. Both would credit
+/// idle time as agent work, which is the one error this measurement must not
+/// make.
 fn has_recent_timestamp(
     conn: &Connection,
     table: &str,
     column: &str,
-    activity_window_ms: i64,
+    lower_bound_ms: i64,
+    now_ms: i64,
 ) -> bool {
     let _linkscope_agent_query = linkscope::phase("agent.db.query");
     linkscope::record_items("agent.db.query", 1);
     let query = format!(
         "SELECT EXISTS(SELECT 1 FROM {table} \
-         WHERE {column} > (strftime('%s', 'now') * 1000 - ?1) LIMIT 1)"
+         WHERE CAST({column} AS INTEGER) > ?1 \
+           AND CAST({column} AS INTEGER) <= ?2 LIMIT 1)"
     );
-    conn.query_row(&query, [activity_window_ms], |row| row.get::<_, i64>(0))
+    conn.query_row(&query, [lower_bound_ms, now_ms], |row| row.get::<_, i64>(0))
         .unwrap_or(0)
         != 0
 }
@@ -368,11 +400,18 @@ mod tests {
     }
 
     fn monitor_with_window(activity_window_ms: i64) -> AgentMonitor {
+        monitor_with_databases(activity_window_ms, Vec::new())
+    }
+
+    fn monitor_with_databases(
+        activity_window_ms: i64,
+        database_patterns: Vec<String>,
+    ) -> AgentMonitor {
         AgentMonitor {
             enabled: true,
             poll_interval_ms: 5_000,
             activity_window_ms,
-            databases: Vec::new(),
+            database_patterns,
             process_whitelist: HashSet::new(),
             process_recency_ms: 300_000,
             last_poll: Instant::now(),
@@ -386,7 +425,7 @@ mod tests {
         // With no configured database the monitor used to see nothing, which
         // left eleven of twelve installed agents invisible.
         let monitor = monitor_with_window(30_000);
-        assert_eq!(monitor.databases, [] as [PathBuf; 0]);
+        assert_eq!(monitor.resolve_databases(), [] as [PathBuf; 0]);
         assert_eq!(
             monitor.check_harnesses(),
             harness::any_active(Duration::from_secs(30)),
@@ -576,6 +615,71 @@ mod tests {
         let monitor = monitor_with_window(30_000);
         assert!(!monitor.check_opencode_db(&path));
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_database_created_after_startup_is_still_detected() {
+        let dir = temp_dir_path("late-database");
+        fs::create_dir(&dir).expect("create temp directory");
+        let pattern = format!("{}/opencode*.db", dir.display());
+        let monitor = monitor_with_databases(60_000, vec![pattern]);
+
+        assert!(
+            !monitor.check_databases(),
+            "an empty directory has no agent activity"
+        );
+
+        let path = dir.join("opencode.db");
+        {
+            let conn = Connection::open(&path).expect("create temp opencode db");
+            conn.execute("CREATE TABLE part (time_updated INTEGER NOT NULL)", [])
+                .expect("create part table");
+            conn.execute("INSERT INTO part (time_updated) VALUES (?1)", [now_ms()])
+                .expect("insert recent part update");
+        }
+
+        assert!(
+            monitor.check_databases(),
+            "a database created after startup must still be polled"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn malformed_and_future_timestamps_are_not_recent_activity() {
+        let path = temp_db_path("timestamp-bounds");
+        let now = now_ms();
+        {
+            let conn = Connection::open(&path).expect("create temp opencode db");
+            conn.execute("CREATE TABLE part (time_updated)", [])
+                .expect("create part table");
+            for value in ["'yesterday'", "'not-a-timestamp'"] {
+                conn.execute(&format!("INSERT INTO part VALUES ({value})"), [])
+                    .expect("insert malformed timestamp");
+            }
+            conn.execute(
+                "INSERT INTO part VALUES (?1)",
+                [now.saturating_add(3_600_000)],
+            )
+            .expect("insert future timestamp");
+        }
+
+        let conn = Connection::open(&path).expect("open temp opencode db");
+        assert!(
+            !has_recent_timestamp(&conn, "part", "time_updated", now - 30_000, now),
+            "text and future timestamps must not count as activity"
+        );
+
+        conn.execute("INSERT INTO part VALUES (?1)", [now - 1_000])
+            .expect("insert recent timestamp");
+        assert!(
+            has_recent_timestamp(&conn, "part", "time_updated", now - 30_000, now),
+            "a genuine recent timestamp must still count"
+        );
+
+        drop(conn);
         let _ = fs::remove_file(path);
     }
 

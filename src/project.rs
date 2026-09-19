@@ -48,24 +48,10 @@ pub fn detect_project_from_title(title: &str) -> Option<String> {
         return Some("OpenCode".to_string());
     }
 
-    // Pattern: JFC/Claude-style "jfc · model · project" with optional leading
-    // status Status prefixes: "● ", "(NNN new) ", etc.
-    if title.contains(" · ") {
-        let cleaned = strip_jfc_status_prefix(title);
-        let parts: Vec<&str> = cleaned.split(" · ").collect();
-        if parts.len() >= 3 {
-            // Last segment is the project/task name
-            let project = parts.last().unwrap().trim();
-            if !project.is_empty() {
-                return Some(project.to_string());
-            }
-        } else if parts.len() == 2 {
-            // "jfc · model" — less common but handle it
-            let project = parts.last().unwrap().trim();
-            if !project.is_empty() {
-                return Some(project.to_string());
-            }
-        }
+    // Pattern: JFC/Claude-style titles with an optional leading status
+    // ("● ", "(NNN new) ", etc.).
+    if let Some(project) = detect_jfc_project(title) {
+        return Some(project);
     }
 
     // Pattern: "user@host directory" (shell prompt title)
@@ -74,6 +60,44 @@ pub fn detect_project_from_title(title: &str) -> Option<String> {
     }
 
     None
+}
+
+/// JFC marker segment. Present as the first field in the legacy grammar and as
+/// the last field in the current one, so it identifies the grammar but is never
+/// itself a project.
+const JFC_MARKER: &str = "jfc";
+
+/// Extract the project from a JFC terminal title, or `None` when the title is
+/// not JFC at all.
+///
+/// Two grammars exist in the wild and they put the project at opposite ends:
+/// current JFC emits `<session> · <model> · jfc` while older installs emitted
+/// `jfc · <model> · <project>`. Taking the last segment unconditionally
+/// recorded the literal `jfc` marker as a project for every current session.
+/// The marker check also keeps unrelated titles that merely contain ` · `
+/// (shell paths, media players) from inventing a project.
+fn detect_jfc_project(title: &str) -> Option<String> {
+    if !title.contains(" \u{00b7} ") {
+        return None;
+    }
+    let cleaned = strip_jfc_status_prefix(title);
+    let fields: Vec<&str> = cleaned.split(" \u{00b7} ").map(str::trim).collect();
+    let [first, model, last] = fields.as_slice() else {
+        return None;
+    };
+    if first.is_empty() || model.is_empty() || last.is_empty() {
+        return None;
+    }
+
+    // Legacy first: a legacy title whose project is literally named "jfc"
+    // still resolves to the project rather than to the session.
+    if *first == JFC_MARKER {
+        Some((*last).to_string())
+    } else if *last == JFC_MARKER {
+        Some((*first).to_string())
+    } else {
+        None
+    }
 }
 
 /// Strip leading status indicators from JFC-style titles.
@@ -97,6 +121,16 @@ fn strip_jfc_status_prefix(title: &str) -> &str {
     }
 
     s
+}
+
+/// Expand a `~/`-prefixed prompt directory against the real home directory.
+///
+/// Returns `None` for paths that carry no tilde prefix, so callers keep their
+/// existing handling for absolute paths and bare basenames.
+fn expand_prompt_tilde(dir: &str) -> Option<PathBuf> {
+    let rest = dir.strip_prefix("~/")?;
+    let home = dirs::home_dir()?;
+    Some(home.join(rest))
 }
 
 /// Try to parse a shell prompt title like "user@host directory".
@@ -125,6 +159,24 @@ fn try_parse_shell_prompt(title: &str) -> Option<Option<String>> {
     // Home directory is not a project
     if dir == "~" {
         return Some(None);
+    }
+
+    // Shells render `\w` prompts with a `~/` prefix, so a tilde path is a full
+    // path with the home directory elided. Without expansion it reached the
+    // basename branch and stored the literal "~/project", which matched no
+    // alias and no search directory. Fall back to the basename when the
+    // directory carries no project marker, because that is the name the
+    // search-dir and alias lookups expect.
+    if let Some(expanded) = expand_prompt_tilde(dir) {
+        if dirs::home_dir().is_some_and(|home| expanded == home) {
+            return Some(None);
+        }
+        return Some(detect_project_from_path(&expanded).or_else(|| {
+            expanded
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        }));
     }
 
     // Full path: try to detect the project from the filesystem
@@ -383,6 +435,42 @@ mod tests {
             detect_project_from_title("(142 new) jfc · bedrock-claude-4-6-opus · jfc"),
             Some("jfc".to_string())
         );
+    }
+
+    #[test]
+    fn current_jfc_grammar_records_the_session_instead_of_the_marker() {
+        assert_eq!(
+            detect_project_from_title(
+                "\u{25cf} refactor watcher \u{00b7} claude-sonnet \u{00b7} jfc"
+            ),
+            Some("refactor watcher".to_string())
+        );
+    }
+
+    #[test]
+    fn titles_without_the_jfc_marker_claim_no_project() {
+        for title in [
+            "Artist \u{00b7} Album \u{00b7} Track",
+            "nvim \u{00b7} src/main.rs",
+            "\u{25cf} session \u{00b7} model \u{00b7} extra \u{00b7} jfc",
+            "\u{25cf} session \u{00b7}  \u{00b7} jfc",
+        ] {
+            assert_eq!(detect_project_from_title(title), None, "accepted {title:?}");
+        }
+    }
+
+    #[test]
+    fn tilde_prompt_directory_is_expanded_instead_of_stored_literally() {
+        let home = dirs::home_dir().expect("home directory");
+        assert_eq!(
+            expand_prompt_tilde("~/myproject"),
+            Some(home.join("myproject"))
+        );
+        assert_eq!(
+            detect_project_from_title("cole@gentoo-p16 ~/myproject"),
+            Some("myproject".to_string())
+        );
+        assert_eq!(detect_project_from_title("cole@gentoo-p16 ~/"), None);
     }
 
     #[test]

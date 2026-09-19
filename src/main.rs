@@ -103,6 +103,27 @@ enum ExportFormat {
     Cron,
 }
 
+/// Reject `--output` for the formats that only write to stdout.
+///
+/// Those exporters take no path, so the flag used to be dropped: the command
+/// printed the report, created no file and exited 0, which reads as success.
+/// Failing is the only honest answer until every format writes files.
+fn check_output_support(format: &ExportFormat, output: Option<&str>) -> Result<(), Error> {
+    let Some(path) = output else {
+        return Ok(());
+    };
+    if matches!(format, ExportFormat::Xlsx) {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "--output {path} is only supported for --format xlsx; \
+         redirect stdout to write {format:?} output to a file"
+    )))
+}
+
+/// Longest reportable span. Every range walks its days one at a time.
+const MAX_DAYS: u32 = 10_000;
+
 fn parse_time_range(days: u32, time: &TimeRangeArgs) -> Result<report::TimeRange, Error> {
     if let (Some(from_str), Some(to_str)) = (&time.from, &time.to) {
         let start = NaiveDate::parse_from_str(from_str, "%Y-%m-%d")
@@ -115,6 +136,16 @@ fn parse_time_range(days: u32, time: &TimeRangeArgs) -> Result<report::TimeRange
                 from_str, to_str
             )));
         }
+        // An explicit range is bounded like --days: the report and XLSX
+        // exporters walk the span one day at a time, so a range spanning the
+        // chrono date domain iterates for millions of days.
+        let span_days = (end - start).num_days();
+        if span_days > i64::from(MAX_DAYS) {
+            return Err(Error::InvalidArgument(format!(
+                "--from/--to range of {} days exceeds maximum of {}",
+                span_days, MAX_DAYS
+            )));
+        }
         return Ok(report::TimeRange::DateRange(start, end));
     }
     if time.from.is_some() || time.to.is_some() {
@@ -123,7 +154,6 @@ fn parse_time_range(days: u32, time: &TimeRangeArgs) -> Result<report::TimeRange
         ));
     }
 
-    const MAX_DAYS: u32 = 10_000;
     if days > MAX_DAYS {
         return Err(Error::InvalidArgument(format!(
             "--days {} exceeds maximum of {}",
@@ -358,9 +388,25 @@ enum Commands {
     },
 }
 
+/// Apply the config-directory env file, then start profiling from the
+/// environment it produced.
+///
+/// `NIRI_ACTIVITY_LINKSCOPE` may live in that file, so reading the environment
+/// first left file-configured profiling permanently off. Taking both steps as
+/// arguments keeps the order in one place instead of in the reading order of
+/// `main`.
+fn start_profiling_after_env_file(
+    load_env_file: impl FnOnce() -> Result<(), Error>,
+    init_profiling: impl FnOnce() -> Option<linkscope::ReportGuard>,
+) -> Option<linkscope::ReportGuard> {
+    if let Err(e) = load_env_file() {
+        tracing::warn!("failed to load env file: {e}");
+    }
+    init_profiling()
+}
+
 fn main() {
     let cli = Cli::parse();
-    let _linkscope_report = profiling::init_from_env();
 
     // TUI mode takes over the terminal; disable tracing to stderr.
     // For CLI commands, enable tracing with env-filter (RUST_LOG=info default).
@@ -374,10 +420,9 @@ fn main() {
             .init();
     }
 
-    // Load env file (SMTP creds etc.) before any threads spawn.
-    if let Err(e) = config::load_env_file() {
-        tracing::warn!("failed to load env file: {e}");
-    }
+    // Env file (SMTP creds, profiling switches) before any threads spawn.
+    let _linkscope_report =
+        start_profiling_after_env_file(config::load_env_file, profiling::init_from_env);
 
     let result: Result<(), Error> = match cli.command {
         None => tui::run_tui_range(report::TimeRange::Days(7)),
@@ -429,18 +474,20 @@ fn main() {
             time,
             format,
             output,
-        }) => parse_time_range(days, &time).and_then(|range| {
-            report::App::open().and_then(|app| match format {
-                ExportFormat::Xlsx => {
-                    let path = output.unwrap_or_else(|| "activity_report.xlsx".to_string());
-                    report::export_xlsx_range(&app, range, &path)
-                }
-                ExportFormat::Json => report::export_json_range(&app, range),
-                ExportFormat::Heatmap => report::export_heatmap_range(&app, range),
-                ExportFormat::Cron => report::export_cron_summary(&app, range),
-                ExportFormat::Csv => report::export_csv_range(&app, range),
-            })
-        }),
+        }) => parse_time_range(days, &time)
+            .and_then(|range| check_output_support(&format, output.as_deref()).map(|()| range))
+            .and_then(|range| {
+                report::App::open().and_then(|app| match format {
+                    ExportFormat::Xlsx => {
+                        let path = output.unwrap_or_else(|| "activity_report.xlsx".to_string());
+                        report::export_xlsx_range(&app, range, &path)
+                    }
+                    ExportFormat::Json => report::export_json_range(&app, range),
+                    ExportFormat::Heatmap => report::export_heatmap_range(&app, range),
+                    ExportFormat::Cron => report::export_cron_summary(&app, range),
+                    ExportFormat::Csv => report::export_csv_range(&app, range),
+                })
+            }),
         Some(Commands::Init) => config::init_config(),
         Some(Commands::BackfillAgent { days }) => (|| -> Result<(), Error> {
             let cfg = config::load_config()?;
@@ -465,22 +512,9 @@ fn main() {
             let input_active_ms = cfg.input_active_secs.saturating_mul(1000);
 
             if dry_run {
-                let count: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM events
-                          WHERE keystrokes = 0
-                            AND mouse_clicks = 0
-                            AND active_ms > ?1",
-                    rusqlite::params![i64::try_from(input_active_ms).unwrap_or(i64::MAX)],
-                    |row| row.get(0),
-                )?;
-                let total_ms: i64 = conn.query_row(
-                    "SELECT COALESCE(SUM(active_ms), 0) FROM events
-                          WHERE keystrokes = 0
-                            AND mouse_clicks = 0
-                            AND active_ms > ?1",
-                    rusqlite::params![i64::try_from(input_active_ms).unwrap_or(i64::MAX)],
-                    |row| row.get(0),
-                )?;
+                // The preview shares its predicate with the repair, so the
+                // two cannot describe different sets of rows.
+                let (count, total_ms) = db::false_active_preview(&conn, input_active_ms)?;
                 let hours = total_ms / MS_PER_HOUR;
                 let mins = (total_ms % MS_PER_HOUR) / MS_PER_MIN;
                 println!(
@@ -745,6 +779,72 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn an_explicit_date_range_is_bounded_like_days() {
+        let error = parse_email(&["--from", "0001-01-01", "--to", "9999-12-31"]);
+        let range = email_time_range(error.0, &error.1);
+        assert!(
+            range.is_err(),
+            "a range spanning the date domain must be rejected"
+        );
+
+        let (days, time, _, _) = parse_email(&["--from", "2026-01-01", "--to", "2026-12-31"]);
+        assert!(email_time_range(days, &time).is_ok());
+    }
+
+    #[test]
+    fn output_is_rejected_for_formats_that_only_write_to_stdout() {
+        for format in [
+            ExportFormat::Csv,
+            ExportFormat::Json,
+            ExportFormat::Heatmap,
+            ExportFormat::Cron,
+        ] {
+            let error = check_output_support(&format, Some("report.out"))
+                .expect_err("stdout-only formats must not silently drop --output");
+            assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+        }
+        assert!(check_output_support(&ExportFormat::Xlsx, Some("book.xlsx")).is_ok());
+        assert!(check_output_support(&ExportFormat::Csv, None).is_ok());
+    }
+
+    #[test]
+    fn profiling_starts_only_after_the_env_file_is_applied() {
+        use std::cell::RefCell;
+
+        let order = RefCell::new(Vec::new());
+        let guard = start_profiling_after_env_file(
+            || {
+                order.borrow_mut().push("env");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("profiling");
+                None
+            },
+        );
+
+        assert!(guard.is_none());
+        assert_eq!(order.into_inner(), ["env", "profiling"]);
+    }
+
+    #[test]
+    fn a_failed_env_file_still_starts_profiling() {
+        let started = std::cell::Cell::new(false);
+        let _guard = start_profiling_after_env_file(
+            || Err(Error::NiriError("no env file".into())),
+            || {
+                started.set(true);
+                None
+            },
+        );
+
+        assert!(
+            started.get(),
+            "profiling must fall back to the real environment"
+        );
+    }
+
     #[test]
     fn browser_engagement_is_explicitly_lifetime_only() {
         assert!(
