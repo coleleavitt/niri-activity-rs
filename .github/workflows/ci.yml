@@ -28,6 +28,12 @@ jobs:
           toolchain: stable
           components: clippy
 
+      # Pinned to the commit behind tag v2 (2.9.2); the workspace is 400+
+      # crates, so an uncached run recompiles every dependency before the
+      # first check can fail.
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+
       - name: Build
         run: cargo build --locked --workspace --all-targets --all-features
 
