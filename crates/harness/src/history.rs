@@ -179,40 +179,111 @@ fn timestamp_field(line: &str) -> Option<i64> {
     None
 }
 
-/// Files under `dir` modified within the window, newest first.
-fn recent_files(dir: &Path, since_secs: i64) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
+/// Budgets for one generic historical log scan.
+///
+/// The generic walk visits every configured agent tree, so without a bound the
+/// cost of startup healing is whatever history a user happens to have kept.
+/// Sized like the Prime budgets: large enough that a real long-lived store fits
+/// and small enough that a runaway tree cannot walk forever. Exceeding a budget
+/// returns `None` rather than a partial list, because `backfill_agent_ms`
+/// stamps `agent_ms = 0` over anything a "complete" scan did not find.
+const MAX_GENERIC_HISTORY_ENTRIES: usize = 1_000_000;
+const MAX_GENERIC_HISTORY_FILES: usize = 50_000;
+const MAX_GENERIC_HISTORY_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_GENERIC_HISTORY_DEPTH: usize = 32;
 
-    while let Some(current) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&current) else {
-            continue;
+/// Files under `dir` modified since `since_secs`.
+///
+/// `None` means the tree could not be enumerated within its budget, or that a
+/// traversal error left part of it unread — either way the caller must not
+/// treat the range as measured.
+fn recent_files(dir: &Path, since_secs: i64) -> Option<Vec<PathBuf>> {
+    recent_files_with_limits(
+        dir,
+        since_secs,
+        MAX_GENERIC_HISTORY_ENTRIES,
+        MAX_GENERIC_HISTORY_FILES,
+        MAX_GENERIC_HISTORY_BYTES,
+    )
+}
+
+fn recent_files_with_limits(
+    dir: &Path,
+    since_secs: i64,
+    max_entries: usize,
+    max_files: usize,
+    max_bytes: u64,
+) -> Option<Vec<PathBuf>> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut bytes = 0u64;
+    let mut entries_seen = 0usize;
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+
+    while let Some((current, depth)) = stack.pop() {
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            // A configured store no agent ever created is normal; anything else
+            // hides records this scan is about to declare absent.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
         };
-        for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_dir() {
-                stack.push(entry.path());
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            entries_seen = entries_seen.saturating_add(1);
+            if entries_seen > max_entries {
+                return None;
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            if metadata.is_dir() {
+                if depth >= MAX_GENERIC_HISTORY_DEPTH {
+                    return None;
+                }
+                stack.push((entry.path(), depth + 1));
                 continue;
             }
             // A log untouched since the window opened cannot contain events
             // inside it, so skipping saves opening tens of thousands of files.
-            let fresh = meta.modified().is_ok_and(|t| {
-                t.duration_since(std::time::UNIX_EPOCH)
-                    .is_ok_and(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX) >= since_secs)
-            });
-            if fresh {
-                out.push(entry.path());
+            if !metadata_modified_is_fresh(metadata.modified(), since_secs)? {
+                continue;
+            }
+            out.push(entry.path());
+            bytes = bytes.saturating_add(metadata.len());
+            if out.len() > max_files || bytes > max_bytes {
+                return None;
             }
         }
     }
-    out
+    Some(out)
 }
 
 fn scan_log(path: &Path, since: i64, until: i64, busy: &mut BusyMinutes) {
-    let Ok(file) = fs::File::open(path) else {
-        return;
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => {
+            busy.mark_incomplete();
+            return;
+        }
     };
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for line in BufReader::new(file).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            // A read error or invalid UTF-8 hides every record behind it, so
+            // the rest of this log is unknown rather than empty.
+            Err(_) => {
+                busy.mark_incomplete();
+                return;
+            }
+        };
         if let Some(secs) = timestamp_field(&line) {
             if secs >= since && secs < until {
                 busy.insert(secs);
@@ -409,10 +480,23 @@ fn scan_prime(since: i64, until: i64, busy: &mut BusyMinutes) {
     scan_prime_roots(prime_session_roots(), since, until, busy);
 }
 
+/// Half-open like every other historical scan, so a step recorded exactly at
+/// `until` belongs to the next range rather than this one.
+///
+/// `json_valid` guards the extraction: one malformed `data` blob would
+/// otherwise abort the whole statement and, with it, the whole database.
 const OPENCODE_STEP_TIMES: &str = "\
     SELECT time_updated / 1000 FROM part \
-    WHERE time_updated BETWEEN ?1 AND ?2 \
-      AND json_extract(data,'$.type') = 'step-finish'";
+    WHERE time_updated >= ?1 AND time_updated < ?2 \
+      AND iif(json_valid(data), json_extract(data,'$.type'), NULL) = 'step-finish'";
+
+/// Wait briefly for a locked OpenCode store during a repair.
+///
+/// The polling path uses a zero timeout because a live agent holds the lock and
+/// the answer can wait for the next tick. Backfill has no next tick: giving up
+/// marks the range unmeasured and leaves the rows for another startup, so a
+/// short wait is the cheaper failure.
+const OPENCODE_HISTORY_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn scan_opencode(since: i64, until: i64, busy: &mut BusyMinutes) {
     scan_opencode_paths(
@@ -430,33 +514,72 @@ fn scan_opencode_paths(
     busy: &mut BusyMinutes,
 ) {
     for path in paths {
-        if !path.exists() {
-            continue;
+        // A store that was never created holds no history. Every other failure
+        // means history exists and was not read, which must not be reported as
+        // a measured absence of agent work.
+        match fs::metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                busy.mark_incomplete();
+                continue;
+            }
         }
         let Ok(conn) = rusqlite::Connection::open_with_flags(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ) else {
+            busy.mark_incomplete();
             continue;
         };
-        let _ = conn.busy_timeout(std::time::Duration::ZERO);
+        let _ = conn.busy_timeout(OPENCODE_HISTORY_BUSY_TIMEOUT);
         let Ok(mut stmt) = conn.prepare(OPENCODE_STEP_TIMES) else {
+            busy.mark_incomplete();
             continue;
         };
         let Ok(rows) = stmt.query_map([since * 1000, until * 1000], |row| row.get::<_, i64>(0))
         else {
+            busy.mark_incomplete();
             continue;
         };
-        for secs in rows.flatten() {
-            busy.insert(secs);
+        for secs in rows {
+            match secs {
+                Ok(secs) => busy.insert(secs),
+                Err(_) => busy.mark_incomplete(),
+            }
         }
     }
+}
+
+/// Drop paths another path in the same pass already covers.
+///
+/// Historical scanning is harness-agnostic — every line is bucketed by its own
+/// timestamp — so a directory nested inside another configured directory would
+/// only be read twice. Live detection deliberately keeps both signals, because
+/// a bounded walk of the root may truncate before reaching the nested one.
+fn without_covered_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort();
+    paths.dedup();
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if kept.iter().any(|covered| path.starts_with(covered)) {
+            continue;
+        }
+        kept.push(path);
+    }
+    kept
 }
 
 /// Reconstruct when agents were working between two Unix timestamps.
 ///
 /// Reads historical logs rather than current file timestamps, so it can
 /// backfill a period that has already passed.
+///
+/// Only OpenCode's store is queried as a database. The other `Signal::Database`
+/// entries index work whose record lives in the same harness's transcripts —
+/// Codex rollouts, Grok's unified log and session files, Gajae Code session
+/// JSONL — so those minutes are reconstructed from the logs rather than from a
+/// schema this crate would have to guess at.
 pub fn busy_minutes(since: i64, until: i64) -> BusyMinutes {
     let mut busy = BusyMinutes::default();
     if until <= since {
@@ -466,20 +589,28 @@ pub fn busy_minutes(since: i64, until: i64) -> BusyMinutes {
     scan_opencode(since, until, &mut busy);
     scan_prime(since, until, &mut busy);
 
+    let mut paths = Vec::new();
     for harness in Harness::ALL {
         if matches!(harness, Harness::OpenCode | Harness::PrimeAgent) {
             continue;
         }
         for signal in harness.signals() {
-            for path in detect::resolve(signal.path()) {
-                if path.is_dir() {
-                    for file in recent_files(&path, since) {
+            paths.extend(detect::resolve(signal.path()));
+        }
+    }
+
+    for path in without_covered_paths(paths) {
+        if path.is_dir() {
+            match recent_files(&path, since) {
+                Some(files) => {
+                    for file in files {
                         scan_log(&file, since, until, &mut busy);
                     }
-                } else if path.extension().is_some_and(|e| e == "jsonl") {
-                    scan_log(&path, since, until, &mut busy);
                 }
+                None => busy.mark_incomplete(),
             }
+        } else if path.extension().is_some_and(|e| e == "jsonl") {
+            scan_log(&path, since, until, &mut busy);
         }
     }
     busy
@@ -771,6 +902,140 @@ mod tests {
         assert_eq!(busy.len(), 2);
         assert!(busy.contains(1_767_225_600));
         assert!(busy.contains(1_767_225_720));
+    }
+
+    #[test]
+    fn opencode_history_excludes_a_step_at_the_exclusive_upper_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("boundary.db");
+        create_opencode(&db, 1_767_225_600);
+        let conn = rusqlite::Connection::open(&db).expect("open");
+        conn.execute(
+            r#"INSERT INTO part VALUES (?1, '{"type":"step-finish"}')"#,
+            [1_767_225_660_000_i64],
+        )
+        .expect("insert");
+        drop(conn);
+
+        let mut busy = BusyMinutes::default();
+        scan_opencode_paths([db], 1_767_225_500, 1_767_225_660, &mut busy);
+
+        assert!(busy.contains(1_767_225_600));
+        assert!(
+            !busy.contains(1_767_225_660),
+            "a step at the exclusive bound belongs to the next range"
+        );
+    }
+
+    #[test]
+    fn opencode_history_reads_valid_parts_beside_a_malformed_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("mixed.db");
+        create_opencode(&db, 1_767_225_600);
+        let conn = rusqlite::Connection::open(&db).expect("open");
+        conn.execute(
+            "INSERT INTO part VALUES (?1, 'not json at all')",
+            [1_767_225_660_000_i64],
+        )
+        .expect("insert");
+        drop(conn);
+
+        let mut busy = BusyMinutes::default();
+        scan_opencode_paths([db], 1_767_225_500, 1_767_225_800, &mut busy);
+
+        assert!(busy.contains(1_767_225_600));
+        assert!(busy.is_complete());
+    }
+
+    #[test]
+    fn opencode_history_scan_failure_is_incomplete() {
+        // A store that exists but cannot be read is unknown history. Reporting
+        // it complete makes backfill stamp the range as measured zero.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_database = dir.path().join("opencode.db");
+        fs::write(&not_a_database, "this is not a sqlite file").expect("fixture");
+        let mut busy = BusyMinutes::default();
+
+        scan_opencode_paths([not_a_database], 1_767_225_500, 1_767_225_800, &mut busy);
+
+        assert!(!busy.is_complete());
+    }
+
+    #[test]
+    fn opencode_history_missing_store_stays_complete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut busy = BusyMinutes::default();
+
+        scan_opencode_paths([dir.path().join("absent.db")], 0, i64::MAX, &mut busy);
+
+        assert!(busy.is_complete());
+        assert!(busy.is_empty());
+    }
+
+    #[test]
+    fn generic_history_budget_overflow_is_explicit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("one.jsonl"), "{}\n").expect("log");
+
+        assert!(
+            recent_files_with_limits(dir.path(), 0, 0, usize::MAX, u64::MAX).is_none(),
+            "an entry overflow must not look like a complete empty scan"
+        );
+        assert!(
+            recent_files_with_limits(dir.path(), 0, usize::MAX, 0, u64::MAX).is_none(),
+            "a file overflow must not look like a complete empty scan"
+        );
+        assert!(
+            recent_files_with_limits(dir.path(), 0, usize::MAX, usize::MAX, 0).is_none(),
+            "a byte overflow must not look like a complete empty scan"
+        );
+        assert_eq!(
+            recent_files_with_limits(dir.path(), 0, usize::MAX, usize::MAX, u64::MAX)
+                .expect("bounded tree")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn generic_history_traversal_errors_are_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_directory = dir.path().join("logs");
+        fs::write(&not_a_directory, "not a directory").expect("fixture");
+
+        assert!(recent_files(&not_a_directory, 0).is_none());
+        assert!(
+            recent_files(&dir.path().join("never-created"), 0).is_some(),
+            "a store no agent ever wrote is a complete empty scan"
+        );
+    }
+
+    #[test]
+    fn generic_log_read_errors_are_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("broken.jsonl");
+        fs::write(&log, [0xff, b'\n']).expect("fixture");
+        let mut busy = BusyMinutes::default();
+
+        scan_log(&log, 0, i64::MAX, &mut busy);
+
+        assert!(!busy.is_complete());
+    }
+
+    #[test]
+    fn a_nested_log_directory_is_not_scanned_twice() {
+        let root = PathBuf::from("/home/agent/.config/jfc/logs");
+        let nested = root.join("daemon/agents");
+        let sibling = PathBuf::from("/home/agent/.config/jfc/logs-archive");
+
+        let kept = without_covered_paths(vec![
+            nested.clone(),
+            root.clone(),
+            sibling.clone(),
+            root.clone(),
+        ]);
+
+        assert_eq!(kept, vec![root, sibling]);
     }
 
     #[test]

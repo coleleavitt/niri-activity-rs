@@ -19,6 +19,36 @@ fn trace_not_before_process(
     (trace_start_secs, i64::from(trace_start_nanos)) >= (process_birth_secs, process_birth_nanos)
 }
 
+/// Process state character from the contents of `/proc/<pid>/stat`.
+///
+/// The command name sits in parentheses and may itself contain spaces or
+/// parentheses, so the state is the first field after the *final* `)`.
+#[cfg(unix)]
+fn stat_state(stat: &str) -> Option<char> {
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    after_comm.split_whitespace().next()?.chars().next()
+}
+
+/// Whether a state character describes a process that can still do work.
+///
+/// `comm` stays readable while a dead process waits to be reaped, so a zombie
+/// answers every identity check exactly as the live process it used to be. An
+/// `agent.prompt` span that died unclosed would then read as open forever and
+/// credit agent time to a process that cannot write another byte.
+#[cfg(unix)]
+fn is_live_state(state: char) -> bool {
+    !matches!(state, 'Z' | 'X' | 'x')
+}
+
+/// Fail closed: a process whose state cannot be read is not evidence of work.
+#[cfg(unix)]
+fn pid_is_live(proc_dir: &std::path::Path) -> bool {
+    fs::read_to_string(proc_dir.join("stat"))
+        .ok()
+        .and_then(|stat| stat_state(&stat))
+        .is_some_and(is_live_state)
+}
+
 #[cfg(unix)]
 pub(crate) fn pid_matches_harness_since(
     pid: u64,
@@ -45,6 +75,9 @@ pub(crate) fn pid_matches_harness_since(
         metadata.ctime(),
         metadata.ctime_nsec(),
     ) {
+        return false;
+    }
+    if !pid_is_live(&path) {
         return false;
     }
     fs::read_to_string(path.join("comm")).is_ok_and(|comm| comm.trim() == harness.process_name())
@@ -92,6 +125,12 @@ pub fn running() -> Vec<Harness> {
         {
             continue;
         }
+        // A dead process waiting to be reaped keeps its name, and "running"
+        // must mean a process that can still act.
+        #[cfg(unix)]
+        if !pid_is_live(&entry.path()) {
+            continue;
+        }
         let Ok(comm) = fs::read_to_string(entry.path().join("comm")) else {
             continue;
         };
@@ -134,6 +173,100 @@ mod tests {
         ));
         assert!(trace_not_before_process(100, 500_000_000, 100, 500_000_000));
         assert!(trace_not_before_process(100, 600_000_000, 100, 500_000_000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_state_field_survives_a_command_name_with_punctuation() {
+        // /proc/<pid>/stat wraps comm in parentheses without escaping, so the
+        // state is the first field after the last one.
+        assert_eq!(stat_state("42 (prime-agent) S 1 42 42 0"), Some('S'));
+        assert_eq!(stat_state("42 (odd (name) x) Z 1 42 42 0"), Some('Z'));
+        assert_eq!(stat_state("not a stat line"), None);
+        assert!(is_live_state('S'));
+        assert!(is_live_state('R'));
+        assert!(!is_live_state('Z'));
+        assert!(!is_live_state('X'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_process_state_is_not_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!pid_is_live(dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_process_is_not_live() {
+        // An exited-but-unreaped agent keeps a readable comm, which used to be
+        // enough to hold an unclosed prompt span open forever.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn");
+        let proc_dir = std::path::PathBuf::from("/proc").join(child.id().to_string());
+
+        let mut state = None;
+        for _ in 0..200 {
+            state = fs::read_to_string(proc_dir.join("stat"))
+                .ok()
+                .and_then(|stat| stat_state(&stat));
+            if state == Some('Z') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(state, Some('Z'), "child never became a zombie");
+        assert!(
+            fs::read_to_string(proc_dir.join("comm")).is_ok(),
+            "a zombie still answers identity checks"
+        );
+        assert!(!pid_is_live(&proc_dir));
+
+        child.wait().expect("reap");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_does_not_keep_a_prompt_span_open() {
+        let Some(source) = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists())
+        else {
+            return;
+        };
+        // comm comes from the name the binary was executed under, so a symlink
+        // named after a harness reproduces the identity a dead agent leaves
+        // behind. A symlink rather than a copy: writing an executable while
+        // sibling tests fork can make the exec fail with ETXTBSY.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let impostor = dir.path().join(Harness::Jcode.process_name());
+        std::os::unix::fs::symlink(source, &impostor).expect("symlink");
+        let mut child = std::process::Command::new(&impostor)
+            .spawn()
+            .expect("spawn");
+        let pid = u64::from(child.id());
+        let proc_dir = std::path::PathBuf::from("/proc").join(pid.to_string());
+
+        for _ in 0..200 {
+            let state = fs::read_to_string(proc_dir.join("stat"))
+                .ok()
+                .and_then(|stat| stat_state(&stat));
+            if state == Some('Z') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // A span recorded after the process was born, by a PID whose comm still
+        // matches: every surviving check says "live agent" except its state.
+        let birth = proc_dir.metadata().expect("proc metadata").ctime();
+        let matched = pid_matches_harness_since(pid, Harness::Jcode, birth.saturating_add(1), 0);
+
+        child.wait().expect("reap");
+        assert!(!matched, "a dead agent cannot still be writing a prompt");
     }
 
     #[test]

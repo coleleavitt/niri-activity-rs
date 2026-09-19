@@ -33,11 +33,18 @@ impl TokenUsage {
     /// thousands of cached tokens per turn — so totalling everything would
     /// swamp the generation signal.
     pub fn generated(self) -> u64 {
-        self.output + self.reasoning
+        self.output.saturating_add(self.reasoning)
     }
 
+    /// Saturating like [`TokenUsage::generated`]: a provider count is whatever
+    /// a transcript happens to contain, and a corrupt one must skew a report
+    /// rather than panic the watcher that reads it.
     pub fn total(self) -> u64 {
-        self.input + self.output + self.reasoning + self.cache_read + self.cache_write
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.reasoning)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
     }
 
     fn saturating_add(self, other: Self) -> Self {
@@ -99,6 +106,9 @@ pub fn recent_usage_all(window_ms: i64) -> TokenUsage {
         .fold(TokenUsage::default(), TokenUsage::saturating_add)
 }
 
+/// `json_valid` gates every extraction: `json_extract` raises an error on a
+/// malformed blob, which aborts the aggregate and drops the whole database's
+/// usage rather than the one unreadable row.
 const OPENCODE_STEP_FINISH: &str = "\
     SELECT COALESCE(SUM(json_extract(data,'$.tokens.input')),0), \
            COALESCE(SUM(json_extract(data,'$.tokens.output')),0), \
@@ -107,6 +117,7 @@ const OPENCODE_STEP_FINISH: &str = "\
            COALESCE(SUM(json_extract(data,'$.tokens.cache.write')),0) \
     FROM part \
     WHERE time_updated > (strftime('%s','now') * 1000 - ?1) \
+      AND json_valid(data) \
       AND json_extract(data,'$.type') = 'step-finish'";
 
 fn opencode_usage(window_ms: i64) -> Option<TokenUsage> {
@@ -178,20 +189,64 @@ fn codex_usage(window_ms: i64) -> Option<TokenUsage> {
     found.then_some(total)
 }
 
+/// Bounds for one rollout discovery pass.
+///
+/// Token reads sit on the watcher's polling path, so this walk has to cost the
+/// same on a machine holding one week of Codex history and one holding three
+/// years. Running out of budget yields the rollouts found so far: a token count
+/// that is short under-reports generation, which reads as "no agent" rather
+/// than crediting work nobody did.
+const MAX_ROLLOUT_TREE_ENTRIES: usize = 20_000;
+const MAX_ROLLOUT_TREE_DEPTH: usize = 8;
+
 fn recent_files(dir: &Path, since: i64) -> Vec<(SystemTime, PathBuf)> {
+    recent_files_with_budget(dir, since, MAX_ROLLOUT_TREE_ENTRIES)
+}
+
+fn recent_files_with_budget(
+    dir: &Path,
+    since: i64,
+    mut remaining: usize,
+) -> Vec<(SystemTime, PathBuf)> {
     let mut files = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((current, depth)) = stack.pop() {
         let Ok(entries) = fs::read_dir(current) else {
             continue;
         };
+        // Codex buckets rollouts by date, so the newest subtree holds the turns
+        // a window this short can contain. Descend into it first, because the
+        // budget may not cover the whole tree.
+        let mut subdirs: Vec<(SystemTime, PathBuf)> = Vec::new();
         for entry in entries.flatten() {
+            if remaining == 0 {
+                stack.clear();
+                break;
+            }
+            remaining -= 1;
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
             if file_type.is_dir() {
-                stack.push(entry.path());
+                if depth >= MAX_ROLLOUT_TREE_DEPTH {
+                    continue;
+                }
+                let stamp = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                subdirs.push((stamp, entry.path()));
             } else if file_type.is_file() {
+                // Only rollout transcripts carry `token_count` events. The tree
+                // also holds state and index files, and opening those costs a
+                // tail read that can never contribute usage.
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_none_or(|extension| extension != "jsonl")
+                {
+                    continue;
+                }
                 let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
                     continue;
                 };
@@ -200,10 +255,14 @@ fn recent_files(dir: &Path, since: i64) -> Vec<(SystemTime, PathBuf)> {
                     .ok()
                     .and_then(|duration| i64::try_from(duration.as_secs()).ok());
                 if modified_secs.is_some_and(|seconds| seconds >= since) {
-                    files.push((modified, entry.path()));
+                    files.push((modified, path));
                 }
             }
         }
+        // The stack pops from the back, so the newest subtree must be pushed
+        // last.
+        subdirs.sort_by_key(|(stamp, _)| *stamp);
+        stack.extend(subdirs.into_iter().map(|(_, path)| (path, depth + 1)));
     }
     files
 }
@@ -211,10 +270,20 @@ fn recent_files(dir: &Path, since: i64) -> Vec<(SystemTime, PathBuf)> {
 fn read_tail(path: &Path, bytes: u64) -> Option<(String, bool)> {
     let mut file = fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
+    read_tail_of_len(&mut file, len, bytes)
+}
+
+/// Read the last `bytes` of the `len` bytes the file held when it was measured.
+///
+/// Codex appends while it works, so reading to EOF would follow the file past
+/// the observed snapshot and defeat the tail bound on exactly the rollout that
+/// matters most — the live one.
+fn read_tail_of_len(file: &mut fs::File, len: u64, bytes: u64) -> Option<(String, bool)> {
     let truncated = len > bytes;
-    file.seek(SeekFrom::Start(len.saturating_sub(bytes))).ok()?;
+    let start = len.saturating_sub(bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
+    file.take(len - start).read_to_end(&mut buf).ok()?;
     Some((String::from_utf8_lossy(&buf).into_owned(), truncated))
 }
 
@@ -389,6 +458,86 @@ mod tests {
         let usage = opencode_usage_paths([first, second], 60_000).expect("queried");
         assert_eq!(usage.input, 7);
         assert_eq!(usage.output, 10);
+    }
+
+    #[test]
+    fn opencode_reads_valid_parts_beside_a_malformed_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("mixed.db");
+        create_opencode(&db, 2, 3);
+        let conn = rusqlite::Connection::open(&db).expect("open");
+        conn.execute(
+            "INSERT INTO part VALUES (strftime('%s','now') * 1000, 'not json at all')",
+            [],
+        )
+        .expect("insert");
+        drop(conn);
+
+        let usage = opencode_usage_paths([db], 60_000).expect("one bad row must not hide the rest");
+
+        assert_eq!(usage.input, 2);
+        assert_eq!(usage.output, 3);
+    }
+
+    #[test]
+    fn extreme_counts_saturate_instead_of_overflowing() {
+        // Provider counts come from whatever a transcript contains, and
+        // `any_generating` calls `generated()` on every poll.
+        let usage = TokenUsage {
+            input: u64::MAX,
+            output: u64::MAX,
+            reasoning: u64::MAX,
+            cache_read: u64::MAX,
+            cache_write: u64::MAX,
+        };
+        assert_eq!(usage.generated(), u64::MAX);
+        assert_eq!(usage.total(), u64::MAX);
+    }
+
+    #[test]
+    fn a_tail_read_stops_at_the_observed_length() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rollout.jsonl");
+        fs::write(&path, "measured\n").expect("rollout");
+
+        let mut file = fs::File::open(&path).expect("open");
+        let len = file.metadata().expect("metadata").len();
+        // What a live Codex does between the stat and the read.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, b"appended\n"))
+            .expect("append");
+
+        let (tail, _) = read_tail_of_len(&mut file, len, ROLLOUT_TAIL_BYTES).expect("tail");
+
+        assert_eq!(tail, "measured\n");
+    }
+
+    #[test]
+    fn rollout_discovery_skips_files_that_cannot_hold_token_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("rollout-live.jsonl"), "{}\n").expect("rollout");
+        fs::write(dir.path().join("state.json"), "{}\n").expect("state");
+
+        let found = recent_files(dir.path(), 0);
+
+        assert_eq!(found.len(), 1);
+        assert!(
+            found[0].1.extension().is_some_and(|e| e == "jsonl"),
+            "only rollout transcripts are worth a tail read"
+        );
+    }
+
+    #[test]
+    fn rollout_discovery_stops_at_its_entry_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..8 {
+            fs::write(dir.path().join(format!("rollout-{index}.jsonl")), "{}\n").expect("rollout");
+        }
+
+        assert!(recent_files_with_budget(dir.path(), 0, 3).len() <= 3);
+        assert_eq!(recent_files_with_budget(dir.path(), 0, usize::MAX).len(), 8);
     }
 
     #[test]

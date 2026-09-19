@@ -65,8 +65,13 @@ fn written_within(path: &Path, window: Duration) -> bool {
 ///
 /// A file stamped in the future — a clock adjustment, or a copy from another
 /// machine — makes `elapsed` fail rather than return zero. Counting that as
-/// recent errs toward crediting real work instead of discarding it.
+/// recent errs toward crediting real work instead of discarding it, but an
+/// empty window asks about no time at all, so a future stamp must not make it
+/// the one window that matches everything.
 fn is_recent(stamp: SystemTime, window: Duration) -> bool {
+    if window.is_zero() {
+        return false;
+    }
     match stamp.elapsed() {
         Ok(age) => age <= window,
         Err(_) => true,
@@ -202,11 +207,27 @@ fn consider_dir_files(dir: &Path, consider: &mut impl FnMut(SystemTime)) {
 // and immediately previous generation so an open span survives rotation.
 const PRIME_TRACE_TAIL_BYTES: u64 = 32 * 1024 * 1024;
 
-fn bounded_tail_lines(path: &Path) -> Vec<String> {
-    bounded_tail_lines_with_limit(path, PRIME_TRACE_TAIL_BYTES)
+/// Substring present in every line [`prime_prompt_record`] can accept.
+///
+/// The shared trace is mostly daemon diagnostics while the watcher polls this
+/// path once a second. One substring scan per line rejects those without
+/// allocating a `String` or parsing JSON, which is the difference between
+/// touching the whole tail and touching the few prompt records in it.
+const PRIME_PROMPT_MARKER: &str = "\"agent.prompt\"";
+
+fn prime_prompt_lines(path: &Path) -> Vec<String> {
+    prime_prompt_lines_with_limit(path, PRIME_TRACE_TAIL_BYTES)
 }
 
-fn bounded_tail_lines_with_limit(path: &Path, max_bytes: u64) -> Vec<String> {
+fn prime_prompt_lines_with_limit(path: &Path, max_bytes: u64) -> Vec<String> {
+    bounded_tail_lines_with_limit(path, max_bytes, |line| line.contains(PRIME_PROMPT_MARKER))
+}
+
+fn bounded_tail_lines_with_limit(
+    path: &Path,
+    max_bytes: u64,
+    keep: impl Fn(&str) -> bool,
+) -> Vec<String> {
     let Ok(mut file) = fs::File::open(path) else {
         return Vec::new();
     };
@@ -214,24 +235,37 @@ fn bounded_tail_lines_with_limit(path: &Path, max_bytes: u64) -> Vec<String> {
         return Vec::new();
     };
     let start = len.saturating_sub(max_bytes);
-    if file.seek(SeekFrom::Start(start)).is_err() {
+    // Read one byte ahead of the boundary when there is one. That byte decides
+    // whether the boundary split a record or landed exactly on a record start;
+    // discarding the first line unconditionally drops a whole span_start or
+    // span_end whenever the tail happens to begin on a record.
+    let probe = u64::from(start > 0);
+    if file.seek(SeekFrom::Start(start - probe)).is_err() {
         return Vec::new();
     }
     // Read no farther than the size observed above. The daemon may keep
     // appending after `metadata()`, so `read_to_end` on the bare file can chase
     // a moving EOF and defeat the tail bound.
-    let read_len = len - start;
+    let read_len = len - start + probe;
     let mut bytes = Vec::new();
     if file.take(read_len).read_to_end(&mut bytes).is_err() {
         return Vec::new();
     }
-    let text = String::from_utf8_lossy(&bytes);
+    let mut body: &[u8] = &bytes;
+    let mut boundary_split_a_record = false;
+    if probe == 1 {
+        let Some((first, rest)) = body.split_first() else {
+            return Vec::new();
+        };
+        boundary_split_a_record = *first != b'\n';
+        body = rest;
+    }
+    let text = String::from_utf8_lossy(body);
     let mut lines = text.lines();
-    if start > 0 {
-        // The byte boundary may land in the middle of a JSON record.
+    if boundary_split_a_record {
         lines.next();
     }
-    lines.map(str::to_owned).collect()
+    lines.filter(|line| keep(line)).map(str::to_owned).collect()
 }
 
 fn prime_timestamp(value: &serde_json::Value) -> Option<(i64, u32)> {
@@ -281,8 +315,8 @@ fn prime_trace_has_open_prompt_with(
 ) -> bool {
     let mut previous = current.as_os_str().to_owned();
     previous.push(".old");
-    let mut lines = bounded_tail_lines(Path::new(&previous));
-    lines.extend(bounded_tail_lines(current));
+    let mut lines = prime_prompt_lines(Path::new(&previous));
+    lines.extend(prime_prompt_lines(current));
 
     let mut decided = HashSet::new();
     for line in lines.into_iter().rev() {
@@ -336,9 +370,9 @@ pub fn signal_active(signal: Signal, window: Duration) -> bool {
 fn prime_trace_last_activity(current: &Path) -> Option<SystemTime> {
     let mut previous = current.as_os_str().to_owned();
     previous.push(".old");
-    bounded_tail_lines(Path::new(&previous))
+    prime_prompt_lines(Path::new(&previous))
         .into_iter()
-        .chain(bounded_tail_lines(current))
+        .chain(prime_prompt_lines(current))
         .filter_map(|line| {
             let (_, seconds, nanos) = prime_prompt_record(&line)?;
             let seconds = u64::try_from(seconds).ok()?;
@@ -532,10 +566,54 @@ mod tests {
         let log = dir.path().join("agent.jsonl");
         fs::write(&log, "discarded\nfirst\nsecond\n").expect("trace");
 
-        let lines = bounded_tail_lines_with_limit(&log, 13);
+        let lines = bounded_tail_lines_with_limit(&log, 12, |_| true);
 
         assert_eq!(lines, ["second"]);
-        assert!(lines.iter().map(String::len).sum::<usize>() <= 13);
+        assert!(lines.iter().map(String::len).sum::<usize>() <= 12);
+    }
+
+    #[test]
+    fn prime_tail_keeps_a_record_that_begins_at_the_byte_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("agent.jsonl");
+        fs::write(&log, "discarded\nfirst\nsecond\n").expect("trace");
+
+        // "discarded\n" is exactly ten bytes, so a thirteen-byte tail starts on
+        // the first byte of a complete record. Skipping it would hide a
+        // span_start or span_end and flip Prime activity.
+        assert_eq!(
+            bounded_tail_lines_with_limit(&log, 13, |_| true),
+            ["first", "second"]
+        );
+    }
+
+    #[test]
+    fn prime_tail_skips_lines_without_a_prompt_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("agent.jsonl");
+        fs::write(
+            &log,
+            format!(
+                "{}\n{}\n",
+                r#"{"component":"trace","name":"kernel.cell","msg":"span_start"}"#,
+                prime_trace(1, "live", "open", "span_start")
+            ),
+        )
+        .expect("trace");
+
+        let lines = prime_prompt_lines_with_limit(&log, PRIME_TRACE_TAIL_BYTES);
+
+        assert_eq!(lines.len(), 1, "daemon diagnostics must not be parsed");
+        assert!(lines[0].contains(PRIME_PROMPT_MARKER));
+    }
+
+    #[test]
+    fn an_empty_window_cannot_be_matched_by_a_future_stamp() {
+        // A clock adjustment counts as recent so real work is not discarded,
+        // but an empty window asks about no time at all and must stay empty.
+        let future = SystemTime::now() + Duration::from_secs(3_600);
+        assert!(!is_recent(future, Duration::ZERO));
+        assert!(is_recent(future, Duration::from_secs(1)));
     }
 
     #[test]
