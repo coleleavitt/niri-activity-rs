@@ -42,8 +42,13 @@ fn millis(raw: Option<i64>) -> Duration {
 pub fn read_places(conn: &Connection) -> Result<Vec<Visit>> {
     let mut stmt = conn.prepare(PLACES)?;
     let rows = stmt.query_map([], |row| {
-        Ok(Visit {
-            url: sql::required_text(row, 0)?,
+        // `WHERE url IS NOT NULL` does not exclude an empty URL, and a page
+        // that points nowhere cannot be attributed to a site.
+        let Some(url) = sql::text(row, 0)? else {
+            return Ok(None);
+        };
+        Ok(Some(Visit {
+            url,
             title: sql::text(row, 1)?,
             visit_count: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
             last_visit: row.get::<_, Option<i64>>(3)?.and_then(time::unix_micros),
@@ -51,16 +56,16 @@ pub fn read_places(conn: &Connection) -> Result<Vec<Visit>> {
             site_name: sql::text(row, 5)?,
             frecency: row.get::<_, Option<i64>>(6)?,
             typed: row.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
-        })
+        }))
     })?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    Ok(sql::collect_present(rows)?)
 }
 
 pub fn read_visit_records(conn: &Connection) -> Result<Vec<VisitRecord>> {
     let mut stmt = conn.prepare(VISITS)?;
     let rows = stmt.query_map([], |row| {
         Ok((
-            sql::required_text(row, 0)?,
+            sql::text(row, 0)?,
             sql::text(row, 1)?,
             row.get::<_, Option<i64>>(2)?,
             row.get::<_, Option<i64>>(3)?.unwrap_or(0),
@@ -72,8 +77,9 @@ pub fn read_visit_records(conn: &Connection) -> Result<Vec<VisitRecord>> {
     for row in rows {
         let (url, title, date, kind, referrer) = row?;
         // A visit without a timestamp cannot be placed on a timeline, which is
-        // the entire point of this table.
-        let Some(visited_at) = date.and_then(time::unix_micros) else {
+        // the entire point of this table, and one without a URL cannot be
+        // placed on a site.
+        let (Some(url), Some(visited_at)) = (url, date.and_then(time::unix_micros)) else {
             continue;
         };
         out.push(VisitRecord {
@@ -91,8 +97,13 @@ pub fn read_visit_records(conn: &Connection) -> Result<Vec<VisitRecord>> {
 pub fn read_engagement(conn: &Connection) -> Result<Vec<Engagement>> {
     let mut stmt = conn.prepare(ENGAGEMENT)?;
     let rows = stmt.query_map([], |row| {
-        Ok(Engagement {
-            url: sql::required_text(row, 0)?,
+        // Measured attention has to belong to a page; an empty URL would pool
+        // unrelated counters under one meaningless domain.
+        let Some(url) = sql::text(row, 0)? else {
+            return Ok(None);
+        };
+        Ok(Some(Engagement {
+            url,
             title: sql::text(row, 1)?,
             view_time: millis(row.get(2)?),
             typing_time: millis(row.get(3)?),
@@ -105,22 +116,26 @@ pub fn read_engagement(conn: &Connection) -> Result<Vec<Engagement>> {
             // microseconds.
             created_at: row.get::<_, Option<i64>>(9)?.and_then(time::unix_millis),
             updated_at: row.get::<_, Option<i64>>(10)?.and_then(time::unix_millis),
-        })
+        }))
     })?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    Ok(sql::collect_present(rows)?)
 }
 
 pub fn read_bookmarks(conn: &Connection) -> Result<Vec<Bookmark>> {
     let mut stmt = conn.prepare(BOOKMARKS)?;
     let rows = stmt.query_map([], |row| {
-        Ok(Bookmark {
-            url: sql::required_text(row, 0)?,
+        // A bookmark with no URL cannot be opened and names no site.
+        let Some(url) = sql::text(row, 0)? else {
+            return Ok(None);
+        };
+        Ok(Some(Bookmark {
+            url,
             title: sql::text(row, 1)?,
             folder: sql::text(row, 2)?,
             added_at: row.get::<_, Option<i64>>(3)?.and_then(time::unix_micros),
-        })
+        }))
     })?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    Ok(sql::collect_present(rows)?)
 }
 
 #[cfg(test)]
@@ -159,6 +174,57 @@ mod tests {
         )
         .expect("seed");
         conn
+    }
+
+    /// Firefox's queries exclude `url IS NULL`, but `'' IS NOT NULL` is true in
+    /// SQLite, so an empty URL still reaches every reader in this file.
+    fn empty_url_rows() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT, title TEXT,
+                visit_count INTEGER, last_visit_date INTEGER, description TEXT,
+                site_name TEXT, frecency INTEGER, typed INTEGER);
+             INSERT INTO moz_places VALUES (1,'','Orphan',1,1767225600000000,NULL,NULL,NULL,0);
+
+             CREATE TABLE moz_historyvisits (id INTEGER PRIMARY KEY, from_visit INTEGER,
+                place_id INTEGER, visit_date INTEGER, visit_type INTEGER);
+             INSERT INTO moz_historyvisits VALUES (10,0,1,1767225600000000,1);
+
+             CREATE TABLE moz_places_metadata (id INTEGER PRIMARY KEY, place_id INTEGER,
+                referrer_place_id INTEGER, created_at INTEGER, updated_at INTEGER,
+                total_view_time INTEGER, typing_time INTEGER, key_presses INTEGER,
+                scrolling_time INTEGER, scrolling_distance INTEGER, document_type INTEGER);
+             INSERT INTO moz_places_metadata VALUES
+                (1,1,NULL,1767225600000,1767225700000,60000,0,0,0,0,0);
+
+             CREATE TABLE moz_bookmarks (id INTEGER PRIMARY KEY, type INTEGER, fk INTEGER,
+                parent INTEGER, title TEXT, dateAdded INTEGER);
+             INSERT INTO moz_bookmarks VALUES (1,1,1,NULL,'Bookmarked',1767225600000000);",
+        )
+        .expect("seed");
+        conn
+    }
+
+    #[test]
+    fn rows_with_an_empty_url_are_skipped_not_emptied() {
+        let conn = empty_url_rows();
+
+        assert!(
+            read_places(&conn).expect("read places").is_empty(),
+            "a page with no URL is not a page"
+        );
+        assert!(
+            read_visit_records(&conn).expect("read visits").is_empty(),
+            "a navigation to nowhere is not a visit"
+        );
+        assert!(
+            read_engagement(&conn).expect("read engagement").is_empty(),
+            "attention cannot be attributed to an empty URL"
+        );
+        assert!(
+            read_bookmarks(&conn).expect("read bookmarks").is_empty(),
+            "a bookmark with no URL points at nothing"
+        );
     }
 
     #[test]

@@ -22,9 +22,13 @@ impl Profile {
     }
 
     /// Path to a sibling file in the profile directory, if it exists.
+    ///
+    /// Only a regular file counts: a partially restored profile can leave a
+    /// directory where a file belongs, and reporting that as readable data
+    /// turns a recoverable profile into a hard read error.
     pub fn sibling(&self, filename: &str) -> Option<PathBuf> {
         let path = self.path.join(filename);
-        path.exists().then_some(path)
+        path.is_file().then_some(path)
     }
 }
 
@@ -237,12 +241,33 @@ pub struct SearchTerm {
     pub term: String,
     /// Search results URL the term produced.
     pub url: String,
+    /// When the search itself was last run, as recorded by the navigation that
+    /// carried it. `None` once that navigation has expired from history —
+    /// later visits to the result page are not searches and never fill this in.
     pub last_searched: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_directory_is_not_a_sibling_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("Bookmarks")).expect("mkdir");
+        let profile = Profile {
+            browser: Browser::Chrome,
+            name: "Default".to_owned(),
+            path: dir.path().to_path_buf(),
+            history_db: dir.path().join("History"),
+        };
+
+        assert_eq!(
+            profile.sibling("Bookmarks"),
+            None,
+            "a directory cannot be read as a bookmarks file"
+        );
+    }
 
     #[test]
     fn firefox_visit_types_map() {

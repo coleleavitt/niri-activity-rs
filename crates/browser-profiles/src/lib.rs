@@ -43,7 +43,7 @@ mod model;
 mod sql;
 mod time;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub use browser::{Browser, Family, is_browser_app_id, strip_window_suffix};
 pub use discover::{discover, discover_browser, discover_in, history_db_for};
@@ -91,12 +91,27 @@ pub fn read_search_terms(profile: &Profile) -> Result<Vec<SearchTerm>> {
 /// Read history from every discovered profile, skipping unreadable ones.
 ///
 /// A single locked or corrupt profile should not sink a whole-system scan, so
-/// failures are dropped rather than propagated.
+/// failures are dropped rather than propagated. Callers that rewrite stored
+/// history from this evidence want [`title_domains`] instead, because it also
+/// says how much evidence went missing.
 pub fn read_all_history() -> Result<Vec<(Profile, Vec<Visit>)>> {
-    Ok(discover()?
-        .into_iter()
-        .filter_map(|p| read_history(&p).ok().map(|v| (p, v)))
-        .collect())
+    Ok(collect_histories(discover()?, read_history).0)
+}
+
+/// Read every discovered profile, counting the ones that could not be read.
+fn collect_histories(
+    profiles: impl IntoIterator<Item = Profile>,
+    read: impl Fn(&Profile) -> Result<Vec<Visit>>,
+) -> (Vec<(Profile, Vec<Visit>)>, usize) {
+    let mut histories = Vec::new();
+    let mut unreadable = 0;
+    for profile in profiles {
+        match read(&profile) {
+            Ok(visits) => histories.push((profile, visits)),
+            Err(_) => unreadable += 1,
+        }
+    }
+    (histories, unreadable)
 }
 
 /// Build a page-title to domain lookup across every profile.
@@ -106,13 +121,67 @@ pub fn read_all_history() -> Result<Vec<(Profile, Vec<Visit>)>> {
 /// it resolves to the same domain. Ambiguous or unresolvable titles are omitted
 /// so profile discovery order cannot change classification.
 pub fn title_to_domain() -> Result<HashMap<String, String>> {
-    let histories = read_all_history()?;
-    Ok(title_domains_from_visits(
-        histories.into_iter().flat_map(|(_, visits)| visits),
-    ))
+    Ok(title_domains()?.into_titles())
 }
 
-fn title_domains_from_visits(visits: impl IntoIterator<Item = Visit>) -> HashMap<String, String> {
+/// Same evidence as [`title_to_domain`], plus what it could not resolve.
+///
+/// Rewriting already-stored history is only safe while the evidence behind it
+/// is whole. Use [`TitleDomains::is_complete`] and
+/// [`TitleDomains::unresolved`] to decide that; the plain map cannot express
+/// the difference between "this title has no domain" and "this title's domain
+/// is unknown to this scan".
+pub fn title_domains() -> Result<TitleDomains> {
+    let (histories, unreadable) = collect_histories(discover()?, read_history);
+    let visits = histories.into_iter().flat_map(|(_, visits)| visits);
+    Ok(title_domains_from_visits(visits).with_unreadable_profiles(unreadable))
+}
+
+/// Title-to-domain evidence together with the gaps in it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TitleDomains {
+    titles: HashMap<String, String>,
+    unresolved: HashSet<String>,
+    unreadable_profiles: usize,
+}
+
+impl TitleDomains {
+    /// Titles whose domain every observation agreed on.
+    pub fn titles(&self) -> &HashMap<String, String> {
+        &self.titles
+    }
+
+    pub fn into_titles(self) -> HashMap<String, String> {
+        self.titles
+    }
+
+    /// Titles seen in history whose domain stayed unknown, because different
+    /// pages share the title or because their URLs have no host.
+    ///
+    /// A stored row with one of these titles must not be reclassified from
+    /// lower-priority title or app rules: the domain rule that governs it may
+    /// exist and simply be unresolvable here.
+    pub fn unresolved(&self) -> &HashSet<String> {
+        &self.unresolved
+    }
+
+    /// Profiles that were discovered but could not be read at all.
+    pub fn unreadable_profiles(&self) -> usize {
+        self.unreadable_profiles
+    }
+
+    /// Whether every discovered profile contributed its history.
+    pub fn is_complete(&self) -> bool {
+        self.unreadable_profiles == 0
+    }
+
+    fn with_unreadable_profiles(mut self, count: usize) -> Self {
+        self.unreadable_profiles = count;
+        self
+    }
+}
+
+fn title_domains_from_visits(visits: impl IntoIterator<Item = Visit>) -> TitleDomains {
     let mut candidates: HashMap<String, Option<String>> = HashMap::new();
 
     for visit in visits {
@@ -130,10 +199,18 @@ fn title_domains_from_visits(visits: impl IntoIterator<Item = Visit>) -> HashMap
             .or_insert(domain);
     }
 
-    candidates
-        .into_iter()
-        .filter_map(|(title, domain)| domain.map(|domain| (title, domain)))
-        .collect()
+    let mut out = TitleDomains::default();
+    for (title, domain) in candidates {
+        match domain {
+            Some(domain) => {
+                out.titles.insert(title, domain);
+            }
+            None => {
+                out.unresolved.insert(title);
+            }
+        }
+    }
+    out
 }
 
 /// Lifetime engagement aggregates per domain across every profile that measures
@@ -230,7 +307,7 @@ mod tests {
         ];
 
         assert_eq!(
-            title_domains_from_visits(visits).get("Reference"),
+            title_domains_from_visits(visits).titles().get("Reference"),
             Some(&"docs.example.com".to_string())
         );
     }
@@ -243,7 +320,7 @@ mod tests {
         let forward = title_domains_from_visits([first.clone(), second.clone()]);
         let reverse = title_domains_from_visits([second, first]);
 
-        assert!(!forward.contains_key("Shared title"));
+        assert!(!forward.titles().contains_key("Shared title"));
         assert_eq!(forward, reverse);
     }
 
@@ -255,8 +332,61 @@ mod tests {
         let forward = title_domains_from_visits([resolved.clone(), unresolved.clone()]);
         let reverse = title_domains_from_visits([unresolved, resolved]);
 
-        assert!(!forward.contains_key("Shared title"));
+        assert!(!forward.titles().contains_key("Shared title"));
         assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn unresolved_titles_are_reported_rather_than_forgotten() {
+        let visits = [
+            titled_visit("https://one.example/page", Some("Shared title")),
+            titled_visit("https://two.example/page", Some("Shared title")),
+            titled_visit("about:blank", Some("Blank")),
+            titled_visit("https://docs.example.com/x", Some("Reference")),
+        ];
+
+        let domains = title_domains_from_visits(visits);
+
+        assert!(domains.unresolved().contains("Shared title"));
+        assert!(domains.unresolved().contains("Blank"));
+        assert!(!domains.unresolved().contains("Reference"));
+        assert!(domains.titles().contains_key("Reference"));
+    }
+
+    #[test]
+    fn an_unreadable_profile_leaves_the_evidence_incomplete() {
+        let readable = Profile {
+            browser: Browser::Zen,
+            name: "readable".to_owned(),
+            path: std::path::PathBuf::from("/tmp/readable"),
+            history_db: std::path::PathBuf::from("/tmp/readable/places.sqlite"),
+        };
+        let locked = Profile {
+            name: "locked".to_owned(),
+            ..readable.clone()
+        };
+
+        let (histories, unreadable) =
+            collect_histories([readable, locked], |profile| match profile.name.as_str() {
+                "locked" => Err(Error::NoHomeDir),
+                _ => Ok(vec![titled_visit(
+                    "https://docs.example.com/x",
+                    Some("Reference"),
+                )]),
+            });
+        let domains =
+            title_domains_from_visits(histories.into_iter().flat_map(|(_, visits)| visits))
+                .with_unreadable_profiles(unreadable);
+
+        assert_eq!(domains.unreadable_profiles(), 1);
+        assert!(
+            !domains.is_complete(),
+            "a profile that was never read cannot be treated as evidence of absence"
+        );
+        assert!(
+            domains.titles().contains_key("Reference"),
+            "the profiles that were read still classify live windows"
+        );
     }
 
     #[test]

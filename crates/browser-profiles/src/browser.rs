@@ -141,7 +141,7 @@ impl Browser {
                 ".librewolf",
                 ".var/app/io.gitlab.librewolf-community/.librewolf",
             ],
-            Browser::Waterfox => &[".waterfox"],
+            Browser::Waterfox => &[".waterfox", ".var/app/net.waterfox.waterfox/.waterfox"],
             Browser::TorBrowser => &[
                 ".local/share/torbrowser/tbb/x86_64/tor-browser/Browser/TorBrowser/Data/Browser",
                 ".tor-browser/app/Browser/TorBrowser/Data/Browser",
@@ -161,18 +161,40 @@ impl Browser {
             ],
             Browser::Brave => &[
                 ".config/BraveSoftware/Brave-Browser",
+                ".config/BraveSoftware/Brave-Browser-Beta",
+                ".config/BraveSoftware/Brave-Browser-Dev",
+                ".config/BraveSoftware/Brave-Browser-Nightly",
                 ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser",
             ],
             Browser::Edge => &[
                 ".config/microsoft-edge",
+                ".config/microsoft-edge-beta",
+                ".config/microsoft-edge-dev",
                 ".var/app/com.microsoft.Edge/config/microsoft-edge",
             ],
             Browser::Vivaldi => &[
                 ".config/vivaldi",
+                ".config/vivaldi-snapshot",
                 ".var/app/com.vivaldi.Vivaldi/config/vivaldi",
             ],
-            Browser::Opera => &[".config/opera", ".var/app/com.opera.Opera/config/opera"],
+            Browser::Opera => &[
+                ".config/opera",
+                ".config/opera-beta",
+                ".config/opera-developer",
+                ".var/app/com.opera.Opera/config/opera",
+            ],
         }
+    }
+
+    /// Whether a profile root may itself be a profile directory.
+    ///
+    /// Tor Browser and Camoufox ship the profile at the root, while every
+    /// other browser keeps profiles in child directories and, for the
+    /// Firefox family, lists them in `profiles.ini`. Probing those roots
+    /// directly would resurrect an abandoned database left beside the real
+    /// profiles and attribute its history to the browser.
+    pub fn root_is_profile(self) -> bool {
+        matches!(self, Browser::TorBrowser | Browser::Camoufox)
     }
 
     /// Branding a browser appends to the window title, one entry per release

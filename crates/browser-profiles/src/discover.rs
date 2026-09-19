@@ -104,8 +104,12 @@ fn profiles_under(browser: Browser, root: &Path) -> Vec<Profile> {
     let filename = browser.family().history_filename();
     let mut out = Vec::new();
 
-    // Tor Browser points its root directly at the profile directory.
-    push_if_profile(&mut out, browser, root, filename);
+    // Tor Browser and Camoufox point their root directly at the profile
+    // directory. For every other browser the root only contains profiles, so
+    // a database sitting there is a leftover copy, not an active profile.
+    if browser.root_is_profile() {
+        push_if_profile(&mut out, browser, root, filename);
+    }
 
     if let Some(registered) = registered_paths(root) {
         for path in registered {
@@ -293,6 +297,61 @@ mod tests {
         touch(&h.join(".config/chromium/Profile 1/History"));
 
         assert_eq!(discover_in(h).len(), 2);
+    }
+
+    #[test]
+    fn finds_non_stable_channels_and_flatpak_packaging() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let h = home.path();
+        touch(&h.join(".config/BraveSoftware/Brave-Browser-Beta/Default/History"));
+        touch(&h.join(".config/opera-developer/Default/History"));
+        touch(&h.join(".var/app/net.waterfox.waterfox/.waterfox/abc.default/places.sqlite"));
+
+        let found: Vec<_> = discover_in(h).into_iter().map(|p| p.browser).collect();
+
+        assert!(found.contains(&Browser::Brave), "brave beta: {found:?}");
+        assert!(
+            found.contains(&Browser::Opera),
+            "opera developer: {found:?}"
+        );
+        assert!(
+            found.contains(&Browser::Waterfox),
+            "waterfox flatpak: {found:?}"
+        );
+    }
+
+    #[test]
+    fn stale_database_in_a_container_root_is_not_a_profile() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let h = home.path();
+        touch(&h.join(".zen/hz8tcfb3.Default (release)/places.sqlite"));
+        // A profile database left in the container root by an old migration.
+        touch(&h.join(".zen/places.sqlite"));
+        std::fs::write(
+            h.join(".zen/profiles.ini"),
+            "[Profile0]\nPath=hz8tcfb3.Default (release)\nIsRelative=1\nDefault=1\n",
+        )
+        .expect("write ini");
+
+        let profiles = discover_in(h);
+        assert_eq!(
+            profiles.len(),
+            1,
+            "the registered profile is the only profile"
+        );
+        assert_eq!(profiles[0].name, "hz8tcfb3.Default (release)");
+    }
+
+    #[test]
+    fn stale_chromium_database_in_a_config_root_is_not_a_profile() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let h = home.path();
+        touch(&h.join(".config/chromium/Default/History"));
+        touch(&h.join(".config/chromium/History"));
+
+        let profiles = discover_in(h);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "Default");
     }
 
     #[test]

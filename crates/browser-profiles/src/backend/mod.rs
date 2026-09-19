@@ -18,36 +18,88 @@ fn open_read_only(db: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Sidecar files SQLite may need to recover a database, in copy order.
+const SIDECARS: [&str; 3] = ["-journal", "-wal", "-shm"];
+
+/// Append a suffix to a path, e.g. `history.sqlite` to `history.sqlite-wal`.
+fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut joined = path.as_os_str().to_os_string();
+    joined.push(suffix);
+    std::path::PathBuf::from(joined)
+}
+
+/// Size and modification time of a database and its sidecars, `None` per file
+/// that does not exist.
+///
+/// Two readings that differ mean the browser wrote to the database while it
+/// was being copied, so the copied files may come from different WAL
+/// generations and cannot be trusted as one snapshot.
+fn generation(db: &Path) -> Result<Vec<Option<(std::time::SystemTime, u64)>>> {
+    let mut out = Vec::with_capacity(SIDECARS.len() + 1);
+    for path in std::iter::once(db.to_path_buf()).chain(SIDECARS.map(|s| with_suffix(db, s))) {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => out.push(Some((meta.modified()?, meta.len()))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => out.push(None),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(out)
+}
+
+/// How many times a torn copy is retried before the read is abandoned.
+const SNAPSHOT_ATTEMPTS: usize = 3;
+
 /// Copy a database and its recovery files into a private, writable directory.
 ///
 /// The writable connection is important: SQLite may need to recover a hot
 /// rollback journal or WAL before the snapshot can be read. Sidecar copy
 /// failures are errors rather than permission to return a potentially stale or
 /// corrupt view of the database.
+///
+/// The copy is not atomic, so a checkpoint or WAL rotation running alongside it
+/// can leave the main file and its sidecars on different generations. Such a
+/// copy is discarded and retried, and a persistently changing database is
+/// reported as an error: reading history that never existed in that shape is
+/// worse than reporting nothing.
 fn snapshot(db: &Path) -> Result<(Connection, tempfile::TempDir)> {
-    let tmp = tempfile::tempdir()?;
-    let name = db.file_name().unwrap_or_else(|| "history.sqlite".as_ref());
-    let copy = tmp.path().join(name);
-    std::fs::copy(db, &copy)?;
+    snapshot_with(db, |src, dst| std::fs::copy(src, dst).map(|_| ()))
+}
 
-    for suffix in ["-journal", "-wal", "-shm"] {
-        let mut src = db.as_os_str().to_os_string();
-        src.push(suffix);
-        let src = std::path::PathBuf::from(src);
-        match std::fs::symlink_metadata(&src) {
-            Ok(_) => {
-                let mut dst = copy.as_os_str().to_os_string();
-                dst.push(suffix);
-                std::fs::copy(&src, std::path::PathBuf::from(dst))?;
+fn snapshot_with(
+    db: &Path,
+    copy_file: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(Connection, tempfile::TempDir)> {
+    let name = db.file_name().unwrap_or_else(|| "history.sqlite".as_ref());
+
+    for _ in 0..SNAPSHOT_ATTEMPTS {
+        let tmp = tempfile::tempdir()?;
+        let copy = tmp.path().join(name);
+        let before = generation(db)?;
+        copy_file(db, &copy)?;
+
+        for suffix in SIDECARS {
+            let src = with_suffix(db, suffix);
+            match std::fs::symlink_metadata(&src) {
+                Ok(_) => copy_file(&src, &with_suffix(&copy, suffix))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
         }
+
+        if generation(db)? != before {
+            continue;
+        }
+
+        let conn = Connection::open(&copy)?;
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        return Ok((conn, tmp));
     }
 
-    let conn = Connection::open(&copy)?;
-    conn.busy_timeout(std::time::Duration::ZERO)?;
-    Ok((conn, tmp))
+    Err(std::io::Error::other(format!(
+        "{} kept changing while it was copied; no consistent snapshot after          {SNAPSHOT_ATTEMPTS} attempts",
+        db.display()
+    ))
+    .into())
 }
 
 fn is_busy_or_locked(error: &crate::Error) -> bool {
@@ -258,6 +310,63 @@ mod tests {
             error,
             crate::Error::Database(rusqlite::Error::SqlInputError { .. })
         ));
+    }
+
+    #[test]
+    fn a_torn_copy_is_retried_until_the_database_holds_still() {
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("history.sqlite");
+        Connection::open(&db)
+            .expect("create")
+            .execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+            .expect("seed");
+        let wal = with_suffix(&db, "-wal");
+        std::fs::write(&wal, b"first generation").expect("wal");
+
+        let main_copies = Cell::new(0);
+        let (conn, _tmp) = snapshot_with(&db, |src, dst| {
+            std::fs::copy(src, dst)?;
+            if src == db {
+                main_copies.set(main_copies.get() + 1);
+                if main_copies.get() == 1 {
+                    // A checkpoint rotating the WAL between the two copies.
+                    std::fs::write(&wal, b"second generation, longer")?;
+                }
+            }
+            Ok(())
+        })
+        .expect("snapshot");
+
+        assert_eq!(main_copies.get(), 2, "the torn copy must be discarded");
+        let value: i64 = conn
+            .query_row("SELECT a FROM t", [], |row| row.get(0))
+            .expect("read snapshot");
+        assert_eq!(value, 1);
+    }
+
+    #[test]
+    fn a_database_that_never_holds_still_is_an_error_not_a_stale_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("history.sqlite");
+        Connection::open(&db).expect("create");
+        let wal = with_suffix(&db, "-wal");
+        std::fs::write(&wal, b"generation 0").expect("wal");
+
+        let generation = std::cell::Cell::new(0_usize);
+        let error = snapshot_with(&db, |src, dst| {
+            std::fs::copy(src, dst)?;
+            if src == db {
+                generation.set(generation.get() + 1);
+                std::fs::write(&wal, "x".repeat(generation.get()))?;
+            }
+            Ok(())
+        })
+        .expect_err("an endlessly changing database has no consistent snapshot");
+
+        assert_eq!(generation.get(), SNAPSHOT_ATTEMPTS);
+        assert!(matches!(error, crate::Error::Io(_)), "{error:?}");
     }
 
     #[cfg(unix)]

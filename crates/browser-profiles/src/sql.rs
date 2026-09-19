@@ -20,9 +20,20 @@ pub fn text(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<String>> {
     })
 }
 
-/// Like [`text`], but for a column that must be present.
-pub fn required_text(row: &Row<'_>, idx: usize) -> rusqlite::Result<String> {
-    Ok(text(row, idx)?.unwrap_or_default())
+/// Collect rows that survived per-row validation, preserving read errors.
+///
+/// A reader returns `None` for a row whose required columns are missing.
+/// Dropping such a row is deliberate: a record carrying an empty URL or path
+/// describes something that never happened, and it would otherwise travel into
+/// reports as if it had.
+pub fn collect_present<T>(
+    rows: impl Iterator<Item = rusqlite::Result<Option<T>>>,
+) -> rusqlite::Result<Vec<T>> {
+    let mut out = Vec::new();
+    for row in rows {
+        out.extend(row?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
