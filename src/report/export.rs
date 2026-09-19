@@ -1,5 +1,9 @@
 //! Export functions for CSV, JSON, and heatmap output.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
+
 use chrono::Timelike;
 use serde::Serialize;
 
@@ -10,12 +14,51 @@ use crate::config::{Category, Config};
 use crate::error::Error;
 use crate::fmt::fmt_hms;
 
+/// Render an export to the file `--output` named, or to stdout without one.
+///
+/// Every exporter used to print unconditionally, so `--output report.csv`
+/// wrote the report to the terminal, created no file and exited 0 — a
+/// success code for work that did not happen. Routing all of them through
+/// one sink makes the file the writer's concern instead of each exporter's,
+/// so no format can quietly lose the flag again.
+fn write_export(
+    output: Option<&Path>,
+    render: impl FnOnce(&mut dyn Write) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let mut sink: Box<dyn Write> = match output {
+        Some(path) => Box::new(BufWriter::new(File::create(path)?)),
+        None => Box::new(std::io::stdout().lock()),
+    };
+    let rendered = render(&mut sink);
+    // A buffered file reports a short or failed write only when it is
+    // flushed, and dropping the writer discards that error, which would
+    // report a truncated export as a success.
+    let flushed = rendered.and_then(|()| Ok(sink.flush()?));
+    match flushed {
+        // `export | head` closes the pipe once the reader has what it asked
+        // for. That is the reader finishing, not this command failing, so it
+        // must not become a non-zero exit like a real write error does.
+        Err(error) if is_broken_pipe(&error) && output.is_none() => Ok(()),
+        other => other,
+    }
+}
+
+/// Whether an export failed only because its reader stopped reading.
+fn is_broken_pipe(error: &Error) -> bool {
+    matches!(error, Error::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe)
+}
+
 /// Export activity data as CSV for a date range.
-pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
+pub fn export_csv_range(app: &App, range: TimeRange, output: Option<&Path>) -> Result<(), Error> {
+    write_export(output, |out| write_csv_range(app, range, out))
+}
+
+fn write_csv_range(app: &App, range: TimeRange, out: &mut dyn Write) -> Result<(), Error> {
     let bounds = range.resolve(&app.config)?;
-    println!(
+    writeln!(
+        out,
         "Date,Screen Time (h:mm:ss),Productive (h:mm:ss),Unproductive (h:mm:ss),Undefined (h:mm:ss),ProdActive (h:mm:ss),ProdPassive (h:mm:ss),Productive Ratio,Productive Active %"
-    );
+    )?;
     let mut date = bounds.start_date;
     let mut iterations = 0u32;
     while date <= bounds.end_date {
@@ -41,7 +84,8 @@ pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
         } else {
             "0.0%".to_string()
         };
-        println!(
+        writeln!(
+            out,
             "{},{},{},{},{},{},{},{},{}",
             date,
             fmt_hms(m.total_ms),
@@ -52,19 +96,21 @@ pub fn export_csv_range(app: &App, range: TimeRange) -> Result<(), Error> {
             fmt_hms(m.productive_passive_ms),
             prod_ratio,
             prod_active_pct
-        );
+        )?;
         date += chrono::Duration::days(1);
     }
     Ok(())
 }
 
 /// Export activity data as JSON for a date range.
-pub fn export_json_range(app: &App, range: TimeRange) -> Result<(), Error> {
-    let data = query_report_range(app, range)?;
-    let json = serde_json::to_string_pretty(&data)
-        .map_err(|e| Error::NiriError(format!("JSON serialization failed: {}", e)))?;
-    println!("{}", json);
-    Ok(())
+pub fn export_json_range(app: &App, range: TimeRange, output: Option<&Path>) -> Result<(), Error> {
+    write_export(output, |out| {
+        let data = query_report_range(app, range)?;
+        let json = serde_json::to_string_pretty(&data)
+            .map_err(|e| Error::NiriError(format!("JSON serialization failed: {}", e)))?;
+        writeln!(out, "{}", json)?;
+        Ok(())
+    })
 }
 
 #[derive(Serialize)]
@@ -79,7 +125,15 @@ struct HeatmapCell {
 }
 
 /// Export a cron-friendly summary of productivity metrics for a date range.
-pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
+pub fn export_cron_summary(
+    app: &App,
+    range: TimeRange,
+    output: Option<&Path>,
+) -> Result<(), Error> {
+    write_export(output, |out| write_cron_summary(app, range, out))
+}
+
+fn write_cron_summary(app: &App, range: TimeRange, out: &mut dyn Write) -> Result<(), Error> {
     let data = query_report_range(app, range)?;
     let productive_ms = data
         .categories
@@ -97,7 +151,8 @@ pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
         0
     };
     let top_app = data.top_apps.first().map_or("-", |a| a.app_id.as_str());
-    println!(
+    writeln!(
+        out,
         "{}|{}|{}|{}|{}%|{}",
         data.since_str
             .split_whitespace()
@@ -108,7 +163,7 @@ pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
         fmt_hms(unproductive_ms),
         ratio,
         top_app
-    );
+    )?;
     Ok(())
 }
 
@@ -143,7 +198,15 @@ fn accumulate_slice(cell: &mut HeatmapCell, config: &Config, slice: &EventInterv
 }
 
 /// Export hourly activity heatmap as JSON for a date range.
-pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
+pub fn export_heatmap_range(
+    app: &App,
+    range: TimeRange,
+    output: Option<&Path>,
+) -> Result<(), Error> {
+    write_export(output, |out| write_heatmap_range(app, range, out))
+}
+
+fn write_heatmap_range(app: &App, range: TimeRange, out: &mut dyn Write) -> Result<(), Error> {
     let bounds = range.resolve(&app.config)?;
     let until_utc = bounds.until_utc.as_deref().unwrap_or(UNTIL_SENTINEL);
     let mut heatmap: std::collections::BTreeMap<(String, u32), HeatmapCell> =
@@ -171,16 +234,116 @@ pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
     }
     let json = serde_json::to_string_pretty(&heatmap.into_values().collect::<Vec<_>>())
         .map_err(|e| Error::NiriError(format!("JSON serialization failed: {}", e)))?;
-    println!("{}", json);
+    writeln!(out, "{}", json)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HeatmapCell, accumulate_slice};
+    use std::path::Path;
+
+    use super::{
+        HeatmapCell, accumulate_slice, export_csv_range, export_heatmap_range, export_json_range,
+        write_export,
+    };
     use crate::config::{Category, Config};
+    use crate::db::{init_db, run_migrations};
     use crate::report::interval::EventInterval;
     use crate::report::interval::input::GranularInput;
+    use crate::report::{App, TimeRange};
+
+    /// One recorded day, in a fixed zone so the exported date never depends
+    /// on the machine running the test.
+    fn app_with_one_day() -> App {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("database");
+        init_db(&conn).expect("schema");
+        run_migrations(&mut conn, &Config::default()).expect("migrations");
+        conn.execute(
+            "INSERT INTO events (
+                 timestamp, app_id, title, category, active_ms, passive_ms, idle_ms
+             ) VALUES (
+                 '2026-01-02T10:00:00+00:00', 'foot', 'build',
+                 'productive', 60000, 0, 0
+             )",
+            [],
+        )
+        .expect("event");
+        let config = Config {
+            timezone: Some(chrono_tz::UTC),
+            ..Config::default()
+        };
+        App { config, conn }
+    }
+
+    fn one_day() -> TimeRange {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("valid date");
+        TimeRange::DateRange(day, day)
+    }
+
+    #[test]
+    fn a_csv_export_writes_the_file_output_names() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("report.csv");
+
+        export_csv_range(&app_with_one_day(), one_day(), Some(&path)).expect("csv export");
+
+        let written = std::fs::read_to_string(&path).expect("exported file");
+        assert!(written.starts_with("Date,Screen Time"), "{written}");
+        assert!(written.contains("2026-01-02"), "{written}");
+    }
+
+    #[test]
+    fn a_json_export_writes_the_file_output_names() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("report.json");
+
+        export_json_range(&app_with_one_day(), one_day(), Some(&path)).expect("json export");
+
+        let written = std::fs::read_to_string(&path).expect("exported file");
+        serde_json::from_str::<serde_json::Value>(&written).expect("valid JSON document");
+    }
+
+    #[test]
+    fn a_heatmap_export_writes_the_file_output_names() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("heatmap.json");
+
+        export_heatmap_range(&app_with_one_day(), one_day(), Some(&path)).expect("heatmap export");
+
+        let written = std::fs::read_to_string(&path).expect("exported file");
+        assert!(written.contains("\"2026-01-02\""), "{written}");
+    }
+
+    #[test]
+    fn an_unwritable_output_path_fails_instead_of_printing() {
+        let error = export_csv_range(
+            &app_with_one_day(),
+            one_day(),
+            Some(Path::new("/nonexistent-directory-for-tests/report.csv")),
+        )
+        .expect_err("a file that cannot be created must not report success");
+
+        assert!(matches!(error, crate::error::Error::Io(_)), "{error}");
+    }
+
+    #[test]
+    fn a_closed_reader_ends_a_stdout_export_without_an_error() {
+        // `export | head -2` closes the pipe as soon as the reader has what it
+        // asked for. A file write that fails this way is a real failure; a
+        // stdout write that fails this way is the reader leaving.
+        let broken = || {
+            Err(crate::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "reader closed the pipe",
+            )))
+        };
+
+        write_export(None, |_| broken()).expect("a closed stdout reader is not an export failure");
+
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        write_export(Some(file.path()), |_| broken())
+            .expect_err("a broken file write must still fail");
+    }
 
     fn cell() -> HeatmapCell {
         HeatmapCell {

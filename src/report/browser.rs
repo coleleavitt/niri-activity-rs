@@ -7,11 +7,12 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono::{DateTime, Local, Utc};
 use owo_colors::OwoColorize;
 
 use super::interval::load_human_intervals;
 use super::{App, TimeRange, UNTIL_SENTINEL};
+use crate::config::Config;
 use crate::error::Error;
 use crate::fmt::truncate;
 
@@ -169,24 +170,30 @@ pub fn show_referrers(limit: usize) {
     }
 }
 
-/// Label a browser timestamp with the calendar date a person would use.
+/// Label a browser timestamp with the calendar date the report would use.
 ///
 /// The browser records UTC instants. Formatting them as UTC puts late-evening
-/// activity on the next day for every zone east of UTC, so the displayed date
-/// must come from the viewer's zone. This view has no `App`, so it uses the
-/// machine zone rather than the report timezone override.
-fn calendar_date<Tz: TimeZone>(instant: Option<DateTime<Utc>>, zone: &Tz) -> String
-where
-    Tz::Offset: std::fmt::Display,
-{
+/// activity on the next day for every zone east of UTC, and formatting them
+/// in the machine zone disagrees with every other surface whenever `timezone`
+/// is configured. `EventInterval::local_start` resolves stored instants with
+/// exactly this rule, so a download and the focus event beside it cannot land
+/// on different days.
+fn calendar_date(instant: Option<DateTime<Utc>>, config: &Config) -> String {
     instant.map_or_else(
         || "—".to_string(),
-        |instant| instant.with_timezone(zone).format("%Y-%m-%d").to_string(),
+        |instant| {
+            let local = if let Some(timezone) = config.timezone {
+                instant.with_timezone(&timezone).fixed_offset()
+            } else {
+                instant.with_timezone(&Local).fixed_offset()
+            };
+            local.format("%Y-%m-%d").to_string()
+        },
     )
 }
 
 /// Show downloads and address-bar searches recorded by the browser.
-pub fn show_activity(limit: usize) {
+pub fn show_activity(config: &Config, limit: usize) {
     let profiles = match browser_profiles::discover() {
         Ok(profiles) => profiles,
         Err(error) => {
@@ -218,7 +225,7 @@ pub fn show_activity(limit: usize) {
             || d.target_path.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
-        let when = calendar_date(d.started_at, &Local);
+        let when = calendar_date(d.started_at, config);
         println!(
             "  {} {:<44} {}",
             when.dimmed(),
@@ -245,7 +252,7 @@ pub fn show_activity(limit: usize) {
         );
     }
     for s in searches.iter().take(limit) {
-        let when = calendar_date(s.last_searched, &Local);
+        let when = calendar_date(s.last_searched, config);
         println!("  {} {}", when.dimmed(), truncate(&s.term, 60));
     }
 }
@@ -253,7 +260,6 @@ pub fn show_activity(limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::db::{init_db, run_migrations};
 
     #[test]
@@ -330,14 +336,23 @@ mod tests {
     }
 
     #[test]
-    fn browser_timestamps_are_labelled_with_the_viewer_calendar_date() {
+    fn browser_timestamps_are_labelled_with_the_configured_report_timezone() {
         let instant = DateTime::parse_from_rfc3339("2026-01-01T23:30:00+00:00")
             .expect("valid instant")
             .with_timezone(&Utc);
-        let east = chrono::FixedOffset::east_opt(3 * 3_600).expect("valid offset");
+        let utc = Config {
+            timezone: Some(chrono_tz::UTC),
+            ..Config::default()
+        };
+        // Moscow is +03:00 all year, so the same instant is already the 2nd
+        // there whatever the machine zone says.
+        let moscow = Config {
+            timezone: Some(chrono_tz::Europe::Moscow),
+            ..Config::default()
+        };
 
-        assert_eq!(calendar_date(Some(instant), &Utc), "2026-01-01");
-        assert_eq!(calendar_date(Some(instant), &east), "2026-01-02");
-        assert_eq!(calendar_date(None, &Utc), "—");
+        assert_eq!(calendar_date(Some(instant), &utc), "2026-01-01");
+        assert_eq!(calendar_date(Some(instant), &moscow), "2026-01-02");
+        assert_eq!(calendar_date(None, &utc), "—");
     }
 }

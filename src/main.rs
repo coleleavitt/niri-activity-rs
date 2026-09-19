@@ -17,6 +17,8 @@ mod tracker;
 mod tui;
 mod watcher;
 
+use std::path::Path;
+
 use chrono::{Datelike, NaiveDate};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -103,22 +105,22 @@ enum ExportFormat {
     Cron,
 }
 
-/// Reject `--output` for the formats that only write to stdout.
+/// Workbook name used when `--output` names no file.
+const DEFAULT_XLSX_PATH: &str = "activity_report.xlsx";
+
+/// Resolve the file an export writes to; `None` means stdout.
 ///
-/// Those exporters take no path, so the flag used to be dropped: the command
-/// printed the report, created no file and exited 0, which reads as success.
-/// Failing is the only honest answer until every format writes files.
-fn check_output_support(format: &ExportFormat, output: Option<&str>) -> Result<(), Error> {
-    let Some(path) = output else {
-        return Ok(());
-    };
-    if matches!(format, ExportFormat::Xlsx) {
-        return Ok(());
+/// The text formats stream to stdout so they stay pipeable, and `--output`
+/// now redirects them to a file instead of being parsed and dropped. A
+/// workbook cannot stream, so xlsx keeps writing a file and keeps the name it
+/// has always defaulted to.
+fn export_destination(format: &ExportFormat, output: Option<String>) -> Option<String> {
+    match format {
+        ExportFormat::Xlsx => Some(output.unwrap_or_else(|| DEFAULT_XLSX_PATH.to_string())),
+        ExportFormat::Csv | ExportFormat::Json | ExportFormat::Heatmap | ExportFormat::Cron => {
+            output
+        }
     }
-    Err(Error::InvalidArgument(format!(
-        "--output {path} is only supported for --format xlsx; \
-         redirect stdout to write {format:?} output to a file"
-    )))
 }
 
 /// Longest reportable span. Every range walks its days one at a time.
@@ -448,9 +450,11 @@ fn main() {
                 report::show_referrers(limit);
                 Ok(())
             }
+            // The activity view needs no database, only the timezone that
+            // dates every other report surface, so it loads the config
+            // instead of opening the tracker database.
             BrowserView::Activity { limit } => {
-                report::show_activity(limit);
-                Ok(())
+                config::load_config().map(|config| report::show_activity(&config, limit))
             }
         },
         Some(Commands::Timeline { days, bucket }) => {
@@ -474,20 +478,27 @@ fn main() {
             time,
             format,
             output,
-        }) => parse_time_range(days, &time)
-            .and_then(|range| check_output_support(&format, output.as_deref()).map(|()| range))
-            .and_then(|range| {
-                report::App::open().and_then(|app| match format {
-                    ExportFormat::Xlsx => {
-                        let path = output.unwrap_or_else(|| "activity_report.xlsx".to_string());
-                        report::export_xlsx_range(&app, range, &path)
-                    }
-                    ExportFormat::Json => report::export_json_range(&app, range),
-                    ExportFormat::Heatmap => report::export_heatmap_range(&app, range),
-                    ExportFormat::Cron => report::export_cron_summary(&app, range),
-                    ExportFormat::Csv => report::export_csv_range(&app, range),
-                })
-            }),
+        }) => parse_time_range(days, &time).and_then(|range| {
+            report::App::open().and_then(|app| {
+                let destination = export_destination(&format, output);
+                let path = destination.as_deref().map(Path::new);
+                match format {
+                    ExportFormat::Xlsx => match destination.as_deref() {
+                        Some(path) => report::export_xlsx_range(&app, range, path),
+                        // `export_destination` always names a workbook for
+                        // xlsx, so no path means the two disagree. Writing a
+                        // file to a guessed name would hide that.
+                        None => Err(Error::InvalidArgument(
+                            "xlsx export resolved no output path".into(),
+                        )),
+                    },
+                    ExportFormat::Json => report::export_json_range(&app, range, path),
+                    ExportFormat::Heatmap => report::export_heatmap_range(&app, range, path),
+                    ExportFormat::Cron => report::export_cron_summary(&app, range, path),
+                    ExportFormat::Csv => report::export_csv_range(&app, range, path),
+                }
+            })
+        }),
         Some(Commands::Init) => config::init_config(),
         Some(Commands::BackfillAgent { days }) => (|| -> Result<(), Error> {
             let cfg = config::load_config()?;
@@ -793,19 +804,36 @@ mod tests {
     }
 
     #[test]
-    fn output_is_rejected_for_formats_that_only_write_to_stdout() {
+    fn every_export_format_writes_the_file_output_names() {
         for format in [
             ExportFormat::Csv,
             ExportFormat::Json,
             ExportFormat::Heatmap,
             ExportFormat::Cron,
         ] {
-            let error = check_output_support(&format, Some("report.out"))
-                .expect_err("stdout-only formats must not silently drop --output");
-            assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+            assert_eq!(
+                export_destination(&format, Some("report.out".to_string())).as_deref(),
+                Some("report.out"),
+                "--output must reach {format:?}"
+            );
+            assert_eq!(
+                export_destination(&format, None),
+                None,
+                "{format:?} must stay pipeable without --output"
+            );
         }
-        assert!(check_output_support(&ExportFormat::Xlsx, Some("book.xlsx")).is_ok());
-        assert!(check_output_support(&ExportFormat::Csv, None).is_ok());
+    }
+
+    #[test]
+    fn a_workbook_keeps_its_default_name_without_output() {
+        assert_eq!(
+            export_destination(&ExportFormat::Xlsx, None).as_deref(),
+            Some(DEFAULT_XLSX_PATH)
+        );
+        assert_eq!(
+            export_destination(&ExportFormat::Xlsx, Some("book.xlsx".to_string())).as_deref(),
+            Some("book.xlsx")
+        );
     }
 
     #[test]
