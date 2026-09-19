@@ -1,8 +1,10 @@
 # Local quality gates. Install with: lefthook install
 #
 # pre-commit stays relatively fast. pre-push mirrors the warning and test gates
-# from .github/workflows/ci.yml using the stable toolchain explicitly, so a
-# different local default toolchain cannot hide CI-only Clippy diagnostics.
+# from .github/workflows/ci.yml. Every command runs on the default toolchain —
+# this machine develops against `rustc-master`, and pinning a gate to a channel
+# that is not installed locally turns the hook into a rustup error instead of a
+# check. CI still runs the same gates on stable.
 pre-commit:
   commands:
     format:
@@ -15,8 +17,8 @@ pre-commit:
 pre-push:
   commands:
     clippy:
-      run: cargo +stable clippy --locked --workspace --all-targets --all-features -- -D warnings
-      fail_text: "Stable-toolchain Clippy failed."
+      run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      fail_text: "Clippy failed."
     test:
-      run: cargo +stable test --locked --workspace --all-targets --all-features
-      fail_text: "Stable-toolchain workspace tests failed."
+      run: cargo test --locked --workspace --all-targets --all-features
+      fail_text: "Workspace tests failed."
