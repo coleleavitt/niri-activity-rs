@@ -1,0 +1,31 @@
+TASK 1: Establish Baseline & Release Profile
+==============================================
+
+RELEASE BUILD RESULTS
+=====================
+
+Command: cargo build --release
+Date: 2026-04-02
+
+Build Status: ✓ SUCCESS
+
+Cargo.toml Changes Applied:
+- Added rust-version = "1.85" to [package] section
+- Added [profile.release] section with:
+  * opt-level = 3
+  * lto = "thin"
+  * codegen-units = 1
+  * strip = "symbols"
+
+Binary Information:
+- Path: target/release/niri-activity-rs
+- Size: 11M (11 MB)
+- Permissions: -rwxr-xr-x
+
+Build Warnings (non-blocking):
+- constant `MS_PER_HOUR` is never used
+- constant `MS_PER_MIN` is never used
+- constant `MS_PER_DAY` is never used
+
+VERIFICATION: ✓ cargo build --release passes
+VERIFICATION: ✓ Binary successfully created and stripped

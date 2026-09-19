@@ -1,0 +1,19 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "niri-activity-rs contributors"
+            }
+        ],
+        "Description": "Reports KWin window focus and metadata to niri-activity-rs over the session bus",
+        "EnabledByDefault": false,
+        "Icon": "preferences-system-windows-script-test",
+        "Id": "niri-activity-rs",
+        "License": "GPL-3.0-or-later",
+        "Name": "niri-activity-rs Window Activity Bridge",
+        "Version": "1.0.0",
+        "Website": "https://github.com/coleleavitt/niri-activity-rs"
+    },
+    "X-Plasma-API": "javascript"
+}

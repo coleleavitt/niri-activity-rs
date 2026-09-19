@@ -1,0 +1,49 @@
+# Task 3: Extract Magic Numbers to Named Constants
+
+## Summary
+Successfully extracted all hardcoded numeric literals to named constants across the codebase.
+
+## Files Modified
+1. src/report/mod.rs
+   - Added: MS_PER_HOUR (3_600_000), MS_PER_MIN (60_000), MS_PER_DAY (86_400_000), MIN_STREAK_MS (300_000)
+   - Replaced 14 occurrences of magic numbers
+
+2. src/fmt.rs
+   - Added: MS_PER_HOUR, MS_PER_MIN
+   - Replaced 3 occurrences of magic numbers
+
+3. src/tui.rs
+   - Added: MS_PER_HOUR, MS_PER_MIN
+   - Replaced 3 occurrences of magic numbers
+
+4. src/main.rs
+   - Added: MS_PER_HOUR, MS_PER_MIN
+   - Replaced 2 occurrences of magic numbers
+
+5. src/report/excel.rs
+   - Added: MS_PER_HOUR (u64), MS_PER_MIN (u64)
+   - Replaced 5 occurrences of magic numbers
+
+6. src/input.rs
+   - Added: SCROLL_NOTCH_THRESHOLD (15.0)
+   - Replaced 3 occurrences of magic numbers
+
+7. src/watcher.rs
+   - Added: FLUSH_INTERVAL_SECS (300), SUSPEND_DETECTION_THRESHOLD_SECS (30), HEARTBEAT_CHECK_INTERVAL_SECS (30)
+   - Replaced 2 occurrences of magic numbers
+
+## Constants Defined
+- MS_PER_HOUR: 3_600_000 (milliseconds per hour)
+- MS_PER_MIN: 60_000 (milliseconds per minute)
+- MS_PER_DAY: 86_400_000 (milliseconds per day)
+- MIN_STREAK_MS: 300_000 (5 minutes, minimum streak duration)
+- SCROLL_NOTCH_THRESHOLD: 15.0 (scroll notch threshold)
+- FLUSH_INTERVAL_SECS: 300 (5 minutes, flush interval)
+- SUSPEND_DETECTION_THRESHOLD_SECS: 30 (suspend detection threshold)
+- HEARTBEAT_CHECK_INTERVAL_SECS: 30 (heartbeat check interval)
+
+## Verification
+✓ cargo build: SUCCESS
+✓ cargo clippy: SUCCESS (13 warnings, all pre-existing)
+✓ cargo test: SUCCESS (11 tests passed)
+✓ Zero behavior change - pure renaming
