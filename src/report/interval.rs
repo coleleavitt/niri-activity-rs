@@ -6,11 +6,22 @@ use rusqlite::{Connection, params};
 use crate::config::{Category, Config};
 use crate::error::Error;
 
-mod input;
+// Visible to the rest of `report` so sibling modules can build intervals in
+// their own tests without duplicating the granular-counter type.
+pub(super) mod input;
 mod presence;
 use input::{GranularInput, proportional_between};
 
 const MS_PER_MINUTE: i64 = 60_000;
+
+/// Longest focus session the loader will accept from the database.
+///
+/// Every report surface expands an interval minute by minute, so a corrupt
+/// duration turns into an allocation proportional to that duration: one year
+/// is already 525,600 slices. A real session cannot outlive a year of wall
+/// clock, so a longer one is malformed evidence. Dropping it undercounts one
+/// row, while trusting it can exhaust memory during an open-ended report.
+const MAX_EVENT_SPAN_MS: i64 = 366 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone)]
 pub(super) struct EventInterval {
@@ -260,6 +271,18 @@ pub(super) fn load_overlapping(
             scroll_horizontal,
         ) = row?;
         let source_start_ms = parse_timestamp(&timestamp)?;
+        let span_ms = active_ms
+            .max(0)
+            .saturating_add(passive_ms.max(0))
+            .saturating_add(idle_ms.max(0));
+        if span_ms > MAX_EVENT_SPAN_MS {
+            tracing::warn!(
+                timestamp = %timestamp,
+                span_ms,
+                "skipping event with an impossible duration"
+            );
+            continue;
+        }
         let event = EventInterval {
             source_start_ms,
             start_ms: source_start_ms,
@@ -312,3 +335,40 @@ fn parse_timestamp(value: &str) -> Result<i64, Error> {
 
 #[cfg(test)]
 mod tests;
+
+/// Guards for durations that cannot come from a real focus session.
+#[cfg(test)]
+mod oversized_event_tests {
+    use super::{MAX_EVENT_SPAN_MS, load_overlapping};
+    use crate::config::Config;
+    use crate::db::{init_db, run_migrations};
+
+    #[test]
+    fn impossible_event_durations_are_skipped_instead_of_expanded() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("database");
+        init_db(&conn).expect("schema");
+        run_migrations(&mut conn, &Config::default()).expect("migrations");
+        conn.execute(
+            "INSERT INTO events (timestamp, app_id, title, category, active_ms, idle_ms)
+             VALUES ('2026-01-02T00:00:00+00:00', 'code', '', 'productive', 0, ?1)",
+            [MAX_EVENT_SPAN_MS + 1],
+        )
+        .expect("malformed event");
+        conn.execute(
+            "INSERT INTO events (timestamp, app_id, title, category, active_ms, idle_ms)
+             VALUES ('2026-01-02T01:00:00+00:00', 'code', '', 'productive', 60000, 0)",
+            [],
+        )
+        .expect("measured event");
+
+        let events = load_overlapping(
+            &conn,
+            "2026-01-02T00:00:00+00:00",
+            "2026-01-03T00:00:00+00:00",
+        )
+        .expect("load");
+
+        assert_eq!(events.len(), 1, "only the measured event survives");
+        assert_eq!(events[0].total_ms(), 60_000);
+    }
+}

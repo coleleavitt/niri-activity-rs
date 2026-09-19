@@ -24,6 +24,10 @@ use crate::config::{Category, Config};
 use crate::error::Error;
 use crate::fmt::fmt_hms;
 
+/// Largest span the exporter will expand into daily rows, matching the CSV
+/// exporter's limit so both refuse the same input.
+const MAX_EXPORT_DAYS: i64 = 10_000;
+
 // Time constants (milliseconds)
 const MS_PER_HOUR: u64 = 3_600_000;
 const MS_PER_MIN: u64 = 60_000;
@@ -45,6 +49,11 @@ fn fmt_delta_hms(delta_ms: i64) -> String {
     let h = abs / MS_PER_HOUR;
     let m = (abs % MS_PER_HOUR) / MS_PER_MIN;
     format!("{sign}{h}:{m:02}")
+}
+
+/// Days a range covers, counting both endpoints.
+fn requested_days(start: NaiveDate, end: NaiveDate) -> i64 {
+    (end - start).num_days().saturating_add(1)
 }
 
 fn workday_averages(daily: &[(NaiveDate, Metrics, bool)]) -> (i64, i64) {
@@ -208,6 +217,15 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
     let bounds: TimeBounds = range.resolve(&app.config)?;
     let since_local = bounds.start_date;
     let today_local = bounds.end_date;
+    // Refused up front, and with the same limit as the CSV exporter, because
+    // the daily loop below runs one query per day and writes one row per day:
+    // an unbounded `--from/--to` span would grind for hours before failing on
+    // the worksheet row limit.
+    if requested_days(since_local, today_local) > MAX_EXPORT_DAYS {
+        return Err(Error::InvalidArgument(
+            "date range exceeds 10,000 day limit".into(),
+        ));
+    }
 
     let mut workbook = Workbook::new();
 
@@ -655,10 +673,7 @@ pub fn export_xlsx_range(app: &App, range: TimeRange, path: &str) -> Result<(), 
         // ====================================================================
         // Feature 7: App Breakdown sheet
         // ====================================================================
-        let until_utc = bounds
-            .until_utc
-            .as_deref()
-            .unwrap_or("9999-12-31T23:59:59+00:00");
+        let until_utc = bounds.until_utc.as_deref().unwrap_or(super::UNTIL_SENTINEL);
 
         let top_apps = query_top_apps(&app.conn, &app.config, &bounds.since_utc, until_utc, 20)?;
 
@@ -744,6 +759,35 @@ mod tests {
             productive_ms,
             ..Metrics::default()
         }
+    }
+
+    #[test]
+    fn oversized_ranges_are_refused_before_a_query_per_day_runs() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("database");
+        crate::db::init_db(&conn).expect("schema");
+        crate::db::run_migrations(&mut conn, &crate::config::Config::default())
+            .expect("migrations");
+        let app = App {
+            config: crate::config::Config::default(),
+            conn,
+        };
+        let first = NaiveDate::from_ymd_opt(1, 1, 1).expect("valid date");
+        let last = NaiveDate::from_ymd_opt(9999, 12, 31).expect("valid date");
+
+        let result = export_xlsx_range(&app, TimeRange::DateRange(first, last), "/dev/null");
+
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn the_export_limit_counts_both_endpoints() {
+        let start = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
+
+        assert_eq!(requested_days(start, start), 1);
+        assert_eq!(
+            requested_days(start, start + chrono::Duration::days(MAX_EXPORT_DAYS - 1)),
+            MAX_EXPORT_DAYS
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use owo_colors::OwoColorize;
 
 use super::query::{query_metrics_range, query_report_range, query_timeline, query_today};
-use super::types::{FatigueTrend, FlowQuality, GapType, ReportData};
+use super::types::{FatigueTrend, FlowQuality, GapType, ReportData, TimelineBucket};
 use super::{App, MS_PER_HOUR, MS_PER_MIN, TimeRange};
 use crate::config::Category;
 use crate::error::Error;
@@ -91,6 +91,39 @@ pub fn show_metrics_range(app: &App, range: TimeRange) -> Result<(), Error> {
     Ok(())
 }
 
+/// Days the requested range covers, whether or not each one holds events.
+///
+/// A per-day average must divide by the days the user asked about. Dividing by
+/// the days that happen to carry events reports one busy day in a quiet week
+/// as a full week of that pace.
+fn requested_days(start: chrono::NaiveDate, end: chrono::NaiveDate) -> i64 {
+    (end - start).num_days().saturating_add(1).max(1)
+}
+
+/// Whether a report has anything to show.
+///
+/// `total_events` counts only the events that *began* inside the range, so a
+/// range covered entirely by one long event that started earlier has zero
+/// events and hours of measured time. Judging emptiness by the event count
+/// alone hides that whole range behind "No activity recorded".
+fn report_is_empty(total_ms: i64, total_events: i64) -> bool {
+    total_ms == 0 && total_events == 0
+}
+
+/// Whether a timeline bucket holds any measured time at all.
+///
+/// Idle counts. A bucket built only from idle minutes is exactly the run the
+/// `[AFK]` marker exists to show, so judging emptiness by the category
+/// durations alone would hide a whole idle day from the timeline.
+fn bucket_has_time(bucket: &TimelineBucket) -> bool {
+    bucket
+        .productive_ms
+        .saturating_add(bucket.neutral_ms)
+        .saturating_add(bucket.unproductive_ms)
+        .saturating_add(bucket.idle_ms)
+        != 0
+}
+
 /// Display hourly activity timeline for the past N days in terminal format.
 pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), Error> {
     let data = query_timeline(app, days_back, bucket_min)?;
@@ -113,7 +146,7 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
             .productive_ms
             .saturating_add(b.neutral_ms)
             .saturating_add(b.unproductive_ms);
-        if total == 0 {
+        if !bucket_has_time(b) {
             continue;
         }
         let total_with_idle = total.saturating_add(b.idle_ms);
@@ -161,6 +194,10 @@ pub fn show_timeline(app: &App, days_back: u32, bucket_min: u32) -> Result<(), E
 /// Generate and display a comprehensive report for a date range in terminal
 /// format.
 pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
+    // Resolved before the query so per-day averages can divide by the days the
+    // user asked for rather than by the days that happen to hold events.
+    let bounds = range.resolve(&app.config)?;
+    let calendar_days = requested_days(bounds.start_date, bounds.end_date);
     let data = query_report_range(app, range)?;
     println!(
         "{}",
@@ -189,7 +226,7 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             .cyan()
             .bold()
     );
-    if data.total_events == 0 {
+    if report_is_empty(data.total_ms, data.total_events) {
         println!("No activity recorded for this period.");
         return Ok(());
     }
@@ -243,9 +280,7 @@ pub fn generate_report_range(app: &App, range: TimeRange) -> Result<(), Error> {
             section_header("── Goals ─────────────────────────────────────────────")
         );
         if let Some(daily_goal) = app.config.goals.daily_ms() {
-            #[allow(clippy::cast_possible_wrap)]
-            let days = (data.daily.len() as i64).max(1);
-            let daily_avg = productive_ms.checked_div(days).unwrap_or(0);
+            let daily_avg = productive_ms.checked_div(calendar_days).unwrap_or(0);
             let daily_pct = if daily_goal > 0 {
                 (daily_avg as f64 / daily_goal as f64 * 100.0).min(999.0)
             } else {
@@ -950,4 +985,50 @@ pub fn show_comparison(app: &App, range: TimeRange) -> Result<(), Error> {
     );
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::NaiveDate;
+
+    use super::{bucket_has_time, report_is_empty, requested_days};
+    use crate::report::types::TimelineBucket;
+
+    fn bucket(productive_ms: i64, idle_ms: i64) -> TimelineBucket {
+        TimelineBucket {
+            hour: 3,
+            minute: 0,
+            productive_ms,
+            neutral_ms: 0,
+            unproductive_ms: 0,
+            idle_ms,
+            keystrokes: 0,
+            dominant_app: "foot".to_string(),
+        }
+    }
+
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
+    }
+
+    #[test]
+    fn idle_only_buckets_still_reach_the_afk_marker() {
+        assert!(bucket_has_time(&bucket(0, 900_000)));
+        assert!(bucket_has_time(&bucket(900_000, 0)));
+        assert!(!bucket_has_time(&bucket(0, 0)));
+    }
+
+    #[test]
+    fn a_range_covered_by_one_earlier_event_is_not_an_empty_report() {
+        assert!(report_is_empty(0, 0));
+        assert!(!report_is_empty(3_600_000, 0));
+        assert!(!report_is_empty(0, 4));
+    }
+
+    #[test]
+    fn daily_averages_divide_by_the_requested_days_not_the_active_ones() {
+        assert_eq!(requested_days(date(2026, 1, 3), date(2026, 1, 9)), 7);
+        assert_eq!(requested_days(date(2026, 1, 3), date(2026, 1, 3)), 1);
+        assert_eq!(requested_days(date(2026, 1, 9), date(2026, 1, 3)), 1);
+    }
 }

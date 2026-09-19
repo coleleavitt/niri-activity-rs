@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Local, TimeZone, Utc};
 use owo_colors::OwoColorize;
 
 use super::interval::load_human_intervals;
@@ -36,6 +37,12 @@ fn tracked_by_domain_between(
     let events = load_human_intervals(&app.conn, &app.config, since, until)?;
     let mut totals: HashMap<String, i64> = HashMap::new();
     for event in events {
+        // Only a browser window's title names a visited page. A non-browser
+        // window that happens to share a page title is not browsing that
+        // domain, and `Config::classify` already refuses the same inference.
+        if !browser_profiles::is_browser_app_id(&event.app_id) {
+            continue;
+        }
         let title = &event.title;
         let key = browser_profiles::strip_window_suffix(title);
         if let Some(domain) = app
@@ -95,9 +102,45 @@ pub fn show_engagement(limit: usize) -> Result<(), Error> {
     Ok(())
 }
 
+/// Split per-profile reads into the rows that succeeded and the ones that did
+/// not.
+///
+/// A profile that cannot be read is not a profile without records. Collapsing
+/// both into an empty list would present a failed read as a measurement.
+fn partition_reads<T, E: std::fmt::Display>(
+    reads: impl IntoIterator<Item = (String, Result<Vec<T>, E>)>,
+) -> (Vec<T>, Vec<String>) {
+    let mut rows = Vec::new();
+    let mut failures = Vec::new();
+    for (profile, result) in reads {
+        match result {
+            Ok(items) => rows.extend(items),
+            Err(error) => failures.push(format!("{profile}: {error}")),
+        }
+    }
+    (rows, failures)
+}
+
+/// Report unreadable profiles on stderr so an empty table is never mistaken
+/// for a browser that recorded nothing.
+fn warn_failures(kind: &str, failures: &[String]) {
+    for failure in failures {
+        eprintln!("{}", format!("Failed to read {kind} from {failure}").red());
+    }
+}
+
 /// Show which sites lead to which, revealing how a destination is reached.
 pub fn show_referrers(limit: usize) {
-    let edges = browser_profiles::referrer_edges().unwrap_or_default();
+    let edges = match browser_profiles::referrer_edges() {
+        Ok(edges) => edges,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                format!("Failed to read browser history: {error}").red()
+            );
+            return;
+        }
+    };
     if edges.is_empty() {
         println!("{}", "No referrer data in browser history.".yellow());
         return;
@@ -126,15 +169,41 @@ pub fn show_referrers(limit: usize) {
     }
 }
 
+/// Label a browser timestamp with the calendar date a person would use.
+///
+/// The browser records UTC instants. Formatting them as UTC puts late-evening
+/// activity on the next day for every zone east of UTC, so the displayed date
+/// must come from the viewer's zone. This view has no `App`, so it uses the
+/// machine zone rather than the report timezone override.
+fn calendar_date<Tz: TimeZone>(instant: Option<DateTime<Utc>>, zone: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    instant.map_or_else(
+        || "—".to_string(),
+        |instant| instant.with_timezone(zone).format("%Y-%m-%d").to_string(),
+    )
+}
+
 /// Show downloads and address-bar searches recorded by the browser.
 pub fn show_activity(limit: usize) {
-    let profiles = browser_profiles::discover().unwrap_or_default();
+    let profiles = match browser_profiles::discover() {
+        Ok(profiles) => profiles,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                format!("Failed to discover browser profiles: {error}").red()
+            );
+            return;
+        }
+    };
 
-    let mut downloads: Vec<browser_profiles::Download> = profiles
-        .iter()
-        .filter_map(|p| browser_profiles::read_downloads(p).ok())
-        .flatten()
-        .collect();
+    let (mut downloads, failures) = partition_reads(
+        profiles
+            .iter()
+            .map(|p| (p.name.clone(), browser_profiles::read_downloads(p))),
+    );
+    warn_failures("downloads", &failures);
     downloads.sort_by_key(|d| std::cmp::Reverse(d.started_at));
 
     println!("{}\n", "Recent downloads".cyan().bold());
@@ -149,9 +218,7 @@ pub fn show_activity(limit: usize) {
             || d.target_path.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
-        let when = d
-            .started_at
-            .map_or_else(|| "—".to_string(), |t| t.format("%Y-%m-%d").to_string());
+        let when = calendar_date(d.started_at, &Local);
         println!(
             "  {} {:<44} {}",
             when.dimmed(),
@@ -162,11 +229,12 @@ pub fn show_activity(limit: usize) {
         );
     }
 
-    let mut searches: Vec<browser_profiles::SearchTerm> = profiles
-        .iter()
-        .filter_map(|p| browser_profiles::read_search_terms(p).ok())
-        .flatten()
-        .collect();
+    let (mut searches, failures) = partition_reads(
+        profiles
+            .iter()
+            .map(|p| (p.name.clone(), browser_profiles::read_search_terms(p))),
+    );
+    warn_failures("address-bar searches", &failures);
     searches.sort_by_key(|s| std::cmp::Reverse(s.last_searched));
 
     println!("\n{}\n", "Recent address-bar searches".cyan().bold());
@@ -177,9 +245,7 @@ pub fn show_activity(limit: usize) {
         );
     }
     for s in searches.iter().take(limit) {
-        let when = s
-            .last_searched
-            .map_or_else(|| "—".to_string(), |t| t.format("%Y-%m-%d").to_string());
+        let when = calendar_date(s.last_searched, &Local);
         println!("  {} {}", when.dimmed(), truncate(&s.term, 60));
     }
 }
@@ -219,5 +285,59 @@ mod tests {
         .expect("tracked totals");
 
         assert_eq!(totals.get("example.com"), Some(&60_000));
+    }
+
+    #[test]
+    fn non_browser_window_sharing_a_page_title_is_not_browser_focus() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("database");
+        init_db(&conn).expect("schema");
+        run_migrations(&mut conn, &Config::default()).expect("migrations");
+        conn.execute(
+            "INSERT INTO events (
+                 timestamp, app_id, title, category, active_ms, passive_ms, idle_ms
+             ) VALUES (
+                 '2026-01-02T10:00:00+00:00', 'foot', 'Example',
+                 'neutral', 60000, 0, 0
+             )",
+            [],
+        )
+        .expect("event");
+        let mut config = Config::default();
+        config
+            .title_domains
+            .insert("Example".to_string(), "example.com".to_string());
+        let app = App { config, conn };
+
+        let totals = tracked_by_domain_between(
+            &app,
+            "2026-01-02T00:00:00+00:00",
+            "2026-01-03T00:00:00+00:00",
+        )
+        .expect("tracked totals");
+
+        assert_eq!(totals.get("example.com"), None);
+    }
+
+    #[test]
+    fn unreadable_profiles_are_reported_instead_of_counted_as_empty() {
+        let (rows, failures) = partition_reads([
+            ("good".to_string(), Ok::<Vec<u8>, String>(vec![1, 2])),
+            ("locked".to_string(), Err("database is locked".to_string())),
+        ]);
+
+        assert_eq!(rows, vec![1, 2]);
+        assert_eq!(failures, vec!["locked: database is locked".to_string()]);
+    }
+
+    #[test]
+    fn browser_timestamps_are_labelled_with_the_viewer_calendar_date() {
+        let instant = DateTime::parse_from_rfc3339("2026-01-01T23:30:00+00:00")
+            .expect("valid instant")
+            .with_timezone(&Utc);
+        let east = chrono::FixedOffset::east_opt(3 * 3_600).expect("valid offset");
+
+        assert_eq!(calendar_date(Some(instant), &Utc), "2026-01-01");
+        assert_eq!(calendar_date(Some(instant), &east), "2026-01-02");
+        assert_eq!(calendar_date(None, &Utc), "—");
     }
 }

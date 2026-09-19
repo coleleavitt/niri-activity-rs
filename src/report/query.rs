@@ -116,7 +116,12 @@ pub(crate) fn metrics_between(
 /// Clamped to the category's own total: `agent_ms` is measured against a
 /// session's full span while these figures exclude idle, so an unclamped
 /// credit could exceed the time it is drawn from and push a bucket negative.
-fn agent_credit(config: &Config, category: Category, agent_ms: i64, total_ms: i64) -> i64 {
+pub(super) fn agent_credit(
+    config: &Config,
+    category: Category,
+    agent_ms: i64,
+    total_ms: i64,
+) -> i64 {
     if category == Category::Productive || !config.agent_activity.counts_as_productive {
         return 0;
     }

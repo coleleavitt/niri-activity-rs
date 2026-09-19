@@ -3,10 +3,10 @@
 use chrono::Timelike;
 use serde::Serialize;
 
-use super::interval::load_human_intervals;
+use super::interval::{EventInterval, load_human_intervals};
 use super::query::query_report_range;
 use super::{App, TimeRange, UNTIL_SENTINEL, day_end_utc, day_start_utc};
-use crate::config::Category;
+use crate::config::{Category, Config};
 use crate::error::Error;
 use crate::fmt::fmt_hms;
 
@@ -112,6 +112,36 @@ pub fn export_cron_summary(app: &App, range: TimeRange) -> Result<(), Error> {
     Ok(())
 }
 
+/// Add one minute slice to the heatmap cell that contains it.
+///
+/// The duration is idle-inclusive because every other report surface counts a
+/// category's idle time inside that category; excluding it here would make the
+/// heatmap shrink during exactly the stretches it is meant to expose.
+fn accumulate_slice(cell: &mut HeatmapCell, config: &Config, slice: &EventInterval) {
+    let total_ms = slice.total_ms();
+    let credited = super::query::agent_credit(
+        config,
+        slice.category,
+        slice.agent_ms.unwrap_or(0),
+        total_ms,
+    );
+    let own_ms = total_ms.saturating_sub(credited);
+    match slice.category {
+        Category::Productive => {
+            cell.productive_ms = cell.productive_ms.saturating_add(own_ms);
+        }
+        Category::Unproductive => {
+            cell.unproductive_ms = cell.unproductive_ms.saturating_add(own_ms);
+        }
+        Category::Neutral => {
+            cell.neutral_ms = cell.neutral_ms.saturating_add(own_ms);
+        }
+    }
+    cell.productive_ms = cell.productive_ms.saturating_add(credited);
+    cell.total_ms = cell.total_ms.saturating_add(total_ms);
+    cell.keystrokes = cell.keystrokes.saturating_add(slice.keystrokes);
+}
+
 /// Export hourly activity heatmap as JSON for a date range.
 pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
     let bounds = range.resolve(&app.config)?;
@@ -125,7 +155,6 @@ pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
             };
             let date = timestamp.format("%Y-%m-%d").to_string();
             let hour = timestamp.hour();
-            let total_ms = slice.active_ms.saturating_add(slice.passive_ms);
             let cell = heatmap
                 .entry((date.clone(), hour))
                 .or_insert_with(|| HeatmapCell {
@@ -137,23 +166,99 @@ pub fn export_heatmap_range(app: &App, range: TimeRange) -> Result<(), Error> {
                     total_ms: 0,
                     keystrokes: 0,
                 });
-            match slice.category {
-                Category::Productive => {
-                    cell.productive_ms = cell.productive_ms.saturating_add(total_ms);
-                }
-                Category::Unproductive => {
-                    cell.unproductive_ms = cell.unproductive_ms.saturating_add(total_ms);
-                }
-                Category::Neutral => {
-                    cell.neutral_ms = cell.neutral_ms.saturating_add(total_ms);
-                }
-            }
-            cell.total_ms = cell.total_ms.saturating_add(total_ms);
-            cell.keystrokes = cell.keystrokes.saturating_add(slice.keystrokes);
+            accumulate_slice(cell, &app.config, &slice);
         }
     }
     let json = serde_json::to_string_pretty(&heatmap.into_values().collect::<Vec<_>>())
         .map_err(|e| Error::NiriError(format!("JSON serialization failed: {}", e)))?;
     println!("{}", json);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HeatmapCell, accumulate_slice};
+    use crate::config::{Category, Config};
+    use crate::report::interval::EventInterval;
+    use crate::report::interval::input::GranularInput;
+
+    fn cell() -> HeatmapCell {
+        HeatmapCell {
+            date: "2026-01-02".to_string(),
+            hour: 9,
+            productive_ms: 0,
+            unproductive_ms: 0,
+            neutral_ms: 0,
+            total_ms: 0,
+            keystrokes: 0,
+        }
+    }
+
+    fn slice(category: Category, active_ms: i64, idle_ms: i64, agent_ms: i64) -> EventInterval {
+        EventInterval {
+            source_start_ms: 0,
+            start_ms: 0,
+            app_id: "foot".to_string(),
+            title: String::new(),
+            category,
+            project: None,
+            active_ms,
+            passive_ms: 0,
+            idle_ms,
+            agent_ms: Some(agent_ms),
+            keystrokes: 0,
+            mouse_clicks: 0,
+            scroll_events: 0,
+            mouse_distance: 0,
+            granular: GranularInput::default(),
+            jiggler_detected: false,
+        }
+    }
+
+    #[test]
+    fn heatmap_cells_keep_the_idle_time_the_report_counts() {
+        let mut cell = cell();
+
+        accumulate_slice(
+            &mut cell,
+            &Config::default(),
+            &slice(Category::Productive, 0, 60_000, 0),
+        );
+
+        assert_eq!(cell.total_ms, 60_000);
+        assert_eq!(cell.productive_ms, 60_000);
+    }
+
+    #[test]
+    fn agent_overlapped_time_is_credited_to_productive_like_the_report() {
+        let mut config = Config::default();
+        config.agent_activity.counts_as_productive = true;
+        let mut cell = cell();
+
+        accumulate_slice(
+            &mut cell,
+            &config,
+            &slice(Category::Neutral, 60_000, 0, 20_000),
+        );
+
+        assert_eq!(cell.neutral_ms, 40_000);
+        assert_eq!(cell.productive_ms, 20_000);
+        assert_eq!(cell.total_ms, 60_000);
+    }
+
+    #[test]
+    fn agent_time_stays_with_its_category_when_credit_is_disabled() {
+        let mut config = Config::default();
+        config.agent_activity.counts_as_productive = false;
+        let mut cell = cell();
+
+        accumulate_slice(
+            &mut cell,
+            &config,
+            &slice(Category::Neutral, 60_000, 0, 20_000),
+        );
+
+        assert_eq!(cell.neutral_ms, 60_000);
+        assert_eq!(cell.productive_ms, 0);
+    }
 }

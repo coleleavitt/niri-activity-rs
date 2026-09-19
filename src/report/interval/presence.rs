@@ -90,6 +90,11 @@ pub(super) fn apply(
                 if offsets.is_empty() && (keys > 0.0 || clicks > 0.0 || scrolls > 0.0) {
                     unknown.push(row_start..row_end);
                 } else {
+                    // Jiggler detection is a device-wide heuristic sampled at
+                    // flush time, not per-offset provenance, so a flagged row
+                    // can still hold a person's real typing. The report
+                    // surfaces the flagged-event count instead, because
+                    // deleting measured input on a guess rewrites history.
                     points.extend(offsets.into_iter().map(|offset| {
                         let offset = i64::from(offset).min(duration.saturating_sub(1));
                         row_start.saturating_add(offset.max(0))
