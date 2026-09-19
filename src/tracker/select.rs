@@ -605,9 +605,14 @@ impl fmt::Debug for SelectedBackend {
     }
 }
 
+/// Why no window tracker could be selected, with the evidence behind it.
+///
+/// The report is boxed because it carries every candidate's probe result: the
+/// diagnostic is worth keeping, but it must not widen the `Result` that every
+/// successful selection also travels through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectionError {
-    pub report: DetectionReport,
+    pub report: Box<DetectionReport>,
 }
 
 impl fmt::Display for DetectionError {
@@ -755,7 +760,9 @@ pub fn select_backend(
         }
     }
 
-    Err(DetectionError { report })
+    Err(DetectionError {
+        report: Box::new(report),
+    })
 }
 
 #[cfg(test)]
