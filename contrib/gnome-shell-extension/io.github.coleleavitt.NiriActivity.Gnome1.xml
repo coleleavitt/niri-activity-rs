@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<node>
+  <interface name="io.github.coleleavitt.NiriActivity.Gnome1">
+    <property name="ProtocolVersion" type="u" access="read"/>
+    <method name="GetActiveWindow">
+      <arg name="generation" type="t" direction="out"/>
+      <arg name="window" type="a{sv}" direction="out"/>
+    </method>
+    <signal name="ActiveWindowChanged">
+      <arg name="generation" type="t"/>
+      <arg name="window" type="a{sv}"/>
+    </signal>
+  </interface>
+</node>

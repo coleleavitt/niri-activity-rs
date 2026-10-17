@@ -1,0 +1,7 @@
+{
+  "uuid": "niri-activity@coleleavitt.github.io",
+  "name": "niri-activity window bridge",
+  "description": "Read-only active-window bridge for niri-activity-rs",
+  "shell-version": ["45"],
+  "version": 1
+}

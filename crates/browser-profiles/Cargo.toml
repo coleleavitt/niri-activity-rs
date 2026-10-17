@@ -1,0 +1,22 @@
+[package]
+name = "browser-profiles"
+description = "Discover browser profiles and read their history across Firefox- and Chromium-family browsers"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+chrono = "0.4.44"
+thiserror = "2"
+dirs = "6.0.0"
+tempfile = "3.27.0"
+serde_json = "1"
+
+[dev-dependencies]
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+
+[lints.rust]
+unsafe_code = "forbid"
