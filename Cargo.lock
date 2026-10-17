@@ -2321,8 +2321,8 @@ dependencies = [
 
 [[package]]
 name = "rust_xlsxwriter"
-version = "0.94.0"
-source = "git+https://github.com/coleleavitt/rust_xlsxwriter.git?rev=1970a524c01b54b5cf7d194d8e970f540f3457ad#1970a524c01b54b5cf7d194d8e970f540f3457ad"
+version = "0.99.1"
+source = "git+https://github.com/coleleavitt/rust_xlsxwriter.git?rev=8b132b3de4a8ad34b0d0bbb48e4ac9c5daf3e56e#8b132b3de4a8ad34b0d0bbb48e4ac9c5daf3e56e"
 dependencies = [
  "zip",
 ]
@@ -3959,9 +3959,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "7.2.0"
+version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
+checksum = "711e8c9646791c49b7eb799a19c4ae70a9b8372ddc6a1fa4778defd1e2aa5d5e"
 dependencies = [
  "crc32fast",
  "flate2",
