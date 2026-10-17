@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use chrono::{DateTime, FixedOffset, Local, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use rusqlite::{Connection, params};
 
 use crate::config::{Category, Config};
@@ -55,12 +55,7 @@ impl EventInterval {
     }
 
     pub(super) fn local_start(&self, config: &Config) -> Option<DateTime<FixedOffset>> {
-        let utc = DateTime::<Utc>::from_timestamp_millis(self.start_ms)?;
-        if let Some(timezone) = config.timezone {
-            Some(utc.with_timezone(&timezone).fixed_offset())
-        } else {
-            Some(utc.with_timezone(&Local).fixed_offset())
-        }
+        DateTime::<Utc>::from_timestamp_millis(self.start_ms).map(|utc| config.to_local(utc))
     }
 
     pub(super) fn minute_slices(&self) -> Vec<Self> {

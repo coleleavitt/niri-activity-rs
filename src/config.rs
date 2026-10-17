@@ -865,13 +865,18 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 }
 
 impl Config {
-    pub fn local_now(&self) -> DateTime<chrono::FixedOffset> {
-        let utc_now = chrono::Utc::now();
+    /// `instant` in the configured timezone, or the machine's when none is
+    /// configured. Every local time the reports show goes through here.
+    pub fn to_local(&self, instant: DateTime<chrono::Utc>) -> DateTime<chrono::FixedOffset> {
         if let Some(tz) = self.timezone {
-            utc_now.with_timezone(&tz).fixed_offset()
+            instant.with_timezone(&tz).fixed_offset()
         } else {
-            utc_now.with_timezone(&Local).fixed_offset()
+            instant.with_timezone(&Local).fixed_offset()
         }
+    }
+
+    pub fn local_now(&self) -> DateTime<chrono::FixedOffset> {
+        self.to_local(chrono::Utc::now())
     }
 
     pub fn local_date_today(&self) -> chrono::NaiveDate {
@@ -907,20 +912,24 @@ impl Config {
         &self,
         value: &str,
     ) -> Option<chrono::DateTime<chrono::FixedOffset>> {
-        let utc_dt = chrono::DateTime::parse_from_rfc3339(value).ok()?;
-        if let Some(tz) = self.timezone {
-            Some(utc_dt.with_timezone(&tz).fixed_offset())
-        } else {
-            Some(utc_dt.with_timezone(&Local).fixed_offset())
-        }
+        let instant = chrono::DateTime::parse_from_rfc3339(value).ok()?;
+        Some(self.to_local(instant.to_utc()))
     }
 
     fn app_category(&self, app_id: &str) -> Option<Category> {
-        // Exact match first (case-insensitive) so specific keys beat globs.
-        for (pattern, &cat) in &self.categories {
-            if !pattern.contains('*') && pattern.eq_ignore_ascii_case(app_id) {
-                return Some(cat);
-            }
+        // Exact keys beat globs. A key with the same case wins over keys that
+        // differ only in case, and among those the smallest key wins, so the
+        // pick is the same on every run.
+        if let Some(&cat) = self.categories.get(app_id) {
+            return Some(cat);
+        }
+        if let Some((_, &cat)) = self
+            .categories
+            .iter()
+            .filter(|(pattern, _)| !pattern.contains('*') && pattern.eq_ignore_ascii_case(app_id))
+            .min_by_key(|(pattern, _)| pattern.as_str())
+        {
+            return Some(cat);
         }
         // `categories` iterates in a different order on every run, so taking
         // the first matching glob let overlapping globs swap an app's
@@ -1656,6 +1665,22 @@ regex = true
             };
 
             assert_eq!(config.app_category("code-oss"), Some(Category::Productive));
+        }
+    }
+
+    #[test]
+    fn keys_differing_only_in_case_resolve_the_same_way_on_every_run() {
+        for _ in 0..64 {
+            let config = Config {
+                categories: HashMap::from([
+                    ("Firefox".to_string(), Category::Productive),
+                    ("firefox".to_string(), Category::Unproductive),
+                ]),
+                ..Config::default()
+            };
+
+            assert_eq!(config.app_category("firefox"), Some(Category::Unproductive));
+            assert_eq!(config.app_category("FIREFOX"), Some(Category::Productive));
         }
     }
 

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use chrono::Local;
+use chrono::{DateTime, FixedOffset};
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
@@ -66,8 +66,9 @@ pub fn send_report(app: &App, range: TimeRange, period_name: &str) -> Result<(),
 
     let subject = report_subject(email_config, &bounds, period_name);
 
-    let html_body = build_html_summary(&bounds, period_name);
-    let text_body = build_text_summary(&bounds, period_name);
+    let generated = app.config.local_now();
+    let html_body = build_html_summary(&bounds, period_name, generated);
+    let text_body = build_text_summary(&bounds, period_name, generated);
 
     let attachment = Attachment::new(filename).body(
         xlsx_bytes,
@@ -217,7 +218,11 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn build_html_summary(bounds: &report::TimeBounds, period_name: &str) -> String {
+fn build_html_summary(
+    bounds: &report::TimeBounds,
+    period_name: &str,
+    generated: DateTime<FixedOffset>,
+) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -250,11 +255,15 @@ fn build_html_summary(bounds: &report::TimeBounds, period_name: &str) -> String 
         html_escape(period_name),
         html_escape(&bounds.start_date.to_string()),
         html_escape(&bounds.end_date.to_string()),
-        html_escape(&Local::now().format("%Y-%m-%d %H:%M:%S").to_string())
+        html_escape(&generated.format("%Y-%m-%d %H:%M:%S").to_string())
     )
 }
 
-fn build_text_summary(bounds: &report::TimeBounds, period_name: &str) -> String {
+fn build_text_summary(
+    bounds: &report::TimeBounds,
+    period_name: &str,
+    generated: DateTime<FixedOffset>,
+) -> String {
     format!(
         "{} Activity Report\n\
          Period: {} to {}\n\n\
@@ -267,7 +276,7 @@ fn build_text_summary(bounds: &report::TimeBounds, period_name: &str) -> String 
         period_name,
         bounds.start_date,
         bounds.end_date,
-        Local::now().format("%Y-%m-%d %H:%M:%S")
+        generated.format("%Y-%m-%d %H:%M:%S")
     )
 }
 

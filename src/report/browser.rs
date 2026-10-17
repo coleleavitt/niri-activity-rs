@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use owo_colors::OwoColorize;
 
 use super::interval::load_human_intervals;
@@ -181,14 +181,7 @@ pub fn show_referrers(limit: usize) {
 fn calendar_date(instant: Option<DateTime<Utc>>, config: &Config) -> String {
     instant.map_or_else(
         || "—".to_string(),
-        |instant| {
-            let local = if let Some(timezone) = config.timezone {
-                instant.with_timezone(&timezone).fixed_offset()
-            } else {
-                instant.with_timezone(&Local).fixed_offset()
-            };
-            local.format("%Y-%m-%d").to_string()
-        },
+        |instant| config.to_local(instant).format("%Y-%m-%d").to_string(),
     )
 }
 

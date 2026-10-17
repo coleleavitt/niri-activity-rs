@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use std::{fs, thread};
 
-use chrono::{Local, Utc};
+use chrono::Utc;
 use owo_colors::OwoColorize;
 use rusqlite::Connection;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -1246,7 +1246,7 @@ fn print_focus_change_status(
 
     println!(
         "{} {} ({}) - {} ({}, {}, {} keys, {} clicks, {} scroll, {}px){}",
-        format!("[{}]", focus_start.with_timezone(&Local).format("%H:%M:%S")).dimmed(),
+        format!("[{}]", ctx.config.to_local(focus_start).format("%H:%M:%S")).dimmed(),
         cat_colored(category, &info.app_id),
         cat_label(category),
         format!("\"{}\"", truncate(&info.title, 40)).dimmed(),
