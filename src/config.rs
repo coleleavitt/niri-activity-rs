@@ -922,13 +922,20 @@ impl Config {
                 return Some(cat);
             }
         }
+        // `categories` iterates in a different order on every run, so taking
+        // the first matching glob let overlapping globs swap an app's
+        // category between runs. The most specific glob wins instead.
         let app_id_lower = app_id.to_ascii_lowercase();
-        for (pattern, &cat) in &self.categories {
-            if pattern.contains('*') && glob_match(&pattern.to_ascii_lowercase(), &app_id_lower) {
-                return Some(cat);
-            }
-        }
-        None
+        self.categories
+            .iter()
+            .filter(|(pattern, _)| {
+                pattern.contains('*') && glob_match(&pattern.to_ascii_lowercase(), &app_id_lower)
+            })
+            .min_by_key(|(pattern, _)| {
+                let literal_len = pattern.chars().filter(|&c| c != '*').count();
+                (std::cmp::Reverse(literal_len), pattern.as_str())
+            })
+            .map(|(_, &cat)| cat)
     }
 
     /// Populate [`Config::title_domains`] from local browser history.
@@ -1633,6 +1640,23 @@ regex = true
             config.app_category("jetbrains-RustRover"),
             Some(Category::Productive)
         );
+    }
+
+    #[test]
+    fn the_most_specific_overlapping_glob_wins_on_every_run() {
+        // Each map gets a fresh hash seed, so a first-match lookup returns
+        // either category depending on the run.
+        for _ in 0..64 {
+            let config = Config {
+                categories: HashMap::from([
+                    ("*code*".to_string(), Category::Unproductive),
+                    ("*code-oss*".to_string(), Category::Productive),
+                ]),
+                ..Config::default()
+            };
+
+            assert_eq!(config.app_category("code-oss"), Some(Category::Productive));
+        }
     }
 
     #[test]
