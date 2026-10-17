@@ -113,11 +113,11 @@ fn strip_jfc_status_prefix(title: &str) -> &str {
     s = s.trim_start();
 
     // Strip "(NNN new) " prefix
-    if s.starts_with('(') {
-        if let Some(close) = s.find(')') {
-            let after = &s[close + 1..];
-            s = after.trim_start();
-        }
+    if s.starts_with('(')
+        && let Some(close) = s.find(')')
+    {
+        let after = &s[close + 1..];
+        s = after.trim_start();
     }
 
     s
@@ -183,10 +183,10 @@ fn try_parse_shell_prompt(title: &str) -> Option<Option<String>> {
     if dir.starts_with('/') {
         let path = Path::new(dir);
         // Skip if it's the home directory itself
-        if let Some(home) = dirs::home_dir() {
-            if path == home {
-                return Some(None);
-            }
+        if let Some(home) = dirs::home_dir()
+            && path == home
+        {
+            return Some(None);
         }
         // Use detect_project_from_path for proper git-root walking
         return Some(detect_project_from_path(path));
@@ -281,10 +281,10 @@ pub fn detect_project_from_path(path: &Path) -> Option<String> {
 
     loop {
         // Skip home directory — it often has stray package.json/.git
-        if let Some(ref h) = home {
-            if dir == *h {
-                break;
-            }
+        if let Some(ref h) = home
+            && dir == *h
+        {
+            break;
         }
 
         for marker in PROJECT_MARKERS {

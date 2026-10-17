@@ -97,10 +97,10 @@ impl Scheduler {
         self.stop.store(true, Ordering::Release);
         self.tx.take();
         if self.worker_done.recv_timeout(timeout).is_ok() {
-            if let Some(worker) = self.worker.take() {
-                if worker.join().is_err() {
-                    tracing::error!("[SCHEDULER] Worker panicked during shutdown");
-                }
+            if let Some(worker) = self.worker.take()
+                && worker.join().is_err()
+            {
+                tracing::error!("[SCHEDULER] Worker panicked during shutdown");
             }
         } else {
             tracing::warn!("[SCHEDULER] Worker did not stop within {timeout:?}; detaching");

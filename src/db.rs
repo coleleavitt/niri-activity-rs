@@ -760,8 +760,10 @@ pub fn insert_event(conn: &Connection, snapshot: SessionSnapshot<'_>) -> Result<
 }
 
 pub(crate) fn decode_input_offsets(blob: &[u8]) -> Vec<u32> {
-    blob.chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+    let (offsets, _) = blob.as_chunks::<4>();
+    offsets
+        .iter()
+        .map(|&offset| u32::from_le_bytes(offset))
         .collect()
 }
 

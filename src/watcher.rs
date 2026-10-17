@@ -1290,25 +1290,24 @@ fn detect_project(config: &Config, app_id: &str, title: &str, pid: Option<i32>) 
     }
 
     // 3. Title-based detection (terminal patterns)
-    if crate::terminal::is_terminal_app(app_id) {
-        if let Some(name) = project::detect_project_from_title(title) {
-            // OC sessions and compound names always pass through
-            if name.contains(':') || name.contains(' ') {
-                return Some(apply_alias(config, name));
-            }
-            // Simple basenames: try to validate via search_dirs if configured
-            if !config.project_search_dirs.is_empty() {
-                if let Some(resolved) =
-                    project::resolve_project_in_search_dirs(&name, &config.project_search_dirs)
-                {
-                    return Some(apply_alias(config, resolved));
-                }
-            }
-            // Accept the name — it came from detect_project_from_path (full
-            // path titles) or is a legitimate basename from a shell
-            // prompt
+    if crate::terminal::is_terminal_app(app_id)
+        && let Some(name) = project::detect_project_from_title(title)
+    {
+        // OC sessions and compound names always pass through
+        if name.contains(':') || name.contains(' ') {
             return Some(apply_alias(config, name));
         }
+        // Simple basenames: try to validate via search_dirs if configured
+        if !config.project_search_dirs.is_empty()
+            && let Some(resolved) =
+                project::resolve_project_in_search_dirs(&name, &config.project_search_dirs)
+        {
+            return Some(apply_alias(config, resolved));
+        }
+        // Accept the name — it came from detect_project_from_path (full
+        // path titles) or is a legitimate basename from a shell
+        // prompt
+        return Some(apply_alias(config, name));
     }
 
     // 4. Try app-specific title parsing (IDEs, editors)
@@ -1391,10 +1390,10 @@ fn detect_branch_from_pwd(app_id: &str, pid: Option<i32>) -> Option<String> {
     // 1. Try /proc/PID/cwd first
     if let Some(pid) = pid {
         let leaf = find_leaf_child(pid);
-        if let Ok(cwd) = fs::read_link(format!("/proc/{}/cwd", leaf)) {
-            if let Some(branch) = project::detect_git_branch(&cwd) {
-                return Some(branch);
-            }
+        if let Ok(cwd) = fs::read_link(format!("/proc/{}/cwd", leaf))
+            && let Some(branch) = project::detect_git_branch(&cwd)
+        {
+            return Some(branch);
         }
     }
 

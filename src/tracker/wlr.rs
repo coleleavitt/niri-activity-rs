@@ -686,22 +686,16 @@ fn window_info(id: u64, window: &Committed) -> WindowInfo {
 }
 
 fn parse_activated(bytes: &[u8]) -> Result<bool, Failure> {
-    let mut chunks = bytes.chunks_exact(size_of::<u32>());
-    let activated = chunks
-        .by_ref()
-        .map(|chunk| u32::from_ne_bytes(chunk.try_into().expect("four-byte chunk")))
-        .any(|state| state == ACTIVATED_STATE);
-    if chunks.remainder().is_empty() {
-        Ok(activated)
-    } else {
-        Err(Failure::new(
+    let (states, tail) = bytes.as_chunks::<{ size_of::<u32>() }>();
+    if !tail.is_empty() {
+        return Err(Failure::new(
             TrackerErrorKind::Protocol,
-            format!(
-                "WLR state array has malformed {}-byte tail",
-                chunks.remainder().len()
-            ),
-        ))
+            format!("WLR state array has malformed {}-byte tail", tail.len()),
+        ));
     }
+    Ok(states
+        .iter()
+        .any(|&state| u32::from_ne_bytes(state) == ACTIVATED_STATE))
 }
 
 #[cfg(test)]

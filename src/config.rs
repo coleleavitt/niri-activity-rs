@@ -665,10 +665,10 @@ fn expand_tilde(path: &str) -> PathBuf {
         if let Some(base_dirs) = directories::BaseDirs::new() {
             return base_dirs.home_dir().join(rest);
         }
-    } else if path == "~" {
-        if let Some(base_dirs) = directories::BaseDirs::new() {
-            return base_dirs.home_dir().to_path_buf();
-        }
+    } else if path == "~"
+        && let Some(base_dirs) = directories::BaseDirs::new()
+    {
+        return base_dirs.home_dir().to_path_buf();
     }
     PathBuf::from(path)
 }
