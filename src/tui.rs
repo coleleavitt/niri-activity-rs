@@ -150,15 +150,11 @@ impl TuiApp {
 /// Run interactive terminal UI for viewing activity reports.
 pub fn run_tui_range(range: TimeRange) -> Result<(), Error> {
     let mut app = TuiApp::load(range)?;
-    let terminal = ratatui::init();
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
-        prev_hook(info);
-    }));
+    // try_init also installs a panic hook that restores the terminal and then
+    // runs the previous hook.
+    let terminal = ratatui::try_init()?;
     let result = run_loop(&mut app, terminal);
     ratatui::restore();
-    let _ = std::panic::take_hook();
     result
 }
 
