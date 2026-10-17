@@ -200,11 +200,12 @@ impl NiriEventSource {
                             io::ErrorKind::UnexpectedEof,
                             "niri event stream reached EOF",
                         )),
-                        Ok(_) => serde_json::from_str::<Event>(&line).map_err(io::Error::from),
+                        Ok(_) => decode_event(&line).map_err(io::Error::from),
                         Err(error) => Err(error),
                     };
                     match event {
-                        Ok(event) => match normalize_event(event) {
+                        Ok(None) => {}
+                        Ok(Some(event)) => match normalize_event(event) {
                             Ok(Some(update)) => {
                                 if first_update {
                                     if !matches!(update, Update::Snapshot(_)) {
@@ -292,6 +293,31 @@ impl WindowEventSource for NiriEventSource {
     }
 }
 
+/// The variants `normalize_event` turns into an update.
+const WINDOW_EVENTS: [&str; 4] = [
+    "WindowsChanged",
+    "WindowOpenedOrChanged",
+    "WindowClosed",
+    "WindowFocusChanged",
+];
+
+/// Decode one event-stream line, or `None` for an event the tracker ignores.
+///
+/// Ignored events are skipped before decoding: niri built from git emits
+/// event kinds the pinned niri-ipc does not know yet, and failing to decode
+/// one ended the stream.
+fn decode_event(line: &str) -> serde_json::Result<Option<Event>> {
+    let value: serde_json::Value = serde_json::from_str(line)?;
+    let consumed = value
+        .as_object()
+        .and_then(|fields| fields.keys().next())
+        .is_none_or(|name| WINDOW_EVENTS.contains(&name.as_str()));
+    if !consumed {
+        return Ok(None);
+    }
+    serde_json::from_value(value).map(Some)
+}
+
 fn normalize_event(event: Event) -> Result<Option<Update>, TrackerError> {
     let update = match event {
         Event::WindowsChanged { windows } => Update::Snapshot(normalize_snapshot(windows)?),
@@ -367,6 +393,28 @@ mod tests {
             },
             focus_timestamp: None,
         }
+    }
+
+    #[test]
+    fn an_event_kind_newer_than_niri_ipc_is_skipped() {
+        let event = decode_event(r#"{"VirtualInputChanged":{"devices":[]}}"#).unwrap();
+
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn a_window_event_is_decoded() {
+        let event = decode_event(r#"{"WindowFocusChanged":{"id":7}}"#).unwrap();
+
+        assert!(matches!(
+            event,
+            Some(Event::WindowFocusChanged { id: Some(7) })
+        ));
+    }
+
+    #[test]
+    fn a_malformed_window_event_is_still_an_error() {
+        assert!(decode_event(r#"{"WindowClosed":{}}"#).is_err());
     }
 
     #[test]
